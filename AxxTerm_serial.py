@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import *
 import struct
 import numpy as np
 
+plotlength = 100
 
 class SerialMonitor(QtWidgets.QMainWindow):
     def __init__(self):
@@ -203,12 +204,12 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.plotItem.getAxis('bottom').setPen( pg.mkPen(color='#000000') )
             self.graphWidget.plotItem.getAxis('left').setPen( pg.mkPen(color='#000000') )
             self.graphWidget.plotItem.showGrid(True, True, 0.3)
-            self.graphWidget.setXRange(0, 300)
+            self.graphWidget.setXRange(0, plotlength)
             self.data = [ self.graphWidget.plotItem.plot(pen=pg.mkPen('r', width=2)), self.graphWidget.plotItem.plot(pen=pg.mkPen('b', width=2)), self.graphWidget.plotItem.plot(pen=pg.mkPen(color=(50,150,0), width=2)), self.graphWidget.plotItem.plot(pen=pg.mkPen('k', width=2))]
-            self.data[0].setData( np.zeros(300) )
-            self.data[1].setData( np.zeros(300) )
-            self.data[2].setData( np.zeros(300) )
-            self.data[3].setData( np.zeros(300) )
+            self.data[0].setData( np.zeros(plotlength) )
+            self.data[1].setData( np.zeros(plotlength) )
+            self.data[2].setData( np.zeros(plotlength) )
+            self.data[3].setData( np.zeros(plotlength) )
             self.numberbuffer = []
 
             self.layout().addWidget(self.graphWidget,   0, 0, 1, 6)
