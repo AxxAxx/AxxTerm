@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import *
 import struct
 import numpy as np
 
-plotlength = 100 #TO-DO make dynamic!
+plotlength = 100 #TO-DO make dynamic with user input field!
 
 class SerialMonitor(QtWidgets.QMainWindow):
     def __init__(self):
