@@ -230,6 +230,10 @@ class SerialDataView(QtWidgets.QWidget):
         self.plot_lines = []
         self.plot_data = []
         self.graphWidget = None
+        # Tracks whether the previous received chunk ended in '\r'. Used to
+        # suppress a '\n' that begins the next chunk when CRLF is split across
+        # serial reads (otherwise Qt renders a blank line between messages).
+        self._pending_cr = False
 
         self.serialData = QtWidgets.QTextEdit(self)
         self.serialData.setReadOnly(True)
@@ -433,6 +437,20 @@ class SerialDataView(QtWidgets.QWidget):
         self.serialDataHex.setFontFamily('Segoe UI')
         self.serialDataHex.setTextColor(self.textcolor)
 
+        # QTextEdit treats BOTH '\r' and '\n' as paragraph separators, so a
+        # CRLF stream renders with a blank line between each message. Keep
+        # the raw bytes for the HEX view, but normalize for the ASCII view.
+        # Serial data arrives in arbitrary-size chunks; a '\r\n' pair can be
+        # split across two reads, so we also carry a _pending_cr flag that
+        # swallows a leading '\n' when the previous chunk ended in '\r'.
+        displayText = appendText.replace('\r\n', '\n').replace('\r', '\n')
+        if direction == "send":
+            self._pending_cr = False
+        else:
+            if self._pending_cr and displayText.startswith('\n'):
+                displayText = displayText[1:]
+            self._pending_cr = appendText.endswith('\r')
+
         lastData = self.serialDataHex.toPlainText().split('\n')[-1]
         lastLength = math.ceil(len(lastData) / 3)
 
@@ -452,16 +470,18 @@ class SerialDataView(QtWidgets.QWidget):
         if direction == "send":
             if mode == 'HEX':
                 try:
-                    self.serialData.insertPlainText(bytes.fromhex(appendText).decode('ISO-8859-1'))
+                    decoded = bytes.fromhex(appendText).decode('ISO-8859-1')
+                    decoded = decoded.replace('\r\n', '\n').replace('\r', '\n')
+                    self.serialData.insertPlainText(decoded)
                 except ValueError:
-                    self.serialData.insertPlainText(appendText)
+                    self.serialData.insertPlainText(displayText)
                 self.serialDataHex.insertPlainText(appendText.upper())
             elif mode == 'ASCII':
-                self.serialData.insertPlainText(appendText)
+                self.serialData.insertPlainText(displayText)
                 for insertText in appendLists:
                     self.serialDataHex.insertPlainText(insertText.upper())
             elif mode == 'BINARY':
-                self.serialData.insertPlainText(appendText)
+                self.serialData.insertPlainText(displayText)
                 try:
                     hex_val = format(int(appendText, 2), 'X')
                     if len(hex_val) % 2:
@@ -472,10 +492,10 @@ class SerialDataView(QtWidgets.QWidget):
         else:
             for insertText in appendLists:
                 self.serialDataHex.insertPlainText(insertText.upper())
-            self.serialData.insertPlainText(appendText)
+            self.serialData.insertPlainText(displayText)
 
             if self.graph_mode.isChecked() and self.graphWidget is not None:
-                for char in appendText:
+                for char in displayText:
                     if char == '\n':
                         values = self._parse_plot_values(''.join(self.numberbuffer))
                         for i, val in enumerate(values):
