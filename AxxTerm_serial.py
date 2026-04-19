@@ -333,6 +333,13 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.serialSendView.serialSendSignal.connect(self.sendFromPort)
         self.port.readyRead.connect(self.readFromPort)
 
+        # Save when serial port settings change
+        self.toolBar.baudRates.currentIndexChanged.connect(lambda: self.save_all_settings())
+        self.toolBar.dataBits.currentIndexChanged.connect(lambda: self.save_all_settings())
+        self.toolBar._parity.currentIndexChanged.connect(lambda: self.save_all_settings())
+        self.toolBar.stopBits.currentIndexChanged.connect(lambda: self.save_all_settings())
+        self.toolBar._flowControl.currentIndexChanged.connect(lambda: self.save_all_settings())
+
         ### Load all settings ###
         self.load_all_settings()
 
