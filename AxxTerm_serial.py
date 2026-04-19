@@ -17,7 +17,7 @@ import numpy as np
 DEFAULT_PLOT_LENGTH = 100
 
 PLOT_COLORS = [
-    '#e6194b', '#3cb44b', '#4363d8', '#e67e00',
+    '#e6194b', '#3cb44b', '#0055d4', '#e67e00',
     '#911eb4', '#1a9bc7', '#f032e6', '#9A6324',
     '#800000', '#469990', '#7b68ee', '#000075',
 ]
