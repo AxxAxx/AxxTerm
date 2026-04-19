@@ -455,61 +455,63 @@ class SerialDataView(QtWidgets.QWidget):
         sp_layout = QtWidgets.QHBoxLayout(self.settings_panel)
         sp_layout.setContentsMargins(4, 2, 4, 2)
 
-        self._type_label = QtWidgets.QLabel('Type:')
-        self.type_combo = QtWidgets.QComboBox()
-        self.type_combo.addItems(list(DATA_TYPES.keys()))
-        self.type_combo.setCurrentText('float32')
-        self.type_combo.currentTextChanged.connect(self._on_setting_changed)
-
-        self._endian_label = QtWidgets.QLabel('Endian:')
-        self.endian_combo = QtWidgets.QComboBox()
-        self.endian_combo.addItems(['Little', 'Big'])
-        self.endian_combo.currentTextChanged.connect(self._on_setting_changed)
-
-        self.sync_button = QtWidgets.QPushButton('Sync')
-        self.sync_button.setToolTip('Clear byte buffer to re-align stream')
-        self.sync_button.clicked.connect(self._on_sync_clicked)
-
-        self._sync_word_label = QtWidgets.QLabel('Sync Word:')
+        # Frame-only: frame start
+        self._frame_start_label = QtWidgets.QLabel('Frame Start:')
         self.sync_word_edit = QtWidgets.QLineEdit('AA')
         self.sync_word_edit.setMaximumWidth(120)
         self.sync_word_edit.setPlaceholderText('e.g. AA BB')
         self.sync_word_edit.editingFinished.connect(self._on_setting_changed)
 
-        self._size_field_label = QtWidgets.QLabel('Size Field:')
+        # Frame-only: payload size
+        self._payload_size_label = QtWidgets.QLabel('Payload Size:')
         self.size_field_combo = QtWidgets.QComboBox()
         self.size_field_combo.addItems(['Fixed', '1-byte', '2-byte'])
         self.size_field_combo.currentTextChanged.connect(self._on_size_field_changed)
 
         self.frame_size_spin = QtWidgets.QSpinBox(minimum=1, maximum=65535, value=12)
-        self.frame_size_spin.setPrefix('Size: ')
         self.frame_size_spin.valueChanged.connect(self._on_setting_changed)
 
+        # Shared: endianness
+        self._endian_label = QtWidgets.QLabel('Endian:')
+        self.endian_combo = QtWidgets.QComboBox()
+        self.endian_combo.addItems(['Little', 'Big'])
+        self.endian_combo.currentTextChanged.connect(self._on_setting_changed)
+
+        # Frame-only: checksum
         self.checksum_check = QtWidgets.QCheckBox('Checksum')
         self.checksum_check.stateChanged.connect(self._on_setting_changed)
 
-        sp_layout.addWidget(self._type_label)
-        sp_layout.addWidget(self.type_combo)
-        sp_layout.addWidget(self._endian_label)
-        sp_layout.addWidget(self.endian_combo)
-        sp_layout.addWidget(self.sync_button)
-        sp_layout.addWidget(self._sync_word_label)
+        # Binary-only: sync button
+        self.sync_button = QtWidgets.QPushButton('Sync')
+        self.sync_button.setToolTip('Clear byte buffer to re-align stream')
+        self.sync_button.clicked.connect(self._on_sync_clicked)
+
+        sp_layout.addWidget(self._frame_start_label)
         sp_layout.addWidget(self.sync_word_edit)
-        sp_layout.addWidget(self._size_field_label)
+        sp_layout.addWidget(self._payload_size_label)
         sp_layout.addWidget(self.size_field_combo)
         sp_layout.addWidget(self.frame_size_spin)
+        sp_layout.addWidget(self._endian_label)
+        sp_layout.addWidget(self.endian_combo)
         sp_layout.addWidget(self.checksum_check)
+        sp_layout.addWidget(self.sync_button)
         sp_layout.addStretch()
 
         self._frame_only_widgets = [
-            self._sync_word_label, self.sync_word_edit,
-            self._size_field_label, self.size_field_combo,
+            self._frame_start_label, self.sync_word_edit,
+            self._payload_size_label, self.size_field_combo,
             self.frame_size_spin, self.checksum_check,
         ]
 
         self.settings_panel.setVisible(False)
 
-        # Delimiter (ASCII mode) -- lives in graph controls row
+        # Type combo -- on graph controls row, shown for binary/frame
+        self.type_combo = QtWidgets.QComboBox()
+        self.type_combo.addItems(list(DATA_TYPES.keys()))
+        self.type_combo.setCurrentText('float32')
+        self.type_combo.currentTextChanged.connect(self._on_setting_changed)
+
+        # Delimiter (ASCII mode) -- on graph controls row
         self.delimiter_combo = QtWidgets.QComboBox()
         self.delimiter_combo.addItems(['Auto', 'Comma', 'Semicolon', 'Space', 'Tab', 'Other'])
         self.delimiter_combo.currentIndexChanged.connect(self._on_delimiter_changed)
@@ -520,15 +522,17 @@ class SerialDataView(QtWidgets.QWidget):
         self.delimiter_custom.setVisible(False)
         self.delimiter_custom.editingFinished.connect(self._on_setting_changed)
 
-        # Graph controls container
+        # Graph controls: left group and right group with stretch between
         graph_controls = QtWidgets.QWidget()
         gc_layout = QtWidgets.QHBoxLayout(graph_controls)
         gc_layout.setContentsMargins(0, 0, 0, 0)
-        gc_layout.addWidget(self.plot_length_spin)
-        gc_layout.addWidget(self.graph_channels)
+        gc_layout.addWidget(self.data_mode)
+        gc_layout.addWidget(self.type_combo)
         gc_layout.addWidget(self.delimiter_combo)
         gc_layout.addWidget(self.delimiter_custom)
-        gc_layout.addWidget(self.data_mode)
+        gc_layout.addWidget(self.graph_channels)
+        gc_layout.addStretch()
+        gc_layout.addWidget(self.plot_length_spin)
         gc_layout.addWidget(self.graph_mode)
 
         # Vertical splitter: graph (top) | data views (bottom)
@@ -710,19 +714,20 @@ class SerialDataView(QtWidgets.QWidget):
         is_binary = (mode == 'Binary Stream')
         is_frame = (mode == 'Custom Frame')
 
-        # Settings panel only for binary/frame modes
+        # Settings panel for binary/frame modes
         self.settings_panel.setVisible(is_binary or is_frame)
 
-        # Delimiter in graph controls row -- only for ASCII mode
+        # Top row: type combo for binary/frame, delimiter for ASCII
+        self.type_combo.setVisible(is_binary or is_frame)
         self.delimiter_combo.setVisible(is_ascii)
         self.delimiter_custom.setVisible(
             is_ascii and self.delimiter_combo.currentText() == 'Other')
 
-        # Frame-only widgets
+        # Settings panel: frame-only widgets
         for w in self._frame_only_widgets:
             w.setVisible(is_frame)
 
-        # Binary-only sync button
+        # Settings panel: binary-only sync button, frame-only endian still shown
         self.sync_button.setVisible(is_binary)
 
         if is_ascii:
