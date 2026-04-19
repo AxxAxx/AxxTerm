@@ -659,6 +659,7 @@ class SerialDataView(QtWidgets.QWidget):
             self.label_sent_data.setText('Data: ASCII')
 
         self.serialData.clear()
+        self.serialDataHex.clear()
         self._binary_reader.sync()
         self._frame_reader.reset()
 
