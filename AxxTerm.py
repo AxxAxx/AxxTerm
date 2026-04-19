@@ -16,6 +16,7 @@ import numpy as np
 # --- Constants ---
 
 DEFAULT_PLOT_LENGTH = 100
+MAX_TEXT_LINES = 10000
 
 PLOT_COLORS = [
     '#e6194b', '#3cb44b', '#0055d4', '#e67e00',
@@ -364,6 +365,12 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._stats_timer.timeout.connect(self._update_stats)
         self._stats_timer.start(1000)
 
+        ### Display throttle (~30 fps) ###
+        self._rx_buffer = bytearray()
+        self._display_timer = QtCore.QTimer(self)
+        self._display_timer.timeout.connect(self._flush_display)
+        self._display_timer.start(33)  # ~30fps
+
         ### Auto-reconnect state ###
         self._reconnect_port_name = ''
         self._reconnect_timer = QtCore.QTimer(self)
@@ -423,13 +430,23 @@ class SerialMonitor(QtWidgets.QMainWindow):
             raw_bytes = bytes(data.data())
             self._rx_bytes += len(raw_bytes)
             self._rx_total += len(raw_bytes)
+            # Log immediately for accurate timestamps
             mode = self.serialDataView.data_mode.currentText()
             if mode == 'ASCII':
                 self._log_data('RX', raw_bytes.decode('ISO-8859-1'))
             else:
                 hex_str = raw_bytes.hex().upper()
                 self._log_data('RX', f'[HEX] {hex_str}')
-            self.serialDataView.handleReceivedData(raw_bytes)
+            # Buffer for throttled display update
+            self._rx_buffer.extend(raw_bytes)
+
+    def _flush_display(self):
+        """Process buffered RX data and update the display (~30 fps)."""
+        if not self._rx_buffer:
+            return
+        data = bytes(self._rx_buffer)
+        self._rx_buffer.clear()
+        self.serialDataView.handleReceivedData(data)
 
     def sendFromPort(self, text):
         if not self.port.isOpen():
@@ -798,6 +815,7 @@ class SerialDataView(QtWidgets.QWidget):
         # suppress a '\n' that begins the next chunk when CRLF is split across
         # serial reads (otherwise Qt renders a blank line between messages).
         self._pending_cr = False
+        self._hex_col = 0  # tracks hex pairs on current line (0..15)
 
         # FFT view state
         self._fft_widget = None
@@ -1877,6 +1895,7 @@ class SerialDataView(QtWidgets.QWidget):
         self._binary_reader.sync()
         self._frame_reader.reset()
         self._pending_cr = False
+        self._hex_col = 0
         self.numberbuffer = []
 
     def _on_mode_changed(self):
@@ -1912,6 +1931,7 @@ class SerialDataView(QtWidgets.QWidget):
         self._binary_reader.sync()
         self._frame_reader.reset()
         self._pending_cr = False
+        self._hex_col = 0
         self.numberbuffer = []
 
         self._apply_reader_settings()
@@ -2112,8 +2132,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.serialDataHex.setTextColor(QtGui.QColor(255, 0, 0))
 
         hex_str = raw_bytes.hex().upper()
-        lastData = self.serialDataHex.toPlainText().split('\n')[-1]
-        lastLength = math.ceil(len(lastData) / 3)
+        lastLength = self._hex_col
 
         pairs = [hex_str[i:i+2] for i in range(0, len(hex_str), 2)]
         append_lists = []
@@ -2123,6 +2142,9 @@ class SerialDataView(QtWidgets.QWidget):
             line = ' '.join(t)
             if pairs:
                 line += '\n'
+                self._hex_col = 0
+            else:
+                self._hex_col = lastLength + len(t)
             append_lists.append(line)
 
         for i in range(0, len(pairs), 16):
@@ -2130,11 +2152,26 @@ class SerialDataView(QtWidgets.QWidget):
             line = ' '.join(chunk)
             if i + 16 < len(pairs):
                 line += '\n'
+                self._hex_col = 0
+            else:
+                self._hex_col = len(chunk)
             append_lists.append(line)
 
         for text in append_lists:
             self.serialDataHex.insertPlainText(text)
         self.serialDataHex.moveCursor(QtGui.QTextCursor.End)
+        self._trim_text_buffer(self.serialDataHex)
+
+    def _trim_text_buffer(self, text_edit, max_lines=MAX_TEXT_LINES):
+        """Remove oldest lines if text exceeds max_lines."""
+        doc = text_edit.document()
+        if doc.blockCount() > max_lines:
+            cursor = QTextCursor(doc.begin())
+            excess = doc.blockCount() - max_lines
+            for _ in range(excess):
+                cursor.movePosition(QTextCursor.NextBlock, QTextCursor.KeepAnchor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()  # remove the leftover newline
 
     def _append_decoded_line(self, sample):
         """Append one decoded sample to the left panel with color-coded channels."""
@@ -2154,6 +2191,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.serialData.setTextColor(QtGui.QColor(255, 0, 0))
         self.serialData.insertPlainText('\n')
         self.serialData.moveCursor(QtGui.QTextCursor.End)
+        self._trim_text_buffer(self.serialData)
 
     def appendSerialText(self, appendText, direction, mode="ASCII"):
         if direction == "send":
@@ -2181,11 +2219,11 @@ class SerialDataView(QtWidgets.QWidget):
                 displayText = displayText[1:]
             self._pending_cr = appendText.endswith('\r')
 
-        lastData = self.serialDataHex.toPlainText().split('\n')[-1]
-        lastLength = math.ceil(len(lastData) / 3)
+        lastLength = self._hex_col
 
         appendLists = []
         splitedByTwoChar = re.split('(..)', appendText.encode().hex())[1::2]
+        num_new_pairs = len(splitedByTwoChar)
         if lastLength > 0:
             t = splitedByTwoChar[: 16 - lastLength] + ['\n']
             appendLists.append(' '.join(t))
@@ -2206,10 +2244,15 @@ class SerialDataView(QtWidgets.QWidget):
                 except ValueError:
                     self.serialData.insertPlainText(displayText)
                 self.serialDataHex.insertPlainText(appendText.upper())
+                # HEX send inserts raw hex chars without line formatting
+                sent_pairs = len(appendText) // 2
+                self._hex_col = (lastLength + sent_pairs) % 16
             elif mode == 'ASCII':
                 self.serialData.insertPlainText(displayText)
                 for insertText in appendLists:
                     self.serialDataHex.insertPlainText(insertText.upper())
+                # Update _hex_col from appendLists (line-wrapped hex pairs)
+                self._hex_col = (lastLength + num_new_pairs) % 16
             elif mode == 'BINARY':
                 self.serialData.insertPlainText(displayText)
                 try:
@@ -2217,12 +2260,16 @@ class SerialDataView(QtWidgets.QWidget):
                     if len(hex_val) % 2:
                         hex_val = '0' + hex_val
                     self.serialDataHex.insertPlainText(hex_val)
+                    sent_pairs = len(hex_val) // 2
+                    self._hex_col = (lastLength + sent_pairs) % 16
                 except ValueError:
                     self.serialDataHex.insertPlainText(appendText)
         else:
             for insertText in appendLists:
                 self.serialDataHex.insertPlainText(insertText.upper())
             self.serialData.insertPlainText(displayText)
+            # Update _hex_col from appendLists (line-wrapped hex pairs)
+            self._hex_col = (lastLength + num_new_pairs) % 16
 
             if self.graph_mode.isChecked() and self.graphWidget is not None:
                 for char in displayText:
@@ -2236,6 +2283,8 @@ class SerialDataView(QtWidgets.QWidget):
 
         self.serialData.moveCursor(QtGui.QTextCursor.End)
         self.serialDataHex.moveCursor(QtGui.QTextCursor.End)
+        self._trim_text_buffer(self.serialData)
+        self._trim_text_buffer(self.serialDataHex)
 
 
 # Horizontal separator line
