@@ -552,6 +552,9 @@ class SerialDataView(QtWidgets.QWidget):
         self.graphWidget = None
         self.channel_names = {}   # {index: 'custom name'} for renamed channels
         self.channel_colors = {}  # {index: '#hex'} for custom channel colors
+        self._y_auto_scale = True
+        self._y_min = -1.0
+        self._y_max = 1.0
         # Tracks whether the previous received chunk ended in '\r'. Used to
         # suppress a '\n' that begins the next chunk when CRLF is split across
         # serial reads (otherwise Qt renders a blank line between messages).
@@ -791,12 +794,15 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.plotItem.getAxis('bottom').setPen(pg.mkPen(color='#000000'))
             self.graphWidget.plotItem.getAxis('left').setPen(pg.mkPen(color='#000000'))
             self.graphWidget.plotItem.showGrid(True, True, 0.3)
-            self.graphWidget.plotItem.setMenuEnabled(False)
-            self.graphWidget.plotItem.vb.setMenuEnabled(False)
             self.graphWidget.setXRange(0, self.plot_length_spin.value())
-            self.graphWidget.enableAutoRange(axis='y')
+            # Restore Y-axis settings
+            if self._y_auto_scale:
+                self.graphWidget.enableAutoRange(axis='y')
+            else:
+                self.graphWidget.setYRange(self._y_min, self._y_max)
             self.graphWidget.addLegend()
             self.graphWidget.scene().sigMouseClicked.connect(self._on_plot_mouse_clicked)
+            self.graphWidget.sigRangeChanged.connect(self._on_range_changed)
             self._create_plot_lines()
             self.numberbuffer = []
             # Clear Plot button overlaid in lower-right corner
@@ -835,6 +841,19 @@ class SerialDataView(QtWidgets.QWidget):
         if obj is self.graphWidget and event.type() == QtCore.QEvent.Resize:
             self._position_clear_graph_btn()
         return super().eventFilter(obj, event)
+
+    def _on_range_changed(self):
+        """Track Y-axis range changes and save."""
+        if self.graphWidget is None:
+            return
+        vb = self.graphWidget.plotItem.vb
+        auto = vb.autoRangeEnabled()[1]  # [x_auto, y_auto]
+        self._y_auto_scale = bool(auto)
+        if not auto:
+            y_range = vb.viewRange()[1]
+            self._y_min = y_range[0]
+            self._y_max = y_range[1]
+        self._save_settings()
 
     def _on_plot_mouse_clicked(self, ev):
         """Right-click on a legend entry to rename or change color."""
@@ -1055,6 +1074,9 @@ class SerialDataView(QtWidgets.QWidget):
             'delimiter_custom': self.delimiter_custom.text(),
             'channel_names': {str(k): v for k, v in self.channel_names.items()},
             'channel_colors': {str(k): v for k, v in self.channel_colors.items()},
+            'y_auto_scale': self._y_auto_scale,
+            'y_min': self._y_min,
+            'y_max': self._y_max,
             'binary': {
                 'data_type': self.type_combo.currentText(),
                 'endianness': 'little' if self.endian_combo.currentText().startswith('Little') else 'big',
@@ -1096,6 +1118,10 @@ class SerialDataView(QtWidgets.QWidget):
             self.channel_names = {int(k): v for k, v in saved_names.items()}
             saved_colors = s.get('channel_colors', {})
             self.channel_colors = {int(k): v for k, v in saved_colors.items()}
+
+            self._y_auto_scale = s.get('y_auto_scale', True)
+            self._y_min = s.get('y_min', -1.0)
+            self._y_max = s.get('y_max', 1.0)
 
             frame = s.get('frame', {})
             binary = s.get('binary', {})
