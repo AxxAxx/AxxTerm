@@ -307,6 +307,14 @@ class SerialMonitor(QtWidgets.QMainWindow):
         quit_action.setShortcut('Ctrl+Q')
         quit_action.triggered.connect(self.close)
 
+        ### View Menu ###
+        view_menu = menubar.addMenu('View')
+        self._dark_mode_action = view_menu.addAction('Dark Mode')
+        self._dark_mode_action.setCheckable(True)
+        self._dark_mode_action.setShortcut('Ctrl+D')
+        self._dark_mode_action.triggered.connect(self._toggle_dark_mode)
+        self._dark_mode = False
+
         ### Tool Bar ###
         self.toolBar = ToolBar(self)
         self.addToolBar(self.toolBar)
@@ -457,9 +465,43 @@ class SerialMonitor(QtWidgets.QMainWindow):
         else:
             self.statsLabel.setText('')
 
+    def _apply_dark_palette(self):
+        palette = QtGui.QPalette()
+        palette.setColor(QtGui.QPalette.Window, QColor(53, 53, 53))
+        palette.setColor(QtGui.QPalette.WindowText, QColor(255, 255, 255))
+        palette.setColor(QtGui.QPalette.Base, QColor(35, 35, 35))
+        palette.setColor(QtGui.QPalette.AlternateBase, QColor(53, 53, 53))
+        palette.setColor(QtGui.QPalette.ToolTipBase, QColor(25, 25, 25))
+        palette.setColor(QtGui.QPalette.ToolTipText, QColor(255, 255, 255))
+        palette.setColor(QtGui.QPalette.Text, QColor(255, 255, 255))
+        palette.setColor(QtGui.QPalette.Button, QColor(53, 53, 53))
+        palette.setColor(QtGui.QPalette.ButtonText, QColor(255, 255, 255))
+        palette.setColor(QtGui.QPalette.BrightText, QColor(255, 0, 0))
+        palette.setColor(QtGui.QPalette.Link, QColor(42, 130, 218))
+        palette.setColor(QtGui.QPalette.Highlight, QColor(42, 130, 218))
+        palette.setColor(QtGui.QPalette.HighlightedText, QColor(35, 35, 35))
+        QtWidgets.QApplication.instance().setPalette(palette)
+        QtWidgets.QApplication.instance().setStyleSheet(
+            "QToolTip { color: #ffffff; background-color: #2a2a2a; border: 1px solid white; }")
+
+    def _apply_light_palette(self):
+        QtWidgets.QApplication.instance().setPalette(
+            QtWidgets.QApplication.style().standardPalette())
+        QtWidgets.QApplication.instance().setStyleSheet("")
+
+    def _toggle_dark_mode(self):
+        self._dark_mode = self._dark_mode_action.isChecked()
+        if self._dark_mode:
+            self._apply_dark_palette()
+        else:
+            self._apply_light_palette()
+        self.serialDataView._update_graph_theme()
+        self.save_all_settings()
+
     def save_all_settings(self, path=None):
         """Save all settings (plot, serial port, macros) to one JSON file."""
         settings = {
+            'dark_mode': self._dark_mode,
             'plot': self.serialDataView._get_settings_dict(),
             'serial': {
                 'baud_rate': self.toolBar.baudRates.currentText(),
@@ -483,6 +525,14 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 s = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError, ValueError):
             return
+
+        # Dark mode
+        self._dark_mode = s.get('dark_mode', False)
+        self._dark_mode_action.setChecked(self._dark_mode)
+        if self._dark_mode:
+            self._apply_dark_palette()
+        else:
+            self._apply_light_palette()
 
         # Plot/decode settings
         plot = s.get('plot', s)  # fallback: old format had plot keys at top level
@@ -871,6 +921,7 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.installEventFilter(self)
             self.splitter.insertWidget(0, self.graphWidget)
             self._position_clear_graph_btn()
+            self._update_graph_theme()
         else:
             self.graphWidget.removeEventFilter(self)
             self.graphWidget.setParent(None)
@@ -887,6 +938,31 @@ class SerialDataView(QtWidgets.QWidget):
         for i, (arr, line) in enumerate(zip(self.plot_data, self.plot_lines)):
             arr[:] = 0
             line.setData(arr)
+
+    def _update_graph_theme(self):
+        """Update graph background and axis colors based on dark mode state."""
+        monitor = self.window()
+        dark = getattr(monitor, '_dark_mode', False)
+        if self.graphWidget is not None:
+            if dark:
+                self.graphWidget.setBackground('#2b2b2b')
+                axis_color = '#ffffff'
+            else:
+                self.graphWidget.setBackground('#FFFFFF')
+                axis_color = '#000000'
+            self.graphWidget.plotItem.getAxis('bottom').setPen(pg.mkPen(color=axis_color))
+            self.graphWidget.plotItem.getAxis('left').setPen(pg.mkPen(color=axis_color))
+            self.graphWidget.plotItem.getAxis('bottom').setTextPen(pg.mkPen(color=axis_color))
+            self.graphWidget.plotItem.getAxis('left').setTextPen(pg.mkPen(color=axis_color))
+            if hasattr(self, '_cursor_label') and self._cursor_label is not None:
+                self._cursor_label.setColor(axis_color)
+            if hasattr(self, '_clear_graph_btn') and self._clear_graph_btn is not None:
+                if dark:
+                    self._clear_graph_btn.setStyleSheet(
+                        'background-color: #353535; color: #ffffff; border: 1px solid #666; padding: 2px 8px;')
+                else:
+                    self._clear_graph_btn.setStyleSheet(
+                        'background-color: #ffffff; border: 1px solid #aaa; padding: 2px 8px;')
 
     def _position_clear_graph_btn(self):
         """Position the Clear Plot button in the lower-right of the graph."""
