@@ -743,11 +743,17 @@ class SerialMonitor(QtWidgets.QMainWindow):
         try:
             n_channels = len(dv.plot_data)
             n_points = len(dv.plot_data[0])
-            header = ','.join(dv._channel_name(i) for i in range(n_channels))
+            # Build header: regular channels + math channels
+            headers = [dv._channel_name(i) for i in range(n_channels)]
+            for mch in dv._math_channels:
+                headers.append(mch.get('name', 'Math'))
+            header = ','.join(headers)
             lines = [header]
             for row in range(n_points):
-                values = ','.join(str(dv.plot_data[ch][row]) for ch in range(n_channels))
-                lines.append(values)
+                values = [str(dv.plot_data[ch][row]) for ch in range(n_channels)]
+                for arr in dv._math_data:
+                    values.append(str(arr[row]) if row < len(arr) else '')
+                lines.append(','.join(values))
             with open(path, 'w') as f:
                 f.write('\n'.join(lines) + '\n')
             self.statusText.setText(f'CSV exported to {os.path.basename(path)}')
@@ -797,6 +803,13 @@ class SerialDataView(QtWidgets.QWidget):
         self._fft_widget = None
         self._fft_lines = []
         self._fft_update_counter = 0
+
+        # Math/computed channels
+        self._math_channels = []   # list of {'name': str, 'expression': str}
+        self._math_lines = []      # PlotDataItem list
+        self._math_data = []       # numpy array list
+        self._math_errors = set()  # indices of channels with eval errors
+        self._math_update_counter = 0
 
         self._binary_reader = BinaryStreamReader()
         self._frame_reader = FrameReader()
@@ -1032,6 +1045,14 @@ class SerialDataView(QtWidgets.QWidget):
         _trig_sep.setFrameShadow(QtWidgets.QFrame.Sunken)
         cl.addWidget(_trig_sep)
 
+        # Math channels button
+        self._math_btn = QtWidgets.QPushButton("Math")
+        self._math_btn.setFont(row_font)
+        self._math_btn.setFixedHeight(30)
+        self._math_btn.setToolTip("Configure math/computed channels")
+        self._math_btn.clicked.connect(self._open_math_dialog)
+        cl.addWidget(self._math_btn)
+
         # Right: plot controls
         cl.addWidget(self.plot_length_spin)
         cl.addWidget(self.graph_mode)
@@ -1173,6 +1194,8 @@ class SerialDataView(QtWidgets.QWidget):
             line.setData(arr)
             self.plot_lines.append(line)
             self.plot_data.append(arr)
+        # Rebuild math channel lines too
+        self._rebuild_math_lines()
 
     def _on_channels_changed(self):
         """Rebuild plot lines when channel count changes while graph is active."""
@@ -1272,11 +1295,17 @@ class SerialDataView(QtWidgets.QWidget):
             self._cursor_label = None
             self.plot_lines = []
             self.plot_data = []
+            self._math_lines = []
+            self._math_data = []
+            self._math_errors = set()
             self._plot_paused = False
 
     def _clear_graph(self):
         """Reset all plot data to zeros."""
         for i, (arr, line) in enumerate(zip(self.plot_data, self.plot_lines)):
+            arr[:] = 0
+            line.setData(arr)
+        for arr, line in zip(self._math_data, self._math_lines):
             arr[:] = 0
             line.setData(arr)
         if self._y2_viewbox:
@@ -1433,6 +1462,12 @@ class SerialDataView(QtWidgets.QWidget):
             color = self._channel_color(i)
             val = arr[x_idx]
             parts.append(f'<span style="color:{color}"><b>{name}</b>: {val:.4f}</span>')
+        for i, (mch, arr) in enumerate(zip(self._math_channels, self._math_data)):
+            color = self._math_channel_color(i)
+            name = mch.get('name', f'Math {i}')
+            if x_idx < len(arr):
+                val = arr[x_idx]
+                parts.append(f'<span style="color:{color}"><b>{name}</b>: {val:.4f}</span>')
         html = '<br>'.join(parts)
         self._cursor_label.setHtml(f'<div style="background:rgba(255,255,255,200);padding:2px">{html}</div>')
         self._cursor_label.setPos(x, mouse_point.y())
@@ -1592,6 +1627,92 @@ class SerialDataView(QtWidgets.QWidget):
             fft_mag = np.abs(np.fft.rfft(arr))
             self._fft_lines[i].setData(fft_mag)
 
+    # --- Math / Computed Channels ---
+
+    def _open_math_dialog(self):
+        """Open the math channel configuration dialog."""
+        dlg = MathChannelDialog(self._math_channels, self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self._math_channels = dlg.get_math_channels()
+            self._rebuild_math_lines()
+            self._save_settings()
+
+    def _math_channel_color(self, math_index):
+        """Return a color for a math channel, picking from unused PLOT_COLORS."""
+        n_regular = self.graph_channels.value()
+        color_index = n_regular + math_index
+        return PLOT_COLORS[color_index % len(PLOT_COLORS)]
+
+    def _rebuild_math_lines(self):
+        """Create or remove math channel plot lines to match definitions."""
+        if self.graphWidget is None:
+            self._math_lines = []
+            self._math_data = []
+            self._math_errors = set()
+            return
+
+        # Remove old math lines
+        for line in self._math_lines:
+            self.graphWidget.plotItem.removeItem(line)
+            if self.graphWidget.plotItem.legend is not None:
+                self.graphWidget.plotItem.legend.removeItem(line)
+        self._math_lines = []
+        self._math_data = []
+        self._math_errors = set()
+
+        plot_length = self.plot_length_spin.value()
+        for i, mch in enumerate(self._math_channels):
+            color = self._math_channel_color(i)
+            pen = pg.mkPen(color, width=2, style=QtCore.Qt.DotLine)
+            name = mch.get('name', f'Math {i}')
+            line = pg.PlotDataItem(pen=pen, name=name)
+            arr = np.zeros(plot_length)
+            line.setData(arr)
+            self.graphWidget.plotItem.addItem(line)
+            if self.graphWidget.plotItem.legend is not None:
+                self.graphWidget.plotItem.legend.addItem(line, name)
+            self._math_lines.append(line)
+            self._math_data.append(arr)
+
+    def _eval_math_expression(self, expression):
+        """Evaluate a math expression safely and return the result array."""
+        namespace = {'__builtins__': {}, 'np': np, 'numpy': np}
+        for i, arr in enumerate(self.plot_data):
+            namespace[f'ch{i}'] = arr
+        try:
+            result = eval(expression, {"__builtins__": {}}, namespace)
+            # Ensure result is a numpy array of the right length
+            if isinstance(result, (int, float)):
+                result = np.full(len(self.plot_data[0]), result)
+            result = np.asarray(result, dtype=float)
+            if result.shape != self.plot_data[0].shape:
+                return None
+            return result
+        except Exception:
+            return None
+
+    def _update_math_channels(self):
+        """Evaluate all math expressions and update their plot lines."""
+        if not self._math_channels or not self._math_lines or not self.plot_data:
+            return
+        for i, mch in enumerate(self._math_channels):
+            if i >= len(self._math_lines):
+                break
+            result = self._eval_math_expression(mch['expression'])
+            if result is not None:
+                self._math_data[i][:] = result
+                self._math_lines[i].setData(self._math_data[i])
+                if i in self._math_errors:
+                    self._math_errors.discard(i)
+                    # Restore normal pen
+                    color = self._math_channel_color(i)
+                    self._math_lines[i].setPen(pg.mkPen(color, width=2, style=QtCore.Qt.DotLine))
+            else:
+                if i not in self._math_errors:
+                    self._math_errors.add(i)
+                    # Set red pen to indicate error
+                    self._math_lines[i].setPen(pg.mkPen('#ff0000', width=2, style=QtCore.Qt.DotLine))
+
     def _append_data_point(self, value, channel):
         """Append a data point to a plot channel using in-place array shift."""
         if channel >= len(self.plot_data):
@@ -1631,12 +1752,18 @@ class SerialDataView(QtWidgets.QWidget):
         arr[-1] = value
         self.plot_lines[channel].setData(arr)
 
-        # Update FFT every 10 samples (count on channel 0)
-        if channel == 0 and self._fft_widget is not None:
-            self._fft_update_counter += 1
-            if self._fft_update_counter >= 10:
-                self._fft_update_counter = 0
-                self._update_fft()
+        # Update FFT and math channels every 10 samples (count on channel 0)
+        if channel == 0:
+            if self._fft_widget is not None:
+                self._fft_update_counter += 1
+                if self._fft_update_counter >= 10:
+                    self._fft_update_counter = 0
+                    self._update_fft()
+            if self._math_lines:
+                self._math_update_counter += 1
+                if self._math_update_counter >= 10:
+                    self._math_update_counter = 0
+                    self._update_math_channels()
 
     def _get_delimiter(self):
         """Return the active delimiter string, or None for auto-detect."""
@@ -1861,6 +1988,7 @@ class SerialDataView(QtWidgets.QWidget):
                 'frame_size': self.frame_size_spin.value(),
                 'checksum': self.checksum_check.isChecked(),
             },
+            'math_channels': self._math_channels,
         }
 
     def _save_settings(self, path=None):
@@ -1913,6 +2041,15 @@ class SerialDataView(QtWidgets.QWidget):
             self.size_field_combo.setCurrentText(sf_map.get(sf, 'Fixed'))
             self.frame_size_spin.setValue(frame.get('frame_size', 12))
             self.checksum_check.setChecked(frame.get('checksum', False))
+
+            # Math channels
+            saved_math = s.get('math_channels', [])
+            if isinstance(saved_math, list):
+                self._math_channels = [
+                    {'name': m.get('name', ''), 'expression': m.get('expression', '')}
+                    for m in saved_math
+                    if isinstance(m, dict) and m.get('expression', '').strip()
+                ]
         except (KeyError, TypeError):
             pass
 
@@ -2088,6 +2225,107 @@ class HLine(QFrame):
         super().__init__()
         self.setFrameShape(QFrame.HLine)
         self.setFrameShadow(QFrame.Sunken)
+
+
+class MathChannelDialog(QtWidgets.QDialog):
+    """Dialog for adding/removing user-defined math channel expressions."""
+
+    def __init__(self, math_channels, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Math Channels")
+        self.setMinimumWidth(550)
+        self.setMinimumHeight(300)
+        self._rows = []
+
+        main_layout = QtWidgets.QVBoxLayout(self)
+
+        # Header
+        header = QtWidgets.QLabel(
+            "Define computed channels using numpy expressions.\n"
+            "Use ch0, ch1, ... to reference plot channels. "
+            "numpy is available as np.")
+        header.setFont(QtGui.QFont('Segoe UI', 9))
+        header.setWordWrap(True)
+        main_layout.addWidget(header)
+
+        # Scrollable area for channel rows
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        self._row_container = QtWidgets.QWidget()
+        self._row_layout = QtWidgets.QVBoxLayout(self._row_container)
+        self._row_layout.setContentsMargins(0, 0, 0, 0)
+        self._row_layout.addStretch()
+        scroll.setWidget(self._row_container)
+        main_layout.addWidget(scroll)
+
+        # Add button
+        add_btn = QtWidgets.QPushButton("+ Add Math Channel")
+        add_btn.setFont(QtGui.QFont('Segoe UI', 10))
+        add_btn.clicked.connect(self._add_row)
+        main_layout.addWidget(add_btn)
+
+        # OK / Cancel
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        main_layout.addWidget(buttons)
+
+        # Populate from existing definitions
+        for ch in math_channels:
+            self._add_row(ch.get('name', ''), ch.get('expression', ''))
+
+    def _add_row(self, name='', expression=''):
+        """Add one math channel row to the dialog."""
+        # When called from button click, name will be False (Qt signal arg)
+        if isinstance(name, bool):
+            name = ''
+        row_widget = QtWidgets.QWidget()
+        row_layout = QtWidgets.QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 2, 0, 2)
+
+        name_edit = QtWidgets.QLineEdit(name)
+        name_edit.setPlaceholderText("Name (e.g. Power)")
+        name_edit.setFont(QtGui.QFont('Segoe UI', 10))
+        name_edit.setFixedWidth(120)
+
+        expr_edit = QtWidgets.QLineEdit(expression)
+        expr_edit.setPlaceholderText("Expression (e.g. ch0 * ch1)")
+        expr_edit.setFont(QtGui.QFont('Segoe UI', 10))
+
+        remove_btn = QtWidgets.QPushButton("X")
+        remove_btn.setFont(QtGui.QFont('Segoe UI', 10))
+        remove_btn.setFixedWidth(30)
+        remove_btn.setToolTip("Remove this math channel")
+
+        row_layout.addWidget(name_edit)
+        row_layout.addWidget(expr_edit)
+        row_layout.addWidget(remove_btn)
+
+        row_data = {'widget': row_widget, 'name': name_edit, 'expr': expr_edit}
+        self._rows.append(row_data)
+
+        # Insert before the stretch
+        self._row_layout.insertWidget(self._row_layout.count() - 1, row_widget)
+
+        remove_btn.clicked.connect(lambda: self._remove_row(row_data))
+
+    def _remove_row(self, row_data):
+        """Remove a math channel row from the dialog."""
+        if row_data in self._rows:
+            self._rows.remove(row_data)
+            row_data['widget'].setParent(None)
+            row_data['widget'].deleteLater()
+
+    def get_math_channels(self):
+        """Return list of {'name': str, 'expression': str} from the dialog."""
+        result = []
+        for row in self._rows:
+            name = row['name'].text().strip()
+            expr = row['expr'].text().strip()
+            if expr:  # skip empty expressions
+                result.append({'name': name or f'Math {len(result)}', 'expression': expr})
+        return result
 
 
 class MacroEditDialog(QtWidgets.QDialog):
