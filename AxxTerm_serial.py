@@ -2,6 +2,7 @@
 import sys
 import math
 import re
+import struct
 import os
 import json
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -31,6 +32,19 @@ else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MACROS_FILE = os.path.join(SCRIPT_DIR, 'macros.json')
 NUM_MACRO_BUTTONS = 8
+
+SETTINGS_FILE = os.path.join(SCRIPT_DIR, 'plot_settings.json')
+
+DATA_TYPES = {
+    'uint8':    ('B', 1),
+    'int8':     ('b', 1),
+    'uint16':   ('H', 2),
+    'int16':    ('h', 2),
+    'uint32':   ('I', 4),
+    'int32':    ('i', 4),
+    'float32':  ('f', 4),
+    'double64': ('d', 8),
+}
 
 DEFAULT_MACROS = [
     {"label": "0x7F",           "hex": "7F"},
