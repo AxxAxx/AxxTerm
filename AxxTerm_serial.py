@@ -374,6 +374,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.plot_lines = []
         self.plot_data = []
         self.graphWidget = None
+        self.channel_names = {}  # {index: 'custom name'} for renamed channels
         # Tracks whether the previous received chunk ended in '\r'. Used to
         # suppress a '\n' that begins the next chunk when CRLF is split across
         # serial reads (otherwise Qt renders a blank line between messages).
@@ -561,6 +562,10 @@ class SerialDataView(QtWidgets.QWidget):
 
         self._load_settings()
 
+    def _channel_name(self, index):
+        """Return custom name for a channel, or default 'Ch N'."""
+        return self.channel_names.get(index, f'Ch {index}')
+
     def _create_plot_lines(self):
         """Create plot lines based on the current channel count spinbox."""
         n = self.graph_channels.value()
@@ -571,7 +576,7 @@ class SerialDataView(QtWidgets.QWidget):
             color = PLOT_COLORS[i % len(PLOT_COLORS)]
             line = self.graphWidget.plotItem.plot(
                 pen=pg.mkPen(color, width=2),
-                name=f'Ch {i}'
+                name=self._channel_name(i)
             )
             arr = np.zeros(plot_length)
             line.setData(arr)
@@ -600,6 +605,7 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.setXRange(0, self.plot_length_spin.value())
             self.graphWidget.enableAutoRange(axis='y')
             self.graphWidget.addLegend()
+            self.graphWidget.plotItem.legend.sigDoubleClicked.connect(self._on_legend_double_clicked)
             self._create_plot_lines()
             self.numberbuffer = []
             self.layout().addWidget(self.graphWidget, 0, 0, 1, 6)
@@ -609,6 +615,21 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget = None
             self.plot_lines = []
             self.plot_data = []
+
+    def _on_legend_double_clicked(self, legend, ev):
+        """Rename a channel by double-clicking its legend entry."""
+        pos = ev.scenePos()
+        for i, (sample, label) in enumerate(legend.items):
+            row_rect = sample.sceneBoundingRect().united(label.sceneBoundingRect())
+            if row_rect.contains(pos):
+                current = self._channel_name(i)
+                new_name, ok = QtWidgets.QInputDialog.getText(
+                    self, 'Rename Channel', f'Channel {i} name:', text=current)
+                if ok and new_name.strip():
+                    self.channel_names[i] = new_name.strip()
+                    label.setText(new_name.strip())
+                    self._save_settings()
+                break
 
     def _append_data_point(self, value, channel):
         """Append a data point to a plot channel using in-place array shift."""
@@ -779,6 +800,7 @@ class SerialDataView(QtWidgets.QWidget):
             'num_points': self.plot_length_spin.value(),
             'delimiter': self.delimiter_combo.currentText(),
             'delimiter_custom': self.delimiter_custom.text(),
+            'channel_names': {str(k): v for k, v in self.channel_names.items()},
             'binary': {
                 'data_type': self.type_combo.currentText(),
                 'endianness': self.endian_combo.currentText().lower(),
@@ -820,6 +842,9 @@ class SerialDataView(QtWidgets.QWidget):
             self.plot_length_spin.setValue(s.get('num_points', DEFAULT_PLOT_LENGTH))
             self.delimiter_combo.setCurrentText(s.get('delimiter', 'Auto'))
             self.delimiter_custom.setText(s.get('delimiter_custom', ''))
+
+            saved_names = s.get('channel_names', {})
+            self.channel_names = {int(k): v for k, v in saved_names.items()}
 
             frame = s.get('frame', {})
             binary = s.get('binary', {})
@@ -908,10 +933,11 @@ class SerialDataView(QtWidgets.QWidget):
         for i, val in enumerate(sample):
             color = QColor(PLOT_COLORS[i % len(PLOT_COLORS)])
             self.serialData.setTextColor(color)
+            name = self._channel_name(i)
             if isinstance(val, float):
-                text = f'Ch{i}: {val:.4f}'
+                text = f'{name}: {val:.4f}'
             else:
-                text = f'Ch{i}: {val}'
+                text = f'{name}: {val}'
             if i < len(sample) - 1:
                 text += '  '
             self.serialData.insertPlainText(text)
