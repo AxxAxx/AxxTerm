@@ -374,7 +374,8 @@ class SerialDataView(QtWidgets.QWidget):
         self.plot_lines = []
         self.plot_data = []
         self.graphWidget = None
-        self.channel_names = {}  # {index: 'custom name'} for renamed channels
+        self.channel_names = {}   # {index: 'custom name'} for renamed channels
+        self.channel_colors = {}  # {index: '#hex'} for custom channel colors
         # Tracks whether the previous received chunk ended in '\r'. Used to
         # suppress a '\n' that begins the next chunk when CRLF is split across
         # serial reads (otherwise Qt renders a blank line between messages).
@@ -564,6 +565,10 @@ class SerialDataView(QtWidgets.QWidget):
         """Return custom name for a channel, or default 'Ch N'."""
         return self.channel_names.get(index, f'Ch {index}')
 
+    def _channel_color(self, index):
+        """Return custom color for a channel, or default from PLOT_COLORS."""
+        return self.channel_colors.get(index, PLOT_COLORS[index % len(PLOT_COLORS)])
+
     def _create_plot_lines(self):
         """Create plot lines based on the current channel count spinbox."""
         n = self.graph_channels.value()
@@ -571,7 +576,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.plot_lines = []
         self.plot_data = []
         for i in range(n):
-            color = PLOT_COLORS[i % len(PLOT_COLORS)]
+            color = self._channel_color(i)
             line = self.graphWidget.plotItem.plot(
                 pen=pg.mkPen(color, width=2),
                 name=self._channel_name(i)
@@ -603,7 +608,7 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.setXRange(0, self.plot_length_spin.value())
             self.graphWidget.enableAutoRange(axis='y')
             self.graphWidget.addLegend()
-            self.graphWidget.plotItem.legend.sigDoubleClicked.connect(self._on_legend_double_clicked)
+            self.graphWidget.scene().sigMouseClicked.connect(self._on_plot_mouse_clicked)
             self._create_plot_lines()
             self.numberbuffer = []
             self.splitter.insertWidget(0, self.graphWidget)
@@ -614,20 +619,57 @@ class SerialDataView(QtWidgets.QWidget):
             self.plot_lines = []
             self.plot_data = []
 
-    def _on_legend_double_clicked(self, legend, ev):
-        """Rename a channel by double-clicking its legend entry."""
+    def _on_plot_mouse_clicked(self, ev):
+        """Right-click on a legend entry to rename or change color."""
+        if ev.button() != QtCore.Qt.RightButton:
+            return
+        legend = self.graphWidget.plotItem.legend
+        if legend is None:
+            return
         pos = ev.scenePos()
         for i, (sample, label) in enumerate(legend.items):
             row_rect = sample.sceneBoundingRect().united(label.sceneBoundingRect())
             if row_rect.contains(pos):
-                current = self._channel_name(i)
-                new_name, ok = QtWidgets.QInputDialog.getText(
-                    self, 'Rename Channel', f'Channel {i} name:', text=current)
-                if ok and new_name.strip():
-                    self.channel_names[i] = new_name.strip()
-                    label.setText(new_name.strip())
-                    self._save_settings()
+                self._show_channel_context_menu(i, label, sample)
+                ev.accept()
                 break
+
+    def _show_channel_context_menu(self, channel_index, label, sample):
+        """Show context menu for a legend entry."""
+        menu = QtWidgets.QMenu(self)
+        rename_action = menu.addAction('Rename...')
+        color_action = menu.addAction('Change Color...')
+        reset_action = menu.addAction('Reset to Default')
+
+        action = menu.exec_(QtGui.QCursor.pos())
+        if action == rename_action:
+            current = self._channel_name(channel_index)
+            new_name, ok = QtWidgets.QInputDialog.getText(
+                self, 'Rename Channel', f'Channel {channel_index} name:', text=current)
+            if ok and new_name.strip():
+                self.channel_names[channel_index] = new_name.strip()
+                label.setText(new_name.strip())
+                self._save_settings()
+        elif action == color_action:
+            current_color = QColor(self._channel_color(channel_index))
+            color = QtWidgets.QColorDialog.getColor(current_color, self, 'Channel Color')
+            if color.isValid():
+                hex_color = color.name()
+                self.channel_colors[channel_index] = hex_color
+                self.plot_lines[channel_index].setPen(pg.mkPen(hex_color, width=2))
+                sample.item = self.plot_lines[channel_index]
+                sample.update()
+                self._save_settings()
+        elif action == reset_action:
+            self.channel_names.pop(channel_index, None)
+            self.channel_colors.pop(channel_index, None)
+            default_name = f'Ch {channel_index}'
+            default_color = PLOT_COLORS[channel_index % len(PLOT_COLORS)]
+            label.setText(default_name)
+            self.plot_lines[channel_index].setPen(pg.mkPen(default_color, width=2))
+            sample.item = self.plot_lines[channel_index]
+            sample.update()
+            self._save_settings()
 
     def _append_data_point(self, value, channel):
         """Append a data point to a plot channel using in-place array shift."""
@@ -794,6 +836,7 @@ class SerialDataView(QtWidgets.QWidget):
             'delimiter': self.delimiter_combo.currentText(),
             'delimiter_custom': self.delimiter_custom.text(),
             'channel_names': {str(k): v for k, v in self.channel_names.items()},
+            'channel_colors': {str(k): v for k, v in self.channel_colors.items()},
             'binary': {
                 'data_type': self.type_combo.currentText(),
                 'endianness': self.endian_combo.currentText().lower(),
@@ -838,6 +881,8 @@ class SerialDataView(QtWidgets.QWidget):
 
             saved_names = s.get('channel_names', {})
             self.channel_names = {int(k): v for k, v in saved_names.items()}
+            saved_colors = s.get('channel_colors', {})
+            self.channel_colors = {int(k): v for k, v in saved_colors.items()}
 
             frame = s.get('frame', {})
             binary = s.get('binary', {})
@@ -924,7 +969,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.serialData.moveCursor(QtGui.QTextCursor.End)
         self.serialData.setFontFamily('Segoe UI')
         for i, val in enumerate(sample):
-            color = QColor(PLOT_COLORS[i % len(PLOT_COLORS)])
+            color = QColor(self._channel_color(i))
             self.serialData.setTextColor(color)
             name = self._channel_name(i)
             if isinstance(val, float):
