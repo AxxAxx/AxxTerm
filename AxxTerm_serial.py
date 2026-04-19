@@ -600,6 +600,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.plot_length_spin.valueChanged.connect(self._on_setting_changed)
 
         self.clear_button = QtWidgets.QPushButton('Clear ALL')
+        self.clear_button.setFont(QtGui.QFont('Segoe UI', 12))
         self.clear_button.clicked.connect(self.clear_button_Clicked)
         self.clear_button.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred)
 
@@ -614,6 +615,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.convert_A_type.addItems(list(CONVERTERS.keys()))
         self.convert_A_type.setCurrentIndex(0)
         self.convert_A_type.setMinimumHeight(30)
+        self.convert_A_type.setFont(QtGui.QFont('Segoe UI', 12))
         self.convert_A_type.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         self.convert_A_type.currentIndexChanged.connect(self.translate_data)
 
@@ -1486,7 +1488,7 @@ class MacroButton(QtWidgets.QPushButton):
         super().__init__(label, parent)
         self.hex_data = hex_data
         self.send_callback = send_callback
-        self.setFont(QtGui.QFont('Segoe UI', 10, 60))
+        self.setFont(QtGui.QFont('Segoe UI', 12))
         self.setStyleSheet('color: white; background-color: #006600')
         self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -1518,10 +1520,13 @@ class SerialSendView(QtWidgets.QWidget):
         self.history = []
         self.history_index = 0
 
+        send_font = QtGui.QFont('Segoe UI', 12)
+
         self.charMode = QtWidgets.QComboBox(self)
         self.charMode.addItems(['ASCII', 'HEX', 'BINARY'])
         self.charMode.setCurrentIndex(0)
         self.charMode.setMinimumHeight(30)
+        self.charMode.setFont(send_font)
         self.charMode.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
 
         self.lineEnding = QtWidgets.QComboBox(self)
@@ -1533,6 +1538,7 @@ class SerialSendView(QtWidgets.QWidget):
         ])
         self.lineEnding.setCurrentIndex(1)
         self.lineEnding.setMinimumHeight(30)
+        self.lineEnding.setFont(send_font)
         self.lineEnding.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
 
         self.sendData = QtWidgets.QTextEdit(self)
@@ -1541,10 +1547,11 @@ class SerialSendView(QtWidgets.QWidget):
         self.sendData.setMaximumHeight(31)
         self.sendData.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         self.sendData.textChanged.connect(self._strip_newlines)
-        self.sendData.setFont(QtGui.QFont('Segoe UI', 12))
+        self.sendData.setFont(send_font)
 
         self.sendButton = QtWidgets.QPushButton('Send')
         self.sendButton.clicked.connect(self.sendButtonClicked)
+        self.sendButton.setFont(send_font)
         self.sendButton.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
 
         # Macro buttons (right-click to edit)
