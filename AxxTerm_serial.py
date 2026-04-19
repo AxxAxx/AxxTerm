@@ -578,8 +578,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.frame_size_spin.valueChanged.connect(self._on_setting_changed)
 
         # Frame-only: checksum
-        self.checksum_check = QtWidgets.QCheckBox('Chk')
-        self.checksum_check.setToolTip('Enable 8-bit checksum')
+        self.checksum_check = QtWidgets.QCheckBox('Checksum')
         self.checksum_check.stateChanged.connect(self._on_setting_changed)
 
         self._frame_only_widgets = [
@@ -596,6 +595,15 @@ class SerialDataView(QtWidgets.QWidget):
         cl = QtWidgets.QHBoxLayout(controls)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(4)
+        row_widgets = [
+            self.data_mode, self.type_combo, self.delimiter_combo,
+            self.delimiter_custom, self.graph_channels, self.endian_combo,
+            self.sync_button, self.sync_word_edit, self.size_field_combo,
+            self.frame_size_spin, self.checksum_check, self.plot_length_spin,
+            self.graph_mode,
+        ]
+        for w in row_widgets:
+            w.setFixedHeight(30)
         # Left: decoding group
         cl.addWidget(self.data_mode)
         cl.addWidget(self.type_combo)
@@ -696,7 +704,7 @@ class SerialDataView(QtWidgets.QWidget):
             # Clear Graph button overlaid in lower-right corner
             self._clear_graph_btn = QtWidgets.QPushButton('Clear Graph', self.graphWidget)
             self._clear_graph_btn.setStyleSheet(
-                'background-color: rgba(255,255,255,180); border: 1px solid #aaa; padding: 2px 8px;')
+                'background-color: #ffffff; border: 1px solid #aaa; padding: 2px 8px;')
             self._clear_graph_btn.clicked.connect(self._clear_graph)
             self._clear_graph_btn.adjustSize()
             self.graphWidget.installEventFilter(self)
