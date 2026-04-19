@@ -793,6 +793,16 @@ class SerialDataView(QtWidgets.QWidget):
         self._binary_reader = BinaryStreamReader()
         self._frame_reader = FrameReader()
 
+        # Pause / Trigger state
+        self._plot_paused = False
+        self._trigger_enabled = False
+        self._trigger_armed = False
+        self._trigger_channel = 0
+        self._trigger_level = 0.0
+        self._trigger_edge = 'rising'
+        self._trigger_countdown = -1
+        self._trigger_prev_value = None  # previous value on trigger channel
+
         self.serialData = QtWidgets.QTextEdit(self)
         self.serialData.setReadOnly(True)
         self.serialData.setFontFamily('Segoe UI')
@@ -957,8 +967,58 @@ class SerialDataView(QtWidgets.QWidget):
         cl.addWidget(self.size_field_combo)
         cl.addWidget(self.frame_size_spin)
         cl.addWidget(self.checksum_check)
-        # Right: plot controls
+        # Middle: trigger controls
         cl.addStretch()
+
+        self._trigger_check = QCheckBox("Trigger")
+        self._trigger_check.setFont(row_font)
+        self._trigger_check.setFixedHeight(30)
+        self._trigger_check.stateChanged.connect(self._on_trigger_toggled)
+
+        self._trigger_ch_spin = QSpinBox(minimum=0, maximum=11, value=0, prefix="Ch: ")
+        self._trigger_ch_spin.setFont(row_font)
+        self._trigger_ch_spin.setFixedHeight(30)
+        self._trigger_ch_spin.valueChanged.connect(self._on_trigger_setting_changed)
+
+        self._trigger_level_edit = QtWidgets.QLineEdit("0.0")
+        self._trigger_level_edit.setFont(row_font)
+        self._trigger_level_edit.setFixedHeight(30)
+        self._trigger_level_edit.setFixedWidth(70)
+        self._trigger_level_edit.setPlaceholderText("Level")
+        self._trigger_level_edit.editingFinished.connect(self._on_trigger_setting_changed)
+
+        self._trigger_edge_combo = QtWidgets.QComboBox()
+        self._trigger_edge_combo.addItems(['Rising', 'Falling'])
+        self._trigger_edge_combo.setFont(row_font)
+        self._trigger_edge_combo.setFixedHeight(30)
+        self._trigger_edge_combo.currentIndexChanged.connect(self._on_trigger_setting_changed)
+
+        self._trigger_rearm_btn = QtWidgets.QPushButton("Re-arm")
+        self._trigger_rearm_btn.setFont(row_font)
+        self._trigger_rearm_btn.setFixedHeight(30)
+        self._trigger_rearm_btn.clicked.connect(self._on_trigger_rearm)
+
+        cl.addWidget(self._trigger_check)
+        cl.addWidget(self._trigger_ch_spin)
+        cl.addWidget(self._trigger_level_edit)
+        cl.addWidget(self._trigger_edge_combo)
+        cl.addWidget(self._trigger_rearm_btn)
+
+        # Initially hide trigger detail widgets
+        self._trigger_detail_widgets = [
+            self._trigger_ch_spin, self._trigger_level_edit,
+            self._trigger_edge_combo, self._trigger_rearm_btn,
+        ]
+        for w in self._trigger_detail_widgets:
+            w.setVisible(False)
+
+        # Separator before plot controls
+        _trig_sep = QtWidgets.QFrame()
+        _trig_sep.setFrameShape(QtWidgets.QFrame.VLine)
+        _trig_sep.setFrameShadow(QtWidgets.QFrame.Sunken)
+        cl.addWidget(_trig_sep)
+
+        # Right: plot controls
         cl.addWidget(self.plot_length_spin)
         cl.addWidget(self.graph_mode)
 
@@ -1095,6 +1155,12 @@ class SerialDataView(QtWidgets.QWidget):
             self._cursor_label.setVisible(False)
             self.graphWidget.addItem(self._cursor_label)
             self.graphWidget.scene().sigMouseMoved.connect(self._on_mouse_moved)
+            # Pause button overlaid in lower-right corner (left of Clear Plot)
+            self._pause_btn = QtWidgets.QPushButton('Pause', self.graphWidget)
+            self._pause_btn.setStyleSheet(
+                'background-color: #ffffff; border: 1px solid #aaa; padding: 2px 8px;')
+            self._pause_btn.clicked.connect(self._toggle_pause)
+            self._pause_btn.adjustSize()
             # Clear Plot button overlaid in lower-right corner
             self._clear_graph_btn = QtWidgets.QPushButton('Clear Plot', self.graphWidget)
             self._clear_graph_btn.setStyleSheet(
@@ -1103,7 +1169,7 @@ class SerialDataView(QtWidgets.QWidget):
             self._clear_graph_btn.adjustSize()
             self.graphWidget.installEventFilter(self)
             self.splitter.insertWidget(0, self.graphWidget)
-            self._position_clear_graph_btn()
+            self._position_overlay_buttons()
             self._update_graph_theme()
         else:
             self.graphWidget.removeEventFilter(self)
@@ -1111,16 +1177,76 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.deleteLater()
             self.graphWidget = None
             self._clear_graph_btn = None
+            self._pause_btn = None
             self._crosshair = None
             self._cursor_label = None
             self.plot_lines = []
             self.plot_data = []
+            self._plot_paused = False
 
     def _clear_graph(self):
         """Reset all plot data to zeros."""
         for i, (arr, line) in enumerate(zip(self.plot_data, self.plot_lines)):
             arr[:] = 0
             line.setData(arr)
+
+    def _toggle_pause(self):
+        """Toggle plot pause/resume."""
+        self._plot_paused = not self._plot_paused
+        self._update_pause_btn_style()
+        self._position_overlay_buttons()
+
+    def _update_pause_btn_style(self):
+        """Update the pause button text and color to reflect current state."""
+        if not hasattr(self, '_pause_btn') or self._pause_btn is None:
+            return
+        dark = getattr(self.window(), '_dark_mode', False)
+        if self._plot_paused:
+            self._pause_btn.setText('Resume')
+            self._pause_btn.setStyleSheet(
+                'background-color: #cc6600; color: #ffffff; border: 1px solid #995500; '
+                'padding: 2px 8px; font-weight: bold;')
+        else:
+            self._pause_btn.setText('Pause')
+            if dark:
+                self._pause_btn.setStyleSheet(
+                    'background-color: #353535; color: #ffffff; border: 1px solid #666; padding: 2px 8px;')
+            else:
+                self._pause_btn.setStyleSheet(
+                    'background-color: #ffffff; border: 1px solid #aaa; padding: 2px 8px;')
+
+    def _on_trigger_toggled(self):
+        """Enable or disable trigger mode."""
+        self._trigger_enabled = self._trigger_check.isChecked()
+        for w in self._trigger_detail_widgets:
+            w.setVisible(self._trigger_enabled)
+        if self._trigger_enabled:
+            self._trigger_armed = True
+            self._trigger_countdown = -1
+            self._trigger_prev_value = None
+            self._on_trigger_setting_changed()
+        else:
+            self._trigger_armed = False
+            self._trigger_countdown = -1
+
+    def _on_trigger_setting_changed(self):
+        """Update trigger parameters from UI."""
+        self._trigger_channel = self._trigger_ch_spin.value()
+        try:
+            self._trigger_level = float(self._trigger_level_edit.text())
+        except ValueError:
+            self._trigger_level = 0.0
+        self._trigger_edge = 'rising' if self._trigger_edge_combo.currentIndex() == 0 else 'falling'
+        self._trigger_prev_value = None
+
+    def _on_trigger_rearm(self):
+        """Re-arm the trigger: resume plotting and reset trigger state."""
+        self._plot_paused = False
+        self._trigger_armed = True
+        self._trigger_countdown = -1
+        self._trigger_prev_value = None
+        self._update_pause_btn_style()
+        self._position_overlay_buttons()
 
     def _update_graph_theme(self):
         """Update graph background and axis colors based on dark mode state."""
@@ -1146,17 +1272,32 @@ class SerialDataView(QtWidgets.QWidget):
                 else:
                     self._clear_graph_btn.setStyleSheet(
                         'background-color: #ffffff; border: 1px solid #aaa; padding: 2px 8px;')
+            if hasattr(self, '_pause_btn') and self._pause_btn is not None:
+                self._update_pause_btn_style()
 
-    def _position_clear_graph_btn(self):
-        """Position the Clear Plot button in the lower-right of the graph."""
-        if self._clear_graph_btn and self.graphWidget:
+    def _position_overlay_buttons(self):
+        """Position the Pause and Clear Plot buttons in the lower-right of the graph."""
+        if self.graphWidget is None:
+            return
+        gw = self.graphWidget
+        margin = 5
+        y = gw.height() - margin
+        x = gw.width() - margin
+        if self._clear_graph_btn:
             btn = self._clear_graph_btn
-            gw = self.graphWidget
-            btn.move(gw.width() - btn.width() - 5, gw.height() - btn.height() - 5)
+            btn.adjustSize()
+            x -= btn.width()
+            btn.move(x, y - btn.height())
+            x -= margin
+        if hasattr(self, '_pause_btn') and self._pause_btn:
+            btn = self._pause_btn
+            btn.adjustSize()
+            x -= btn.width()
+            btn.move(x, y - btn.height())
 
     def eventFilter(self, obj, event):
         if obj is self.graphWidget and event.type() == QtCore.QEvent.Resize:
-            self._position_clear_graph_btn()
+            self._position_overlay_buttons()
         return super().eventFilter(obj, event)
 
     def _on_mouse_moved(self, scene_pos):
@@ -1259,7 +1400,37 @@ class SerialDataView(QtWidgets.QWidget):
         """Append a data point to a plot channel using in-place array shift."""
         if channel >= len(self.plot_data):
             return
+
+        # When paused, don't update arrays at all -- plot freezes
+        if self._plot_paused:
+            return
+
         arr = self.plot_data[channel]
+
+        # Trigger detection (only check on the trigger channel)
+        if (self._trigger_armed and self._trigger_countdown < 0
+                and channel == self._trigger_channel):
+            prev = self._trigger_prev_value
+            self._trigger_prev_value = value
+            if prev is not None:
+                fired = False
+                if self._trigger_edge == 'rising':
+                    fired = prev < self._trigger_level and value >= self._trigger_level
+                else:
+                    fired = prev > self._trigger_level and value <= self._trigger_level
+                if fired:
+                    self._trigger_countdown = len(arr) // 2
+
+        # Decrement trigger countdown (per-sample on channel 0 to count once per sample set)
+        if self._trigger_countdown > 0 and channel == 0:
+            self._trigger_countdown -= 1
+            if self._trigger_countdown <= 0:
+                self._plot_paused = True
+                self._trigger_armed = False
+                self._trigger_countdown = -1
+                self._update_pause_btn_style()
+                self._position_overlay_buttons()
+
         arr[:-1] = arr[1:]
         arr[-1] = value
         self.plot_lines[channel].setData(arr)
