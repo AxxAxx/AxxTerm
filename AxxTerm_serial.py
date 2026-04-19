@@ -574,33 +574,33 @@ class SerialDataView(QtWidgets.QWidget):
         self.serialDataHex.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
         self.label_data_flow = QtWidgets.QLabel('Data: HEX')
-        self.label_data_flow.setFont(QtGui.QFont('Segoe UI', 12))
+        self.label_data_flow.setFont(QtGui.QFont('Segoe UI', 10))
         self.label_data_flow.setIndent(5)
 
         self.label_sent_data = QtWidgets.QLabel('Data: ASCII')
-        self.label_sent_data.setFont(QtGui.QFont('Segoe UI', 12))
+        self.label_sent_data.setFont(QtGui.QFont('Segoe UI', 10))
         self.label_sent_data.setIndent(5)
 
         self.graph_mode = QCheckBox("Show Plot")
-        self.graph_mode.setFont(QtGui.QFont('Segoe UI', 12))
+        self.graph_mode.setFont(QtGui.QFont('Segoe UI', 10))
         self.graph_mode.stateChanged.connect(self.graph_state_changed)
 
         self.graph_channels = QSpinBox(minimum=1, maximum=12, value=4, prefix="Ch: ")
-        self.graph_channels.setFont(QtGui.QFont('Segoe UI', 12))
+        self.graph_channels.setFont(QtGui.QFont('Segoe UI', 10))
         self.graph_channels.valueChanged.connect(self._on_channels_changed)
 
         self.data_mode = QtWidgets.QComboBox()
         self.data_mode.addItems(['ASCII', 'Binary Stream', 'Custom Frame'])
-        self.data_mode.setFont(QtGui.QFont('Segoe UI', 12))
+        self.data_mode.setFont(QtGui.QFont('Segoe UI', 10))
         self.data_mode.setMinimumWidth(130)
         self.data_mode.currentIndexChanged.connect(self._on_mode_changed)
 
         self.plot_length_spin = QSpinBox(minimum=10, maximum=10000, value=DEFAULT_PLOT_LENGTH, prefix="Pts: ", singleStep=50)
-        self.plot_length_spin.setFont(QtGui.QFont('Segoe UI', 12))
+        self.plot_length_spin.setFont(QtGui.QFont('Segoe UI', 10))
         self.plot_length_spin.valueChanged.connect(self._on_setting_changed)
 
         self.clear_button = QtWidgets.QPushButton('Clear ALL')
-        self.clear_button.setFont(QtGui.QFont('Segoe UI', 12))
+        self.clear_button.setFont(QtGui.QFont('Segoe UI', 10))
         self.clear_button.clicked.connect(self.clear_button_Clicked)
         self.clear_button.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred)
 
@@ -608,14 +608,14 @@ class SerialDataView(QtWidgets.QWidget):
         self.label.setPixmap(create_connector_pixmap('#cc2222'))
 
         self.converter_label = QtWidgets.QLabel('Converter')
-        self.converter_label.setFont(QtGui.QFont('Segoe UI', 12))
+        self.converter_label.setFont(QtGui.QFont('Segoe UI', 10))
         self.converter_label.setIndent(5)
 
         self.convert_A_type = QtWidgets.QComboBox(self)
         self.convert_A_type.addItems(list(CONVERTERS.keys()))
         self.convert_A_type.setCurrentIndex(0)
         self.convert_A_type.setMinimumHeight(30)
-        self.convert_A_type.setFont(QtGui.QFont('Segoe UI', 12))
+        self.convert_A_type.setFont(QtGui.QFont('Segoe UI', 10))
         self.convert_A_type.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         self.convert_A_type.currentIndexChanged.connect(self.translate_data)
 
@@ -623,7 +623,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.convert_A_text.setMaximumHeight(31)
         self.convert_A_text.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         self.convert_A_text.textChanged.connect(self.translate_data)
-        self.convert_A_text.setFont(QtGui.QFont('Segoe UI', 12))
+        self.convert_A_text.setFont(QtGui.QFont('Segoe UI', 10))
 
         self.convert_arrow = QtWidgets.QLabel('\u2192')
         self.convert_arrow.setFont(QtGui.QFont('Segoe UI', 14))
@@ -633,7 +633,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.convert_B_text = QtWidgets.QTextEdit(self)
         self.convert_B_text.setMaximumHeight(31)
         self.convert_B_text.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
-        self.convert_B_text.setFont(QtGui.QFont('Segoe UI', 12))
+        self.convert_B_text.setFont(QtGui.QFont('Segoe UI', 10))
 
         # --- All decode/plot widgets in one row ---
 
@@ -709,7 +709,7 @@ class SerialDataView(QtWidgets.QWidget):
             self.frame_size_spin, self.checksum_check, self.plot_length_spin,
             self.graph_mode, self._frame_start_label, self._payload_size_label,
         ]
-        row_font = QtGui.QFont('Segoe UI', 12)
+        row_font = QtGui.QFont('Segoe UI', 10)
         for w in row_widgets:
             w.setFixedHeight(30)
             w.setFont(row_font)
@@ -1488,7 +1488,7 @@ class MacroButton(QtWidgets.QPushButton):
         super().__init__(label, parent)
         self.hex_data = hex_data
         self.send_callback = send_callback
-        self.setFont(QtGui.QFont('Segoe UI', 12))
+        self.setFont(QtGui.QFont('Segoe UI', 10))
         self.setStyleSheet('color: white; background-color: #006600')
         self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
@@ -1520,7 +1520,7 @@ class SerialSendView(QtWidgets.QWidget):
         self.history = []
         self.history_index = 0
 
-        send_font = QtGui.QFont('Segoe UI', 12)
+        send_font = QtGui.QFont('Segoe UI', 10)
 
         self.charMode = QtWidgets.QComboBox(self)
         self.charMode.addItems(['ASCII', 'HEX', 'BINARY'])
@@ -1662,10 +1662,10 @@ class ToolBar(QtWidgets.QToolBar):
         super().__init__('Serial Port', parent)
         self.setMovable(False)
 
-        toolbar_font = QtGui.QFont('Segoe UI', 12)
+        toolbar_font = QtGui.QFont('Segoe UI', 10)
 
         serial_label = QtWidgets.QLabel(' Serial Port: ')
-        serial_label.setFont(QtGui.QFont('Segoe UI', 12))
+        serial_label.setFont(QtGui.QFont('Segoe UI', 10))
         self.addWidget(serial_label)
 
         self.portOpenButton = QtWidgets.QPushButton('Open')
