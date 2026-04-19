@@ -373,6 +373,9 @@ class SerialDataView(QtWidgets.QWidget):
         # serial reads (otherwise Qt renders a blank line between messages).
         self._pending_cr = False
 
+        self._binary_reader = BinaryStreamReader()
+        self._frame_reader = FrameReader()
+
         self.serialData = QtWidgets.QTextEdit(self)
         self.serialData.setReadOnly(True)
         self.serialData.setFontFamily('Segoe UI')
@@ -401,6 +404,11 @@ class SerialDataView(QtWidgets.QWidget):
         self.graph_channels = QSpinBox(minimum=1, maximum=12, value=4, prefix="Ch: ")
         self.graph_channels.setFont(QtGui.QFont('Segoe UI', 12))
         self.graph_channels.valueChanged.connect(self._on_channels_changed)
+
+        self.data_mode = QtWidgets.QComboBox()
+        self.data_mode.addItems(['ASCII', 'Binary Stream', 'Custom Frame'])
+        self.data_mode.setFont(QtGui.QFont('Segoe UI', 12))
+        self.data_mode.currentIndexChanged.connect(self._on_mode_changed)
 
         self.plot_length_spin = QSpinBox(minimum=10, maximum=10000, value=DEFAULT_PLOT_LENGTH, prefix="Pts: ", singleStep=50)
         self.plot_length_spin.setFont(QtGui.QFont('Segoe UI', 12))
@@ -434,26 +442,86 @@ class SerialDataView(QtWidgets.QWidget):
         self.convert_B_text.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         self.convert_B_text.setFont(QtGui.QFont('Segoe UI', 12))
 
+        # --- Binary/Frame settings panel ---
+        self.settings_panel = QtWidgets.QWidget()
+        sp_layout = QtWidgets.QHBoxLayout(self.settings_panel)
+        sp_layout.setContentsMargins(4, 2, 4, 2)
+
+        self.type_combo = QtWidgets.QComboBox()
+        self.type_combo.addItems(list(DATA_TYPES.keys()))
+        self.type_combo.setCurrentText('float32')
+        self.type_combo.currentTextChanged.connect(self._on_setting_changed)
+
+        self.endian_combo = QtWidgets.QComboBox()
+        self.endian_combo.addItems(['Little', 'Big'])
+        self.endian_combo.currentTextChanged.connect(self._on_setting_changed)
+
+        self.sync_button = QtWidgets.QPushButton('Sync')
+        self.sync_button.setToolTip('Clear byte buffer to re-align stream')
+        self.sync_button.clicked.connect(self._on_sync_clicked)
+
+        self.sync_word_edit = QtWidgets.QLineEdit('AA')
+        self.sync_word_edit.setMaximumWidth(120)
+        self.sync_word_edit.setPlaceholderText('e.g. AA BB')
+        self.sync_word_edit.editingFinished.connect(self._on_setting_changed)
+
+        self.size_field_combo = QtWidgets.QComboBox()
+        self.size_field_combo.addItems(['Fixed', '1-byte', '2-byte'])
+        self.size_field_combo.currentTextChanged.connect(self._on_size_field_changed)
+
+        self.frame_size_spin = QtWidgets.QSpinBox(minimum=1, maximum=65535, value=12)
+        self.frame_size_spin.setPrefix('Size: ')
+        self.frame_size_spin.valueChanged.connect(self._on_setting_changed)
+
+        self.checksum_check = QtWidgets.QCheckBox('Checksum')
+        self.checksum_check.stateChanged.connect(self._on_setting_changed)
+
+        self._sync_word_label = QtWidgets.QLabel('Sync Word:')
+        self._size_field_label = QtWidgets.QLabel('Size Field:')
+
+        sp_layout.addWidget(QtWidgets.QLabel('Type:'))
+        sp_layout.addWidget(self.type_combo)
+        sp_layout.addWidget(QtWidgets.QLabel('Endian:'))
+        sp_layout.addWidget(self.endian_combo)
+        sp_layout.addWidget(self.sync_button)
+        sp_layout.addWidget(self._sync_word_label)
+        sp_layout.addWidget(self.sync_word_edit)
+        sp_layout.addWidget(self._size_field_label)
+        sp_layout.addWidget(self.size_field_combo)
+        sp_layout.addWidget(self.frame_size_spin)
+        sp_layout.addWidget(self.checksum_check)
+        sp_layout.addStretch()
+
+        self._frame_only_widgets = [
+            self.sync_word_edit, self.size_field_combo,
+            self.frame_size_spin, self.checksum_check,
+            self._sync_word_label, self._size_field_label,
+        ]
+
+        self.settings_panel.setVisible(False)
+
         # Graph controls container
         graph_controls = QtWidgets.QWidget()
         gc_layout = QtWidgets.QHBoxLayout(graph_controls)
         gc_layout.setContentsMargins(0, 0, 0, 0)
         gc_layout.addWidget(self.plot_length_spin)
         gc_layout.addWidget(self.graph_channels)
+        gc_layout.addWidget(self.data_mode)
         gc_layout.addWidget(self.graph_mode)
 
         self.setLayout(QtWidgets.QGridLayout(self))
         self.layout().addWidget(self.label_data_flow,   1, 3, 1, 2)
         self.layout().addWidget(self.label_sent_data,   1, 0, 1, 3)
         self.layout().addWidget(graph_controls,         1, 5, 1, 1, alignment=QtCore.Qt.AlignRight)
-        self.layout().addWidget(self.serialData,        2, 0, 1, 3)
-        self.layout().addWidget(self.serialDataHex,     2, 3, 1, 3)
-        self.layout().addWidget(self.label,             4, 0, 1, 1)
-        self.layout().addWidget(self.converter_label,   3, 1, 1, 1)
-        self.layout().addWidget(self.convert_A_type,    4, 1, 1, 1)
-        self.layout().addWidget(self.convert_A_text,    4, 2, 1, 1)
-        self.layout().addWidget(self.convert_B_text,    4, 3, 1, 2)
-        self.layout().addWidget(self.clear_button,      4, 5, 1, 1, alignment=QtCore.Qt.AlignRight)
+        self.layout().addWidget(self.settings_panel,    2, 0, 1, 6)
+        self.layout().addWidget(self.serialData,        3, 0, 1, 3)
+        self.layout().addWidget(self.serialDataHex,     3, 3, 1, 3)
+        self.layout().addWidget(self.label,             5, 0, 1, 1)
+        self.layout().addWidget(self.converter_label,   4, 1, 1, 1)
+        self.layout().addWidget(self.convert_A_type,    5, 1, 1, 1)
+        self.layout().addWidget(self.convert_A_text,    5, 2, 1, 1)
+        self.layout().addWidget(self.convert_B_text,    5, 3, 1, 2)
+        self.layout().addWidget(self.clear_button,      5, 5, 1, 1, alignment=QtCore.Qt.AlignRight)
         self.layout().setContentsMargins(2, 2, 2, 2)
 
     def _create_plot_lines(self):
@@ -481,6 +549,7 @@ class SerialDataView(QtWidgets.QWidget):
             if self.graphWidget.plotItem.legend is not None:
                 self.graphWidget.plotItem.legend.clear()
             self._create_plot_lines()
+        self._apply_reader_settings()
 
     def graph_state_changed(self):
         if self.graph_mode.isChecked():
@@ -562,6 +631,70 @@ class SerialDataView(QtWidgets.QWidget):
         self.serialData.clear()
         self.convert_A_text.clear()
         self.convert_B_text.clear()
+
+    def _on_mode_changed(self):
+        """Show/hide settings panel and update left panel label based on data mode."""
+        mode = self.data_mode.currentText()
+        is_binary = (mode == 'Binary Stream')
+        is_frame = (mode == 'Custom Frame')
+        is_data_mode = is_binary or is_frame
+
+        self.settings_panel.setVisible(is_data_mode)
+
+        for w in self._frame_only_widgets:
+            w.setVisible(is_frame)
+
+        self.sync_button.setVisible(is_binary)
+
+        if is_data_mode:
+            self.label_sent_data.setText('Data: Decoded')
+        else:
+            self.label_sent_data.setText('Data: ASCII')
+
+        self.serialData.clear()
+        self._binary_reader.sync()
+        self._frame_reader.reset()
+
+        self._apply_reader_settings()
+
+    def _on_setting_changed(self):
+        """Apply current settings to readers."""
+        self._apply_reader_settings()
+
+    def _on_size_field_changed(self):
+        """Enable/disable frame size spinner based on size field type."""
+        self.frame_size_spin.setEnabled(self.size_field_combo.currentText() == 'Fixed')
+        self._on_setting_changed()
+
+    def _on_sync_clicked(self):
+        """Clear binary stream buffer for re-alignment."""
+        self._binary_reader.sync()
+
+    def _apply_reader_settings(self):
+        """Push current UI settings to both reader objects."""
+        dtype = self.type_combo.currentText()
+        endian = 'little' if self.endian_combo.currentText() == 'Little' else 'big'
+        nch = self.graph_channels.value()
+
+        self._binary_reader.data_type = dtype
+        self._binary_reader.endianness = endian
+        self._binary_reader.num_channels = nch
+
+        self._frame_reader.data_type = dtype
+        self._frame_reader.endianness = endian
+        self._frame_reader.num_channels = nch
+        self._frame_reader.size_field = self.size_field_combo.currentText().lower()
+        self._frame_reader.frame_size = self.frame_size_spin.value()
+        self._frame_reader.checksum_enabled = self.checksum_check.isChecked()
+
+        try:
+            sw = bytes.fromhex(self.sync_word_edit.text().replace(' ', ''))
+            if len(sw) > 0:
+                self._frame_reader.sync_word = sw
+        except ValueError:
+            pass
+
+        self._frame_reader.reset()
 
     def appendSerialText(self, appendText, direction, mode="ASCII"):
         if direction == "send":
