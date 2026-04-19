@@ -626,6 +626,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.convert_arrow = QtWidgets.QLabel('\u2192')
         self.convert_arrow.setFont(QtGui.QFont('Segoe UI', 14))
         self.convert_arrow.setAlignment(QtCore.Qt.AlignCenter)
+        self.convert_arrow.setFixedWidth(20)
 
         self.convert_B_text = QtWidgets.QTextEdit(self)
         self.convert_B_text.setMaximumHeight(31)
