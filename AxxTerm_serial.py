@@ -17,9 +17,9 @@ import numpy as np
 DEFAULT_PLOT_LENGTH = 100
 
 PLOT_COLORS = [
-    '#e6194b', '#3cb44b', '#4363d8', '#f58231',
-    '#911eb4', '#42d4f4', '#f032e6', '#9A6324',
-    '#800000', '#469990', '#dcbeff', '#000075',
+    '#e6194b', '#3cb44b', '#4363d8', '#e67e00',
+    '#911eb4', '#1a9bc7', '#f032e6', '#9A6324',
+    '#800000', '#469990', '#7b68ee', '#000075',
 ]
 
 # QSerialPort stop bit enum: OneStop=1, OneAndHalfStop=3, TwoStop=2
