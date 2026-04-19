@@ -315,6 +315,12 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._dark_mode_action.triggered.connect(self._toggle_dark_mode)
         self._dark_mode = False
 
+        self._auto_reconnect_action = view_menu.addAction('Auto-Reconnect')
+        self._auto_reconnect_action.setCheckable(True)
+        self._auto_reconnect_action.setChecked(True)
+        self._auto_reconnect_action.triggered.connect(self._toggle_auto_reconnect)
+        self._auto_reconnect = True
+
         ### Tool Bar ###
         self.toolBar = ToolBar(self)
         self.addToolBar(self.toolBar)
@@ -336,10 +342,16 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._stats_timer.timeout.connect(self._update_stats)
         self._stats_timer.start(1000)
 
+        ### Auto-reconnect state ###
+        self._reconnect_port_name = ''
+        self._reconnect_timer = QtCore.QTimer(self)
+        self._reconnect_timer.timeout.connect(self._try_reconnect)
+
         ### Signal Connect ###
         self.toolBar.portOpenButton.clicked.connect(self.portOpen)
         self.serialSendView.serialSendSignal.connect(self.sendFromPort)
         self.port.readyRead.connect(self.readFromPort)
+        self.port.errorOccurred.connect(self._on_port_error)
 
         # Save when serial port settings change
         self.toolBar.baudRates.currentIndexChanged.connect(lambda: self.save_all_settings())
@@ -352,6 +364,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.load_all_settings()
 
     def portOpen(self, flag):
+        # Manual open/close always cancels any pending auto-reconnect
+        self._reconnect_timer.stop()
+        self._reconnect_port_name = ''
+
         if flag:
             self.port.setBaudRate(self.toolBar.baudRate())
             self.port.setPortName(self.toolBar.portName())
@@ -498,10 +514,61 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.serialDataView._update_graph_theme()
         self.save_all_settings()
 
+    def _toggle_auto_reconnect(self):
+        self._auto_reconnect = self._auto_reconnect_action.isChecked()
+        if not self._auto_reconnect:
+            self._reconnect_timer.stop()
+            if self._reconnect_port_name:
+                self._reconnect_port_name = ''
+                self.statusText.setText('Auto-reconnect disabled')
+        self.save_all_settings()
+
+    def _on_port_error(self, error):
+        """Handle serial port errors. On ResourceError (device unplugged), close
+        gracefully and optionally start scanning for reconnection."""
+        if error == QSerialPort.ResourceError and self.port.isOpen():
+            self._reconnect_port_name = self.port.portName()
+            self.port.close()
+            self.toolBar.portOpenButton.setChecked(False)
+            self.toolBar.serialControlEnable(True)
+            self.serialDataView.label.setPixmap(create_connector_pixmap('#cc2222'))
+            if self._auto_reconnect:
+                self.statusText.setText(
+                    f'Port disconnected - reconnecting to {self._reconnect_port_name}...')
+                self._reconnect_timer.start(1000)
+            else:
+                self.statusText.setText('Port disconnected')
+                self._reconnect_port_name = ''
+
+    def _try_reconnect(self):
+        """Poll available ports for the previously connected port name."""
+        available = [p.portName() for p in QSerialPortInfo.availablePorts()]
+        if self._reconnect_port_name not in available:
+            return
+        # Port reappeared -- try to open with the current toolbar settings
+        self.port.setPortName(self._reconnect_port_name)
+        self.port.setBaudRate(self.toolBar.baudRate())
+        self.port.setDataBits(self.toolBar.dataBit())
+        self.port.setParity(self.toolBar.parity())
+        self.port.setStopBits(self.toolBar.stopBit())
+        self.port.setFlowControl(self.toolBar.flowControl())
+        if self.port.open(QtCore.QIODevice.ReadWrite):
+            self._reconnect_timer.stop()
+            self._reconnect_port_name = ''
+            self.toolBar.portOpenButton.setChecked(True)
+            self.toolBar.serialControlEnable(False)
+            self.serialDataView.label.setPixmap(create_connector_pixmap('#22bb22'))
+            self._rx_bytes = 0
+            self._tx_bytes = 0
+            self._rx_total = 0
+            self._tx_total = 0
+            self.statusText.setText('Port reconnected')
+
     def save_all_settings(self, path=None):
         """Save all settings (plot, serial port, macros) to one JSON file."""
         settings = {
             'dark_mode': self._dark_mode,
+            'auto_reconnect': self._auto_reconnect,
             'plot': self.serialDataView._get_settings_dict(),
             'serial': {
                 'baud_rate': self.toolBar.baudRates.currentText(),
@@ -533,6 +600,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self._apply_dark_palette()
         else:
             self._apply_light_palette()
+
+        # Auto-reconnect
+        self._auto_reconnect = s.get('auto_reconnect', True)
+        self._auto_reconnect_action.setChecked(self._auto_reconnect)
 
         # Plot/decode settings
         plot = s.get('plot', s)  # fallback: old format had plot keys at top level
