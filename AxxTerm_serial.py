@@ -1547,7 +1547,7 @@ class ToolBar(QtWidgets.QToolBar):
         self.portScanButton.setFont(toolbar_font)
 
         self.portNames = QtWidgets.QComboBox(self)
-        self.portNames.addItems([port.portName() for port in QSerialPortInfo().availablePorts()])
+        self._populate_ports()
         self.portNames.setMinimumHeight(30)
         self.portNames.setFont(toolbar_font)
 
@@ -1593,9 +1593,22 @@ class ToolBar(QtWidgets.QToolBar):
         self.addWidget(self.stopBits)
         self.addWidget(self._flowControl)
 
-    def scan_button_Clicked(self):
+    def _populate_ports(self):
         self.portNames.clear()
-        self.portNames.addItems([port.portName() for port in QSerialPortInfo().availablePorts()])
+        for port in QSerialPortInfo().availablePorts():
+            name = port.portName()
+            desc = port.description()
+            vid = port.vendorIdentifier()
+            pid = port.productIdentifier()
+            label = name
+            if desc:
+                label += f'  {desc}'
+            if vid or pid:
+                label += f'  [{vid:04X}:{pid:04X}]'
+            self.portNames.addItem(label, name)
+
+    def scan_button_Clicked(self):
+        self._populate_ports()
 
     def serialControlEnable(self, flag):
         self.portNames.setEnabled(flag)
@@ -1610,7 +1623,7 @@ class ToolBar(QtWidgets.QToolBar):
         return int(self.baudRates.currentText())
 
     def portName(self):
-        return self.portNames.currentText()
+        return self.portNames.currentData() or self.portNames.currentText()
 
     def dataBit(self):
         return int(self.dataBits.currentIndex() + 5)
