@@ -782,6 +782,9 @@ class SerialDataView(QtWidgets.QWidget):
         self.graphWidget = None
         self.channel_names = {}   # {index: 'custom name'} for renamed channels
         self.channel_colors = {}  # {index: '#hex'} for custom channel colors
+        self.channel_axes = {}    # {index: 1 or 2} axis assignment (1=left, 2=right)
+        self._y2_viewbox = None
+        self._y2_plot_lines = {}  # {channel_index: PlotDataItem} for Y2 channels
         self._y_auto_scale = True
         self._y_min = -1.0
         self._y_max = 1.0
@@ -1092,19 +1095,81 @@ class SerialDataView(QtWidgets.QWidget):
         """Return custom color for a channel, or default from PLOT_COLORS."""
         return self.channel_colors.get(index, PLOT_COLORS[index % len(PLOT_COLORS)])
 
+    def _setup_y2_axis(self):
+        """Create a second Y-axis viewbox linked to the main plot."""
+        if self._y2_viewbox is not None:
+            return
+        self._y2_viewbox = pg.ViewBox()
+        self.graphWidget.plotItem.showAxis('right')
+        self.graphWidget.plotItem.scene().addItem(self._y2_viewbox)
+        self.graphWidget.plotItem.getAxis('right').linkToView(self._y2_viewbox)
+        self._y2_viewbox.setXLink(self.graphWidget.plotItem)
+        # Sync geometry now and on resize
+        self._sync_y2_viewbox()
+        self.graphWidget.plotItem.vb.sigResized.connect(self._sync_y2_viewbox)
+        # Style right axis to match theme
+        dark = getattr(self.window(), '_dark_mode', False)
+        axis_color = '#ffffff' if dark else '#000000'
+        self.graphWidget.plotItem.getAxis('right').setPen(pg.mkPen(color=axis_color))
+        self.graphWidget.plotItem.getAxis('right').setTextPen(pg.mkPen(color=axis_color))
+        self.graphWidget.plotItem.getAxis('right').setLabel('Y2')
+        self._y2_viewbox.enableAutoRange(axis='y')
+
+    def _sync_y2_viewbox(self):
+        """Keep Y2 viewbox geometry in sync with the main viewbox."""
+        if self._y2_viewbox and self.graphWidget:
+            self._y2_viewbox.setGeometry(self.graphWidget.plotItem.vb.sceneBoundingRect())
+
+    def _remove_y2_axis(self):
+        """Remove the second Y-axis viewbox and hide the right axis."""
+        if self._y2_viewbox and self.graphWidget:
+            try:
+                self.graphWidget.plotItem.vb.sigResized.disconnect(self._sync_y2_viewbox)
+            except (TypeError, RuntimeError):
+                pass
+            self.graphWidget.plotItem.scene().removeItem(self._y2_viewbox)
+            self.graphWidget.plotItem.hideAxis('right')
+        self._y2_viewbox = None
+        self._y2_plot_lines = {}
+
+    def _has_y2_channels(self):
+        """Check if any current channel is assigned to Y2."""
+        n = self.graph_channels.value()
+        return any(self.channel_axes.get(i, 1) == 2 for i in range(n))
+
     def _create_plot_lines(self):
         """Create plot lines based on the current channel count spinbox."""
         n = self.graph_channels.value()
         plot_length = self.plot_length_spin.value()
         self.plot_lines = []
         self.plot_data = []
+        # Remove old Y2 lines
+        if self._y2_viewbox:
+            for line in self._y2_plot_lines.values():
+                self._y2_viewbox.removeItem(line)
+        self._y2_plot_lines = {}
+        # Setup or remove Y2 axis as needed
+        if self._has_y2_channels():
+            self._setup_y2_axis()
+        else:
+            self._remove_y2_axis()
         for i in range(n):
             color = self._channel_color(i)
-            line = self.graphWidget.plotItem.plot(
-                pen=pg.mkPen(color, width=2),
-                name=self._channel_name(i)
-            )
             arr = np.zeros(plot_length)
+            axis = self.channel_axes.get(i, 1)
+            if axis == 2 and self._y2_viewbox is not None:
+                # Dashed pen for Y2 channels
+                pen = pg.mkPen(color, width=2, style=QtCore.Qt.DashLine)
+                line = pg.PlotDataItem(pen=pen, name=self._channel_name(i))
+                self._y2_viewbox.addItem(line)
+                self._y2_plot_lines[i] = line
+            else:
+                pen = pg.mkPen(color, width=2)
+                line = pg.PlotDataItem(pen=pen, name=self._channel_name(i))
+                self.graphWidget.plotItem.addItem(line)
+            # Add all channels to legend in order
+            if self.graphWidget.plotItem.legend is not None:
+                self.graphWidget.plotItem.legend.addItem(line, self._channel_name(i))
             line.setData(arr)
             self.plot_lines.append(line)
             self.plot_data.append(arr)
@@ -1114,6 +1179,11 @@ class SerialDataView(QtWidgets.QWidget):
         if self.graphWidget is not None:
             for line in self.plot_lines:
                 self.graphWidget.plotItem.removeItem(line)
+            # Also remove Y2 lines from their viewbox
+            if self._y2_viewbox:
+                for line in self._y2_plot_lines.values():
+                    self._y2_viewbox.removeItem(line)
+                self._y2_plot_lines = {}
             if self.graphWidget.plotItem.legend is not None:
                 self.graphWidget.plotItem.legend.clear()
             self._create_plot_lines()
@@ -1189,6 +1259,9 @@ class SerialDataView(QtWidgets.QWidget):
         else:
             # Destroy FFT widget first if it exists
             self._destroy_fft_widget()
+            # Clean up Y2 axis before destroying graph
+            self._y2_plot_lines = {}
+            self._y2_viewbox = None
             self.graphWidget.removeEventFilter(self)
             self.graphWidget.setParent(None)
             self.graphWidget.deleteLater()
@@ -1206,6 +1279,8 @@ class SerialDataView(QtWidgets.QWidget):
         for i, (arr, line) in enumerate(zip(self.plot_data, self.plot_lines)):
             arr[:] = 0
             line.setData(arr)
+        if self._y2_viewbox:
+            self._y2_viewbox.enableAutoRange(axis='y')
 
     def _toggle_pause(self):
         """Toggle plot pause/resume."""
@@ -1280,6 +1355,9 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.plotItem.getAxis('left').setPen(pg.mkPen(color=axis_color))
             self.graphWidget.plotItem.getAxis('bottom').setTextPen(pg.mkPen(color=axis_color))
             self.graphWidget.plotItem.getAxis('left').setTextPen(pg.mkPen(color=axis_color))
+            if self._y2_viewbox is not None:
+                self.graphWidget.plotItem.getAxis('right').setPen(pg.mkPen(color=axis_color))
+                self.graphWidget.plotItem.getAxis('right').setTextPen(pg.mkPen(color=axis_color))
             if hasattr(self, '_cursor_label') and self._cursor_label is not None:
                 self._cursor_label.setColor(axis_color)
             if hasattr(self, '_clear_graph_btn') and self._clear_graph_btn is not None:
@@ -1381,11 +1459,18 @@ class SerialDataView(QtWidgets.QWidget):
         if legend is None:
             return
         pos = ev.scenePos()
-        for i, (sample, label) in enumerate(legend.items):
+        for sample, label in legend.items:
             row_rect = sample.sceneBoundingRect().united(label.sceneBoundingRect())
             if row_rect.contains(pos):
-                self._show_channel_context_menu(i, label, sample)
-                ev.accept()
+                # Find channel index by matching the PlotDataItem
+                ch_index = None
+                for idx, line in enumerate(self.plot_lines):
+                    if sample.item is line:
+                        ch_index = idx
+                        break
+                if ch_index is not None:
+                    self._show_channel_context_menu(ch_index, label, sample)
+                    ev.accept()
                 break
 
     def _show_channel_context_menu(self, channel_index, label, sample):
@@ -1393,10 +1478,23 @@ class SerialDataView(QtWidgets.QWidget):
         menu = QtWidgets.QMenu(self)
         rename_action = menu.addAction('Rename...')
         color_action = menu.addAction('Change Color...')
+        # Y-axis toggle
+        current_axis = self.channel_axes.get(channel_index, 1)
+        if current_axis == 1:
+            axis_action = menu.addAction('Move to Y2 axis')
+        else:
+            axis_action = menu.addAction('Move to Y1 axis')
         reset_action = menu.addAction('Reset to Default')
 
         action = menu.exec_(QtGui.QCursor.pos())
-        if action == rename_action:
+        if action == axis_action:
+            new_axis = 2 if current_axis == 1 else 1
+            if new_axis == 1:
+                self.channel_axes.pop(channel_index, None)
+            else:
+                self.channel_axes[channel_index] = 2
+            self._on_channels_changed()
+        elif action == rename_action:
             current = self._channel_name(channel_index)
             new_name, ok = QtWidgets.QInputDialog.getText(
                 self, 'Rename Channel', f'Channel {channel_index} name:', text=current)
@@ -1410,20 +1508,28 @@ class SerialDataView(QtWidgets.QWidget):
             if color.isValid():
                 hex_color = color.name()
                 self.channel_colors[channel_index] = hex_color
-                self.plot_lines[channel_index].setPen(pg.mkPen(hex_color, width=2))
+                on_y2 = self.channel_axes.get(channel_index, 1) == 2
+                pen_style = QtCore.Qt.DashLine if on_y2 else QtCore.Qt.SolidLine
+                self.plot_lines[channel_index].setPen(pg.mkPen(hex_color, width=2, style=pen_style))
                 sample.item = self.plot_lines[channel_index]
                 sample.update()
                 self._save_settings()
         elif action == reset_action:
+            was_y2 = self.channel_axes.get(channel_index, 1) == 2
             self.channel_names.pop(channel_index, None)
             self.channel_colors.pop(channel_index, None)
-            default_name = f'Ch {channel_index}'
-            default_color = PLOT_COLORS[channel_index % len(PLOT_COLORS)]
-            label.setText(default_name)
-            self.plot_lines[channel_index].setPen(pg.mkPen(default_color, width=2))
-            sample.item = self.plot_lines[channel_index]
-            sample.update()
-            self._save_settings()
+            self.channel_axes.pop(channel_index, None)
+            if was_y2:
+                # Axis changed, need full rebuild
+                self._on_channels_changed()
+            else:
+                default_name = f'Ch {channel_index}'
+                default_color = PLOT_COLORS[channel_index % len(PLOT_COLORS)]
+                label.setText(default_name)
+                self.plot_lines[channel_index].setPen(pg.mkPen(default_color, width=2))
+                sample.item = self.plot_lines[channel_index]
+                sample.update()
+                self._save_settings()
 
     def _fft_state_changed(self):
         """Create or destroy the FFT widget when the checkbox toggles."""
@@ -1739,6 +1845,7 @@ class SerialDataView(QtWidgets.QWidget):
             'delimiter_custom': self.delimiter_custom.text(),
             'channel_names': {str(k): v for k, v in self.channel_names.items()},
             'channel_colors': {str(k): v for k, v in self.channel_colors.items()},
+            'channel_axes': {str(k): v for k, v in self.channel_axes.items()},
             'y_auto_scale': self._y_auto_scale,
             'y_min': self._y_min,
             'y_max': self._y_max,
@@ -1786,6 +1893,8 @@ class SerialDataView(QtWidgets.QWidget):
             self.channel_names = {int(k): v for k, v in saved_names.items()}
             saved_colors = s.get('channel_colors', {})
             self.channel_colors = {int(k): v for k, v in saved_colors.items()}
+            saved_axes = s.get('channel_axes', {})
+            self.channel_axes = {int(k): v for k, v in saved_axes.items()}
 
             self._y_auto_scale = s.get('y_auto_scale', True)
             self._y_min = s.get('y_min', -1.0)
