@@ -30,10 +30,8 @@ if getattr(sys, 'frozen', False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MACROS_FILE = os.path.join(SCRIPT_DIR, 'macros.json')
 NUM_MACRO_BUTTONS = 8
-
-SETTINGS_FILE = os.path.join(SCRIPT_DIR, 'plot_settings.json')
+SETTINGS_FILE = os.path.join(SCRIPT_DIR, 'AxxTerm_settings.json')
 
 DATA_TYPES = {
     'uint8':    ('B', 1),
@@ -335,6 +333,9 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.serialSendView.serialSendSignal.connect(self.sendFromPort)
         self.port.readyRead.connect(self.readFromPort)
 
+        ### Load all settings ###
+        self.load_all_settings()
+
     def portOpen(self, flag):
         if flag:
             self.port.setBaudRate(self.toolBar.baudRate())
@@ -441,18 +442,63 @@ class SerialMonitor(QtWidgets.QMainWindow):
         else:
             self.statsLabel.setText('')
 
+    def save_all_settings(self, path=None):
+        """Save all settings (plot, serial port, macros) to one JSON file."""
+        settings = {
+            'plot': self.serialDataView._get_settings_dict(),
+            'serial': {
+                'baud_rate': self.toolBar.baudRates.currentText(),
+                'data_bits': self.toolBar.dataBits.currentIndex(),
+                'parity': self.toolBar._parity.currentIndex(),
+                'stop_bits': self.toolBar.stopBits.currentIndex(),
+                'flow_control': self.toolBar._flowControl.currentIndex(),
+            },
+            'macros': self.serialSendView._get_macros_list(),
+        }
+        try:
+            with open(path or SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except OSError:
+            pass
+
+    def load_all_settings(self, path=None):
+        """Load all settings from one JSON file."""
+        try:
+            with open(path or SETTINGS_FILE, 'r') as f:
+                s = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            return
+
+        # Plot/decode settings
+        plot = s.get('plot', s)  # fallback: old format had plot keys at top level
+        self.serialDataView._load_plot_settings(plot)
+
+        # Serial port settings
+        serial = s.get('serial', {})
+        if serial:
+            self.toolBar.baudRates.setCurrentText(serial.get('baud_rate', '115200'))
+            self.toolBar.dataBits.setCurrentIndex(serial.get('data_bits', 3))
+            self.toolBar._parity.setCurrentIndex(serial.get('parity', 0))
+            self.toolBar.stopBits.setCurrentIndex(serial.get('stop_bits', 0))
+            self.toolBar._flowControl.setCurrentIndex(serial.get('flow_control', 0))
+
+        # Macros
+        macros = s.get('macros', None)
+        if macros:
+            self.serialSendView._load_macros_from_list(macros)
+
     def _menu_save_settings(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, 'Save Settings', '', 'JSON Files (*.json);;All Files (*)')
         if path:
-            self.serialDataView._save_settings(path)
+            self.save_all_settings(path)
             self.statusText.setText(f'Settings saved to {os.path.basename(path)}')
 
     def _menu_load_settings(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, 'Load Settings', '', 'JSON Files (*.json);;All Files (*)')
         if path:
-            self.serialDataView._load_settings(path)
+            self.load_all_settings(path)
             self.statusText.setText(f'Settings loaded from {os.path.basename(path)}')
 
     def _menu_export_csv(self):
@@ -481,7 +527,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
     def _menu_export_png(self):
         dv = self.serialDataView
         if dv.graphWidget is None:
-            self.statusText.setText('No graph to export (enable Show Graph)')
+            self.statusText.setText('No plot to export (enable Show Plot)')
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, 'Export PNG', '', 'PNG Files (*.png);;All Files (*)')
@@ -532,7 +578,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.label_sent_data.setFont(QtGui.QFont('Segoe UI', 12))
         self.label_sent_data.setIndent(5)
 
-        self.graph_mode = QCheckBox("Show Graph")
+        self.graph_mode = QCheckBox("Show Plot")
         self.graph_mode.setFont(QtGui.QFont('Segoe UI', 12))
         self.graph_mode.stateChanged.connect(self.graph_state_changed)
 
@@ -641,7 +687,7 @@ class SerialDataView(QtWidgets.QWidget):
             self.type_combo, self.endian_combo,
         ]
 
-        # Single controls row: left = decoding, right = Pts + Show Graph
+        # Single controls row: left = decoding, right = Pts + Show Plot
         controls = QtWidgets.QWidget()
         cl = QtWidgets.QHBoxLayout(controls)
         cl.setContentsMargins(0, 0, 0, 0)
@@ -701,8 +747,6 @@ class SerialDataView(QtWidgets.QWidget):
         self.layout().setRowStretch(1, 1)
         self.layout().setContentsMargins(2, 2, 2, 2)
 
-        self._load_settings()
-
     def _channel_name(self, index):
         """Return custom name for a channel, or default 'Ch N'."""
         return self.channel_names.get(index, f'Ch {index}')
@@ -755,8 +799,8 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.scene().sigMouseClicked.connect(self._on_plot_mouse_clicked)
             self._create_plot_lines()
             self.numberbuffer = []
-            # Clear Graph button overlaid in lower-right corner
-            self._clear_graph_btn = QtWidgets.QPushButton('Clear Graph', self.graphWidget)
+            # Clear Plot button overlaid in lower-right corner
+            self._clear_graph_btn = QtWidgets.QPushButton('Clear Plot', self.graphWidget)
             self._clear_graph_btn.setStyleSheet(
                 'background-color: #ffffff; border: 1px solid #aaa; padding: 2px 8px;')
             self._clear_graph_btn.clicked.connect(self._clear_graph)
@@ -781,7 +825,7 @@ class SerialDataView(QtWidgets.QWidget):
             line.setData(self.plot_data[self.plot_lines.index(line)])
 
     def _position_clear_graph_btn(self):
-        """Position the Clear Graph button in the lower-right of the graph."""
+        """Position the Clear Plot button in the lower-right of the graph."""
         if self._clear_graph_btn and self.graphWidget:
             btn = self._clear_graph_btn
             gw = self.graphWidget
@@ -1026,21 +1070,13 @@ class SerialDataView(QtWidgets.QWidget):
         }
 
     def _save_settings(self, path=None):
-        """Persist current plot/decode settings to JSON file."""
-        try:
-            with open(path or SETTINGS_FILE, 'w') as f:
-                json.dump(self._get_settings_dict(), f, indent=2)
-        except OSError:
-            pass
+        """Persist settings via parent SerialMonitor (saves everything to one file)."""
+        monitor = self.window()
+        if hasattr(monitor, 'save_all_settings'):
+            monitor.save_all_settings(path)
 
-    def _load_settings(self, path=None):
-        """Restore plot/decode settings from JSON file."""
-        try:
-            with open(path or SETTINGS_FILE, 'r') as f:
-                s = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError, ValueError):
-            return
-
+    def _load_plot_settings(self, s):
+        """Restore plot/decode settings from a dict (subsection of full settings)."""
         widgets = [self.data_mode, self.type_combo, self.endian_combo,
                    self.graph_channels, self.plot_length_spin,
                    self.delimiter_combo, self.delimiter_custom,
@@ -1503,11 +1539,24 @@ class SerialSendView(QtWidgets.QWidget):
         self.sendData.clear()
         self.history_index = 0
 
+    def _get_macros_list(self):
+        """Return current macro definitions as a list of dicts."""
+        return [{"label": btn.text(), "hex": btn.hex_data} for btn in self.macro_buttons]
+
+    def _load_macros_from_list(self, macros):
+        """Restore macro buttons from a list of dicts."""
+        if not isinstance(macros, list) or len(macros) != NUM_MACRO_BUTTONS:
+            return
+        for btn, macro in zip(self.macro_buttons, macros):
+            btn.setText(macro.get("label", ""))
+            btn.hex_data = macro.get("hex", "")
+
     def _load_macros(self):
-        """Load macro definitions from JSON file, or use defaults."""
+        """Load macro definitions from settings file, or use defaults."""
         try:
-            with open(MACROS_FILE, 'r') as f:
-                macros = json.load(f)
+            with open(SETTINGS_FILE, 'r') as f:
+                s = json.load(f)
+                macros = s.get('macros', None)
                 if isinstance(macros, list) and len(macros) == NUM_MACRO_BUTTONS:
                     return macros
         except (FileNotFoundError, json.JSONDecodeError, ValueError):
@@ -1515,13 +1564,10 @@ class SerialSendView(QtWidgets.QWidget):
         return [dict(m) for m in DEFAULT_MACROS]
 
     def _save_macros(self):
-        """Persist current macro definitions to JSON file."""
-        macros = [{"label": btn.text(), "hex": btn.hex_data} for btn in self.macro_buttons]
-        try:
-            with open(MACROS_FILE, 'w') as f:
-                json.dump(macros, f, indent=2)
-        except OSError:
-            pass
+        """Persist macros via parent SerialMonitor."""
+        monitor = self.window()
+        if hasattr(monitor, 'save_all_settings'):
+            monitor.save_all_settings()
 
 
 class ToolBar(QtWidgets.QToolBar):
