@@ -811,6 +811,8 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.plotItem.showGrid(True, True, 0.3)
             # Force 3-button mouse mode (left=pan, right=menu)
             self.graphWidget.plotItem.vb.setMouseMode(pg.ViewBox.PanMode)
+            # Disable mouse wheel/drag zoom on Y-axis
+            self.graphWidget.plotItem.vb.setMouseEnabled(x=True, y=False)
             # Disable non-functional menu items
             for action in self.graphWidget.plotItem.ctrlMenu.actions():
                 if action.text() in ('Average', 'Downsample', 'Alpha'):
