@@ -2,6 +2,7 @@
 import sys
 import math
 import re
+import struct
 import os
 import json
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -32,6 +33,19 @@ else:
 MACROS_FILE = os.path.join(SCRIPT_DIR, 'macros.json')
 NUM_MACRO_BUTTONS = 8
 
+SETTINGS_FILE = os.path.join(SCRIPT_DIR, 'plot_settings.json')
+
+DATA_TYPES = {
+    'uint8':    ('B', 1),
+    'int8':     ('b', 1),
+    'uint16':   ('H', 2),
+    'int16':    ('h', 2),
+    'uint32':   ('I', 4),
+    'int32':    ('i', 4),
+    'float32':  ('f', 4),
+    'double64': ('d', 8),
+}
+
 DEFAULT_MACROS = [
     {"label": "0x7F",           "hex": "7F"},
     {"label": "FF",             "hex": "FF"},
@@ -57,6 +71,135 @@ CONVERTERS = {
     'BINARY --> ASCII': lambda v: chr(int(v, 2)),
     'BINARY --> DECIMAL': lambda v: str(int(v, 2)),
 }
+
+
+class BinaryStreamReader:
+    """Decodes a continuous binary byte stream into channel values."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self.data_type = 'float32'
+        self.endianness = 'little'
+        self.num_channels = 4
+
+    def feed(self, data):
+        """Feed raw bytes. Returns list of tuples, one per sample."""
+        self.buffer.extend(data)
+        fmt_char, type_size = DATA_TYPES[self.data_type]
+        package_size = self.num_channels * type_size
+        if package_size == 0:
+            return []
+        prefix = '<' if self.endianness == 'little' else '>'
+        fmt = prefix + fmt_char * self.num_channels
+        results = []
+        while len(self.buffer) >= package_size:
+            values = struct.unpack(fmt, self.buffer[:package_size])
+            self.buffer = self.buffer[package_size:]
+            results.append(values)
+        return results
+
+    def sync(self):
+        """Clear buffer to re-align stream."""
+        self.buffer.clear()
+
+
+class FrameReader:
+    """Decodes framed binary packets with sync word, optional size, and optional checksum.
+
+    Note: Sync word matching uses a simple byte-by-byte scan. Sync words with
+    internal prefix repetition (e.g. 01 02 01 03) may miss valid frames if the
+    pattern overlaps in the stream. Simple sync words (AA, AA BB, etc.) work correctly.
+    """
+
+    SEARCHING = 0
+    READING_SIZE = 1
+    READING_PAYLOAD = 2
+
+    def __init__(self):
+        self.data_type = 'float32'
+        self.endianness = 'little'
+        self.num_channels = 4
+        self.sync_word = bytes([0xAA])
+        self.size_field = 'fixed'
+        self.frame_size = 12
+        self.checksum_enabled = False
+        self.state = self.SEARCHING
+        self._sync_index = 0
+        self._size_buffer = bytearray()
+        self._payload_buffer = bytearray()
+        self._payload_size = 0
+
+    def reset(self):
+        """Reset state machine and clear buffers."""
+        self.state = self.SEARCHING
+        self._sync_index = 0
+        self._size_buffer.clear()
+        self._payload_buffer.clear()
+        self._payload_size = 0
+
+    def feed(self, data):
+        """Feed raw bytes. Returns list of tuples, one per sample."""
+        results = []
+        fmt_char, type_size = DATA_TYPES[self.data_type]
+        prefix = '<' if self.endianness == 'little' else '>'
+        sample_size = self.num_channels * type_size
+        if sample_size == 0:
+            return []
+        fmt = prefix + fmt_char * self.num_channels
+
+        for byte in data:
+            if self.state == self.SEARCHING:
+                if byte == self.sync_word[self._sync_index]:
+                    self._sync_index += 1
+                    if self._sync_index == len(self.sync_word):
+                        self._sync_index = 0
+                        if self.size_field == 'fixed':
+                            self._payload_size = self.frame_size
+                            self.state = self.READING_PAYLOAD
+                            self._payload_buffer.clear()
+                        else:
+                            self.state = self.READING_SIZE
+                            self._size_buffer.clear()
+                else:
+                    self._sync_index = 1 if byte == self.sync_word[0] else 0
+
+            elif self.state == self.READING_SIZE:
+                self._size_buffer.append(byte)
+                needed = 1 if self.size_field == '1-byte' else 2
+                if len(self._size_buffer) >= needed:
+                    if needed == 1:
+                        self._payload_size = self._size_buffer[0]
+                    else:
+                        size_fmt = '<H' if self.endianness == 'little' else '>H'
+                        self._payload_size = struct.unpack(size_fmt, self._size_buffer[:2])[0]
+                    if self._payload_size == 0 or (self._payload_size % sample_size) != 0:
+                        self.state = self.SEARCHING
+                        self._sync_index = 0
+                    else:
+                        self.state = self.READING_PAYLOAD
+                        self._payload_buffer.clear()
+
+            elif self.state == self.READING_PAYLOAD:
+                self._payload_buffer.append(byte)
+                total_needed = self._payload_size + (1 if self.checksum_enabled else 0)
+                if len(self._payload_buffer) >= total_needed:
+                    payload = bytes(self._payload_buffer[:self._payload_size])
+                    valid = True
+                    if self.checksum_enabled:
+                        received = self._payload_buffer[self._payload_size]
+                        computed = sum(payload) & 0xFF
+                        if received != computed:
+                            valid = False
+                    if valid:
+                        offset = 0
+                        while offset + sample_size <= len(payload):
+                            values = struct.unpack_from(fmt, payload, offset)
+                            results.append(values)
+                            offset += sample_size
+                    self.state = self.SEARCHING
+                    self._sync_index = 0
+
+        return results
 
 
 def create_connector_pixmap(color, width=71, height=30):
@@ -181,7 +324,8 @@ class SerialMonitor(QtWidgets.QMainWindow):
     def readFromPort(self):
         data = self.port.readAll()
         if len(data) > 0:
-            self.serialDataView.appendSerialText(QtCore.QTextStream(data).readAll(), "read")
+            raw_bytes = bytes(data.data())
+            self.serialDataView.handleReceivedData(raw_bytes)
 
     def sendFromPort(self, text):
         if self.serialSendView.charMode.currentText() == 'HEX':
@@ -235,6 +379,9 @@ class SerialDataView(QtWidgets.QWidget):
         # serial reads (otherwise Qt renders a blank line between messages).
         self._pending_cr = False
 
+        self._binary_reader = BinaryStreamReader()
+        self._frame_reader = FrameReader()
+
         self.serialData = QtWidgets.QTextEdit(self)
         self.serialData.setReadOnly(True)
         self.serialData.setFontFamily('Segoe UI')
@@ -264,8 +411,14 @@ class SerialDataView(QtWidgets.QWidget):
         self.graph_channels.setFont(QtGui.QFont('Segoe UI', 12))
         self.graph_channels.valueChanged.connect(self._on_channels_changed)
 
+        self.data_mode = QtWidgets.QComboBox()
+        self.data_mode.addItems(['ASCII', 'Binary Stream', 'Custom Frame'])
+        self.data_mode.setFont(QtGui.QFont('Segoe UI', 12))
+        self.data_mode.currentIndexChanged.connect(self._on_mode_changed)
+
         self.plot_length_spin = QSpinBox(minimum=10, maximum=10000, value=DEFAULT_PLOT_LENGTH, prefix="Pts: ", singleStep=50)
         self.plot_length_spin.setFont(QtGui.QFont('Segoe UI', 12))
+        self.plot_length_spin.valueChanged.connect(self._on_setting_changed)
 
         self.clear_button = QtWidgets.QPushButton('Clear ALL')
         self.clear_button.clicked.connect(self.clear_button_Clicked)
@@ -296,27 +449,89 @@ class SerialDataView(QtWidgets.QWidget):
         self.convert_B_text.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         self.convert_B_text.setFont(QtGui.QFont('Segoe UI', 12))
 
+        # --- Binary/Frame settings panel ---
+        self.settings_panel = QtWidgets.QWidget()
+        sp_layout = QtWidgets.QHBoxLayout(self.settings_panel)
+        sp_layout.setContentsMargins(4, 2, 4, 2)
+
+        self.type_combo = QtWidgets.QComboBox()
+        self.type_combo.addItems(list(DATA_TYPES.keys()))
+        self.type_combo.setCurrentText('float32')
+        self.type_combo.currentTextChanged.connect(self._on_setting_changed)
+
+        self.endian_combo = QtWidgets.QComboBox()
+        self.endian_combo.addItems(['Little', 'Big'])
+        self.endian_combo.currentTextChanged.connect(self._on_setting_changed)
+
+        self.sync_button = QtWidgets.QPushButton('Sync')
+        self.sync_button.setToolTip('Clear byte buffer to re-align stream')
+        self.sync_button.clicked.connect(self._on_sync_clicked)
+
+        self.sync_word_edit = QtWidgets.QLineEdit('AA')
+        self.sync_word_edit.setMaximumWidth(120)
+        self.sync_word_edit.setPlaceholderText('e.g. AA BB')
+        self.sync_word_edit.editingFinished.connect(self._on_setting_changed)
+
+        self.size_field_combo = QtWidgets.QComboBox()
+        self.size_field_combo.addItems(['Fixed', '1-byte', '2-byte'])
+        self.size_field_combo.currentTextChanged.connect(self._on_size_field_changed)
+
+        self.frame_size_spin = QtWidgets.QSpinBox(minimum=1, maximum=65535, value=12)
+        self.frame_size_spin.setPrefix('Size: ')
+        self.frame_size_spin.valueChanged.connect(self._on_setting_changed)
+
+        self.checksum_check = QtWidgets.QCheckBox('Checksum')
+        self.checksum_check.stateChanged.connect(self._on_setting_changed)
+
+        self._sync_word_label = QtWidgets.QLabel('Sync Word:')
+        self._size_field_label = QtWidgets.QLabel('Size Field:')
+
+        sp_layout.addWidget(QtWidgets.QLabel('Type:'))
+        sp_layout.addWidget(self.type_combo)
+        sp_layout.addWidget(QtWidgets.QLabel('Endian:'))
+        sp_layout.addWidget(self.endian_combo)
+        sp_layout.addWidget(self.sync_button)
+        sp_layout.addWidget(self._sync_word_label)
+        sp_layout.addWidget(self.sync_word_edit)
+        sp_layout.addWidget(self._size_field_label)
+        sp_layout.addWidget(self.size_field_combo)
+        sp_layout.addWidget(self.frame_size_spin)
+        sp_layout.addWidget(self.checksum_check)
+        sp_layout.addStretch()
+
+        self._frame_only_widgets = [
+            self.sync_word_edit, self.size_field_combo,
+            self.frame_size_spin, self.checksum_check,
+            self._sync_word_label, self._size_field_label,
+        ]
+
+        self.settings_panel.setVisible(False)
+
         # Graph controls container
         graph_controls = QtWidgets.QWidget()
         gc_layout = QtWidgets.QHBoxLayout(graph_controls)
         gc_layout.setContentsMargins(0, 0, 0, 0)
         gc_layout.addWidget(self.plot_length_spin)
         gc_layout.addWidget(self.graph_channels)
+        gc_layout.addWidget(self.data_mode)
         gc_layout.addWidget(self.graph_mode)
 
         self.setLayout(QtWidgets.QGridLayout(self))
         self.layout().addWidget(self.label_data_flow,   1, 3, 1, 2)
         self.layout().addWidget(self.label_sent_data,   1, 0, 1, 3)
         self.layout().addWidget(graph_controls,         1, 5, 1, 1, alignment=QtCore.Qt.AlignRight)
-        self.layout().addWidget(self.serialData,        2, 0, 1, 3)
-        self.layout().addWidget(self.serialDataHex,     2, 3, 1, 3)
-        self.layout().addWidget(self.label,             4, 0, 1, 1)
-        self.layout().addWidget(self.converter_label,   3, 1, 1, 1)
-        self.layout().addWidget(self.convert_A_type,    4, 1, 1, 1)
-        self.layout().addWidget(self.convert_A_text,    4, 2, 1, 1)
-        self.layout().addWidget(self.convert_B_text,    4, 3, 1, 2)
-        self.layout().addWidget(self.clear_button,      4, 5, 1, 1, alignment=QtCore.Qt.AlignRight)
+        self.layout().addWidget(self.settings_panel,    2, 0, 1, 6)
+        self.layout().addWidget(self.serialData,        3, 0, 1, 3)
+        self.layout().addWidget(self.serialDataHex,     3, 3, 1, 3)
+        self.layout().addWidget(self.label,             5, 0, 1, 1)
+        self.layout().addWidget(self.converter_label,   4, 1, 1, 1)
+        self.layout().addWidget(self.convert_A_type,    5, 1, 1, 1)
+        self.layout().addWidget(self.convert_A_text,    5, 2, 1, 1)
+        self.layout().addWidget(self.convert_B_text,    5, 3, 1, 2)
+        self.layout().addWidget(self.clear_button,      5, 5, 1, 1, alignment=QtCore.Qt.AlignRight)
         self.layout().setContentsMargins(2, 2, 2, 2)
+
+        self._load_settings()
 
     def _create_plot_lines(self):
         """Create plot lines based on the current channel count spinbox."""
@@ -343,6 +558,8 @@ class SerialDataView(QtWidgets.QWidget):
             if self.graphWidget.plotItem.legend is not None:
                 self.graphWidget.plotItem.legend.clear()
             self._create_plot_lines()
+        self._apply_reader_settings()
+        self._save_settings()
 
     def graph_state_changed(self):
         if self.graph_mode.isChecked():
@@ -424,6 +641,217 @@ class SerialDataView(QtWidgets.QWidget):
         self.serialData.clear()
         self.convert_A_text.clear()
         self.convert_B_text.clear()
+        self._binary_reader.sync()
+        self._frame_reader.reset()
+
+    def _on_mode_changed(self):
+        """Show/hide settings panel and update left panel label based on data mode."""
+        mode = self.data_mode.currentText()
+        is_binary = (mode == 'Binary Stream')
+        is_frame = (mode == 'Custom Frame')
+        is_data_mode = is_binary or is_frame
+
+        self.settings_panel.setVisible(is_data_mode)
+
+        for w in self._frame_only_widgets:
+            w.setVisible(is_frame)
+
+        self.sync_button.setVisible(is_binary)
+
+        if is_data_mode:
+            self.label_sent_data.setText('Data: Decoded')
+        else:
+            self.label_sent_data.setText('Data: ASCII')
+
+        self.serialData.clear()
+        self.serialDataHex.clear()
+        self._binary_reader.sync()
+        self._frame_reader.reset()
+
+        self._apply_reader_settings()
+        self._save_settings()
+
+    def _on_setting_changed(self):
+        """Apply current settings to readers."""
+        self._apply_reader_settings()
+        self._save_settings()
+
+    def _on_size_field_changed(self):
+        """Enable/disable frame size spinner based on size field type."""
+        self.frame_size_spin.setEnabled(self.size_field_combo.currentText() == 'Fixed')
+        self._on_setting_changed()
+
+    def _on_sync_clicked(self):
+        """Clear binary stream buffer for re-alignment."""
+        self._binary_reader.sync()
+
+    def _apply_reader_settings(self):
+        """Push current UI settings to both reader objects."""
+        dtype = self.type_combo.currentText()
+        endian = 'little' if self.endian_combo.currentText() == 'Little' else 'big'
+        nch = self.graph_channels.value()
+
+        self._binary_reader.data_type = dtype
+        self._binary_reader.endianness = endian
+        self._binary_reader.num_channels = nch
+
+        self._frame_reader.data_type = dtype
+        self._frame_reader.endianness = endian
+        self._frame_reader.num_channels = nch
+        self._frame_reader.size_field = self.size_field_combo.currentText().lower()
+        self._frame_reader.frame_size = self.frame_size_spin.value()
+        self._frame_reader.checksum_enabled = self.checksum_check.isChecked()
+
+        try:
+            sw = bytes.fromhex(self.sync_word_edit.text().replace(' ', ''))
+            if len(sw) > 0:
+                self._frame_reader.sync_word = sw
+        except ValueError:
+            pass
+
+        self._frame_reader.reset()
+
+    def _save_settings(self):
+        """Persist current plot/decode settings to JSON file."""
+        settings = {
+            'mode': self.data_mode.currentText(),
+            'num_channels': self.graph_channels.value(),
+            'num_points': self.plot_length_spin.value(),
+            'binary': {
+                'data_type': self.type_combo.currentText(),
+                'endianness': self.endian_combo.currentText().lower(),
+            },
+            'frame': {
+                'data_type': self.type_combo.currentText(),
+                'endianness': self.endian_combo.currentText().lower(),
+                'sync_word': self.sync_word_edit.text(),
+                'size_field': self.size_field_combo.currentText().lower(),
+                'frame_size': self.frame_size_spin.value(),
+                'checksum': self.checksum_check.isChecked(),
+            },
+        }
+        try:
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except OSError:
+            pass
+
+    def _load_settings(self):
+        """Restore plot/decode settings from JSON file."""
+        try:
+            with open(SETTINGS_FILE, 'r') as f:
+                s = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            return
+
+        widgets = [self.data_mode, self.type_combo, self.endian_combo,
+                   self.graph_channels, self.plot_length_spin,
+                   self.sync_word_edit, self.size_field_combo,
+                   self.frame_size_spin, self.checksum_check]
+        for w in widgets:
+            w.blockSignals(True)
+
+        try:
+            self.data_mode.setCurrentText(s.get('mode', 'ASCII'))
+            self.graph_channels.setValue(s.get('num_channels', 4))
+            self.plot_length_spin.setValue(s.get('num_points', DEFAULT_PLOT_LENGTH))
+
+            frame = s.get('frame', {})
+            binary = s.get('binary', {})
+            dtype = frame.get('data_type', binary.get('data_type', 'float32'))
+            endian = frame.get('endianness', binary.get('endianness', 'little'))
+
+            self.type_combo.setCurrentText(dtype)
+            self.endian_combo.setCurrentText(endian.capitalize())
+            self.sync_word_edit.setText(frame.get('sync_word', 'AA'))
+            sf = frame.get('size_field', 'fixed')
+            sf_map = {'fixed': 'Fixed', '1-byte': '1-byte', '2-byte': '2-byte'}
+            self.size_field_combo.setCurrentText(sf_map.get(sf, 'Fixed'))
+            self.frame_size_spin.setValue(frame.get('frame_size', 12))
+            self.checksum_check.setChecked(frame.get('checksum', False))
+        except (KeyError, TypeError):
+            pass
+
+        for w in widgets:
+            w.blockSignals(False)
+
+        self._apply_reader_settings()
+        self.frame_size_spin.setEnabled(self.size_field_combo.currentText() == 'Fixed')
+        self._on_mode_changed()
+
+    def handleReceivedData(self, raw_bytes):
+        """Route incoming serial bytes based on current data mode."""
+        mode = self.data_mode.currentText()
+
+        if mode == 'ASCII':
+            text = raw_bytes.decode('ISO-8859-1')
+            self.appendSerialText(text, "read")
+            return
+
+        # Binary/Frame modes: always show raw HEX
+        self._append_hex_view(raw_bytes)
+
+        # Decode through appropriate reader
+        if mode == 'Binary Stream':
+            samples = self._binary_reader.feed(raw_bytes)
+        else:
+            samples = self._frame_reader.feed(raw_bytes)
+
+        # Display decoded values and feed plot
+        for sample in samples:
+            self._append_decoded_line(sample)
+            if self.graph_mode.isChecked() and self.graphWidget is not None:
+                for i, val in enumerate(sample):
+                    self._append_data_point(float(val), i)
+
+    def _append_hex_view(self, raw_bytes):
+        """Append raw bytes to the HEX text view (right panel)."""
+        self.serialDataHex.moveCursor(QtGui.QTextCursor.End)
+        self.serialDataHex.setFontFamily('Segoe UI')
+        self.serialDataHex.setTextColor(QtGui.QColor(255, 0, 0))
+
+        hex_str = raw_bytes.hex().upper()
+        lastData = self.serialDataHex.toPlainText().split('\n')[-1]
+        lastLength = math.ceil(len(lastData) / 3)
+
+        pairs = [hex_str[i:i+2] for i in range(0, len(hex_str), 2)]
+        append_lists = []
+        if lastLength > 0 and lastLength < 16:
+            t = pairs[:16 - lastLength]
+            pairs = pairs[16 - lastLength:]
+            line = ' '.join(t)
+            if pairs:
+                line += '\n'
+            append_lists.append(line)
+
+        for i in range(0, len(pairs), 16):
+            chunk = pairs[i:i+16]
+            line = ' '.join(chunk)
+            if i + 16 < len(pairs):
+                line += '\n'
+            append_lists.append(line)
+
+        for text in append_lists:
+            self.serialDataHex.insertPlainText(text)
+        self.serialDataHex.moveCursor(QtGui.QTextCursor.End)
+
+    def _append_decoded_line(self, sample):
+        """Append one decoded sample to the left panel with color-coded channels."""
+        self.serialData.moveCursor(QtGui.QTextCursor.End)
+        self.serialData.setFontFamily('Segoe UI')
+        for i, val in enumerate(sample):
+            color = QColor(PLOT_COLORS[i % len(PLOT_COLORS)])
+            self.serialData.setTextColor(color)
+            if isinstance(val, float):
+                text = f'Ch{i}: {val:.4f}'
+            else:
+                text = f'Ch{i}: {val}'
+            if i < len(sample) - 1:
+                text += '  '
+            self.serialData.insertPlainText(text)
+        self.serialData.setTextColor(QtGui.QColor(255, 0, 0))
+        self.serialData.insertPlainText('\n')
+        self.serialData.moveCursor(QtGui.QTextCursor.End)
 
     def appendSerialText(self, appendText, direction, mode="ASCII"):
         if direction == "send":

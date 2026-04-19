@@ -1,5 +1,7 @@
 # AxxTerm user config
 macros.json
+plot_settings.json
+.superpowers/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
