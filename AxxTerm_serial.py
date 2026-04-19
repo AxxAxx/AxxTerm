@@ -317,6 +317,18 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.setStatusBar(QtWidgets.QStatusBar(self))
         self.statusText = QtWidgets.QLabel(self)
         self.statusBar().addWidget(self.statusText)
+        self.statsLabel = QtWidgets.QLabel(self)
+        self.statsLabel.setFont(QtGui.QFont('Segoe UI', 10))
+        self.statusBar().addPermanentWidget(self.statsLabel)
+
+        ### Throughput tracking ###
+        self._rx_bytes = 0
+        self._tx_bytes = 0
+        self._rx_total = 0
+        self._tx_total = 0
+        self._stats_timer = QtCore.QTimer(self)
+        self._stats_timer.timeout.connect(self._update_stats)
+        self._stats_timer.start(1000)
 
         ### Signal Connect ###
         self.toolBar.portOpenButton.clicked.connect(self.portOpen)
@@ -339,6 +351,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self.toolBar.serialControlEnable(True)
             else:
                 self.statusText.setText('Port opened')
+                self._rx_bytes = 0
+                self._tx_bytes = 0
+                self._rx_total = 0
+                self._tx_total = 0
                 self.toolBar.serialControlEnable(False)
                 self.serialDataView.label.setPixmap(create_connector_pixmap('#22bb22'))
         else:
@@ -351,6 +367,8 @@ class SerialMonitor(QtWidgets.QMainWindow):
         data = self.port.readAll()
         if len(data) > 0:
             raw_bytes = bytes(data.data())
+            self._rx_bytes += len(raw_bytes)
+            self._rx_total += len(raw_bytes)
             self.serialDataView.handleReceivedData(raw_bytes)
 
     def sendFromPort(self, text):
@@ -362,7 +380,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
             elif self.serialSendView.lineEnding.currentIndex() == 3:
                 text = text + '0D0A'
             try:
-                self.port.write(bytes.fromhex(text))
+                tx = bytes.fromhex(text)
+                self.port.write(tx)
+                self._tx_bytes += len(tx)
+                self._tx_total += len(tx)
                 self.statusText.setText('')
             except ValueError:
                 self.statusText.setText('Not a valid HEX string')
@@ -375,7 +396,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
             elif self.serialSendView.lineEnding.currentIndex() == 3:
                 text = text + '\r\n'
             try:
-                self.port.write(text.encode())
+                tx = text.encode()
+                self.port.write(tx)
+                self._tx_bytes += len(tx)
+                self._tx_total += len(tx)
                 self.statusText.setText('')
             except (UnicodeEncodeError, ValueError):
                 self.statusText.setText('Not a valid ASCII string')
@@ -384,12 +408,38 @@ class SerialMonitor(QtWidgets.QMainWindow):
             try:
                 value = int(text, 2)
                 num_bytes = max(1, (value.bit_length() + 7) // 8)
-                self.port.write(value.to_bytes(num_bytes, byteorder='big'))
+                tx = value.to_bytes(num_bytes, byteorder='big')
+                self.port.write(tx)
+                self._tx_bytes += len(tx)
+                self._tx_total += len(tx)
                 self.statusText.setText('')
             except (ValueError, OverflowError):
                 self.statusText.setText('Not a valid BINARY string')
 
         self.serialDataView.appendSerialText(text, "send", self.serialSendView.charMode.currentText())
+
+    def _update_stats(self):
+        """Update status bar with throughput and totals (called every second)."""
+        def fmt(n):
+            if n >= 1_000_000:
+                return f'{n / 1_000_000:.1f} MB'
+            if n >= 1_000:
+                return f'{n / 1_000:.1f} kB'
+            return f'{n} B'
+
+        rx_rate = self._rx_bytes
+        tx_rate = self._tx_bytes
+        self._rx_bytes = 0
+        self._tx_bytes = 0
+
+        if self.port.isOpen():
+            baud = self.toolBar.baudRate()
+            self.statsLabel.setText(
+                f'RX: {fmt(rx_rate)}/s  TX: {fmt(tx_rate)}/s  |  '
+                f'RX total: {fmt(self._rx_total)}  TX total: {fmt(self._tx_total)}  |  '
+                f'{baud} baud')
+        else:
+            self.statsLabel.setText('')
 
     def _menu_save_settings(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
