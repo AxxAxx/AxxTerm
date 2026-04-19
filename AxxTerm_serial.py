@@ -319,7 +319,8 @@ class SerialMonitor(QtWidgets.QMainWindow):
     def readFromPort(self):
         data = self.port.readAll()
         if len(data) > 0:
-            self.serialDataView.appendSerialText(QtCore.QTextStream(data).readAll(), "read")
+            raw_bytes = bytes(data.data())
+            self.serialDataView.handleReceivedData(raw_bytes)
 
     def sendFromPort(self, text):
         if self.serialSendView.charMode.currentText() == 'HEX':
@@ -695,6 +696,80 @@ class SerialDataView(QtWidgets.QWidget):
             pass
 
         self._frame_reader.reset()
+
+    def handleReceivedData(self, raw_bytes):
+        """Route incoming serial bytes based on current data mode."""
+        mode = self.data_mode.currentText()
+
+        if mode == 'ASCII':
+            text = raw_bytes.decode('ISO-8859-1')
+            self.appendSerialText(text, "read")
+            return
+
+        # Binary/Frame modes: always show raw HEX
+        self._append_hex_view(raw_bytes)
+
+        # Decode through appropriate reader
+        if mode == 'Binary Stream':
+            samples = self._binary_reader.feed(raw_bytes)
+        else:
+            samples = self._frame_reader.feed(raw_bytes)
+
+        # Display decoded values and feed plot
+        for sample in samples:
+            self._append_decoded_line(sample)
+            if self.graph_mode.isChecked() and self.graphWidget is not None:
+                for i, val in enumerate(sample):
+                    self._append_data_point(float(val), i)
+
+    def _append_hex_view(self, raw_bytes):
+        """Append raw bytes to the HEX text view (right panel)."""
+        self.serialDataHex.moveCursor(QtGui.QTextCursor.End)
+        self.serialDataHex.setFontFamily('Segoe UI')
+        self.serialDataHex.setTextColor(QtGui.QColor(255, 0, 0))
+
+        hex_str = raw_bytes.hex().upper()
+        lastData = self.serialDataHex.toPlainText().split('\n')[-1]
+        lastLength = math.ceil(len(lastData) / 3)
+
+        pairs = [hex_str[i:i+2] for i in range(0, len(hex_str), 2)]
+        append_lists = []
+        if lastLength > 0 and lastLength < 16:
+            t = pairs[:16 - lastLength]
+            pairs = pairs[16 - lastLength:]
+            line = ' '.join(t)
+            if pairs:
+                line += '\n'
+            append_lists.append(line)
+
+        for i in range(0, len(pairs), 16):
+            chunk = pairs[i:i+16]
+            line = ' '.join(chunk)
+            if i + 16 < len(pairs):
+                line += '\n'
+            append_lists.append(line)
+
+        for text in append_lists:
+            self.serialDataHex.insertPlainText(text)
+        self.serialDataHex.moveCursor(QtGui.QTextCursor.End)
+
+    def _append_decoded_line(self, sample):
+        """Append one decoded sample to the left panel with color-coded channels."""
+        self.serialData.moveCursor(QtGui.QTextCursor.End)
+        self.serialData.setFontFamily('Segoe UI')
+        for i, val in enumerate(sample):
+            color = QColor(PLOT_COLORS[i % len(PLOT_COLORS)])
+            self.serialData.setTextColor(color)
+            if isinstance(val, float):
+                text = f'Ch{i}: {val:.4f}'
+            else:
+                text = f'Ch{i}: {val}'
+            if i < len(sample) - 1:
+                text += '  '
+            self.serialData.insertPlainText(text)
+        self.serialData.setTextColor(QtGui.QColor(255, 0, 0))
+        self.serialData.insertPlainText('\n')
+        self.serialData.moveCursor(QtGui.QTextCursor.End)
 
     def appendSerialText(self, appendText, direction, mode="ASCII"):
         if direction == "send":
