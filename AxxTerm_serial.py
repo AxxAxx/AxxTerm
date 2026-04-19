@@ -283,6 +283,32 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.setWindowTitle('AxxTerm')
         self.setWindowIcon(QIcon(create_connector_pixmap('#22bb22')))
 
+        ### Menu Bar ###
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu('File')
+
+        save_settings_action = file_menu.addAction('Save Settings...')
+        save_settings_action.setShortcut('Ctrl+S')
+        save_settings_action.triggered.connect(self._menu_save_settings)
+
+        load_settings_action = file_menu.addAction('Load Settings...')
+        load_settings_action.setShortcut('Ctrl+O')
+        load_settings_action.triggered.connect(self._menu_load_settings)
+
+        file_menu.addSeparator()
+
+        export_csv_action = file_menu.addAction('Export CSV...')
+        export_csv_action.triggered.connect(self._menu_export_csv)
+
+        export_png_action = file_menu.addAction('Export PNG...')
+        export_png_action.triggered.connect(self._menu_export_png)
+
+        file_menu.addSeparator()
+
+        quit_action = file_menu.addAction('Quit')
+        quit_action.setShortcut('Ctrl+Q')
+        quit_action.triggered.connect(self.close)
+
         ### Tool Bar ###
         self.toolBar = ToolBar(self)
         self.addToolBar(self.toolBar)
@@ -364,6 +390,60 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self.statusText.setText('Not a valid BINARY string')
 
         self.serialDataView.appendSerialText(text, "send", self.serialSendView.charMode.currentText())
+
+    def _menu_save_settings(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Save Settings', '', 'JSON Files (*.json);;All Files (*)')
+        if path:
+            self.serialDataView._save_settings(path)
+            self.statusText.setText(f'Settings saved to {os.path.basename(path)}')
+
+    def _menu_load_settings(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, 'Load Settings', '', 'JSON Files (*.json);;All Files (*)')
+        if path:
+            self.serialDataView._load_settings(path)
+            self.statusText.setText(f'Settings loaded from {os.path.basename(path)}')
+
+    def _menu_export_csv(self):
+        dv = self.serialDataView
+        if not dv.plot_data:
+            self.statusText.setText('No plot data to export')
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Export CSV', '', 'CSV Files (*.csv);;All Files (*)')
+        if not path:
+            return
+        try:
+            n_channels = len(dv.plot_data)
+            n_points = len(dv.plot_data[0])
+            header = ','.join(dv._channel_name(i) for i in range(n_channels))
+            lines = [header]
+            for row in range(n_points):
+                values = ','.join(str(dv.plot_data[ch][row]) for ch in range(n_channels))
+                lines.append(values)
+            with open(path, 'w') as f:
+                f.write('\n'.join(lines) + '\n')
+            self.statusText.setText(f'CSV exported to {os.path.basename(path)}')
+        except OSError as e:
+            self.statusText.setText(f'Export failed: {e}')
+
+    def _menu_export_png(self):
+        dv = self.serialDataView
+        if dv.graphWidget is None:
+            self.statusText.setText('No graph to export (enable Show Graph)')
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Export PNG', '', 'PNG Files (*.png);;All Files (*)')
+        if not path:
+            return
+        try:
+            from pyqtgraph.exporters import ImageExporter
+            exporter = ImageExporter(dv.graphWidget.plotItem)
+            exporter.export(path)
+            self.statusText.setText(f'PNG exported to {os.path.basename(path)}')
+        except Exception as e:
+            self.statusText.setText(f'Export failed: {e}')
 
 
 class SerialDataView(QtWidgets.QWidget):
@@ -827,9 +907,9 @@ class SerialDataView(QtWidgets.QWidget):
 
         self._frame_reader.reset()
 
-    def _save_settings(self):
-        """Persist current plot/decode settings to JSON file."""
-        settings = {
+    def _get_settings_dict(self):
+        """Build the current settings as a dict."""
+        return {
             'mode': self.data_mode.currentText(),
             'num_channels': self.graph_channels.value(),
             'num_points': self.plot_length_spin.value(),
@@ -850,16 +930,19 @@ class SerialDataView(QtWidgets.QWidget):
                 'checksum': self.checksum_check.isChecked(),
             },
         }
+
+    def _save_settings(self, path=None):
+        """Persist current plot/decode settings to JSON file."""
         try:
-            with open(SETTINGS_FILE, 'w') as f:
-                json.dump(settings, f, indent=2)
+            with open(path or SETTINGS_FILE, 'w') as f:
+                json.dump(self._get_settings_dict(), f, indent=2)
         except OSError:
             pass
 
-    def _load_settings(self):
+    def _load_settings(self, path=None):
         """Restore plot/decode settings from JSON file."""
         try:
-            with open(SETTINGS_FILE, 'r') as f:
+            with open(path or SETTINGS_FILE, 'r') as f:
                 s = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError, ValueError):
             return
