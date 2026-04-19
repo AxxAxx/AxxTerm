@@ -552,7 +552,7 @@ class SerialDataView(QtWidgets.QWidget):
 
         # Endianness (binary/frame)
         self.endian_combo = QtWidgets.QComboBox()
-        self.endian_combo.addItems(['Little', 'Big'])
+        self.endian_combo.addItems(['Little Endian', 'Big Endian'])
         self.endian_combo.setMinimumWidth(70)
         self.endian_combo.currentTextChanged.connect(self._on_setting_changed)
 
@@ -562,15 +562,16 @@ class SerialDataView(QtWidgets.QWidget):
         self.sync_button.clicked.connect(self._on_sync_clicked)
 
         # Frame-only: frame start
-        self._frame_start_label = QtWidgets.QLabel('Start:')
+        self._frame_start_label = QtWidgets.QLabel('Start byte [hex]:')
         self.sync_word_edit = QtWidgets.QLineEdit('AA')
         self.sync_word_edit.setMaximumWidth(80)
         self.sync_word_edit.setPlaceholderText('AA BB')
         self.sync_word_edit.editingFinished.connect(self._on_setting_changed)
 
         # Frame-only: payload size
+        self._payload_size_label = QtWidgets.QLabel('Payload Size:')
         self.size_field_combo = QtWidgets.QComboBox()
-        self.size_field_combo.addItems(['Fixed', '1-byte', '2-byte'])
+        self.size_field_combo.addItems(['Fixed', '1-byte size field', '2-byte size field'])
         self.size_field_combo.setMinimumWidth(70)
         self.size_field_combo.currentTextChanged.connect(self._on_size_field_changed)
 
@@ -583,8 +584,8 @@ class SerialDataView(QtWidgets.QWidget):
 
         self._frame_only_widgets = [
             self._frame_start_label, self.sync_word_edit,
-            self.size_field_combo, self.frame_size_spin,
-            self.checksum_check,
+            self._payload_size_label, self.size_field_combo,
+            self.frame_size_spin, self.checksum_check,
         ]
         self._binary_frame_widgets = [
             self.type_combo, self.endian_combo,
@@ -614,6 +615,7 @@ class SerialDataView(QtWidgets.QWidget):
         cl.addWidget(self.sync_button)
         cl.addWidget(self._frame_start_label)
         cl.addWidget(self.sync_word_edit)
+        cl.addWidget(self._payload_size_label)
         cl.addWidget(self.size_field_combo)
         cl.addWidget(self.frame_size_spin)
         cl.addWidget(self.checksum_check)
@@ -913,7 +915,7 @@ class SerialDataView(QtWidgets.QWidget):
 
     def _on_size_field_changed(self):
         """Enable/disable frame size spinner based on size field type."""
-        self.frame_size_spin.setEnabled(self.size_field_combo.currentText() == 'Fixed')
+        self.frame_size_spin.setEnabled(self.size_field_combo.currentText().startswith('Fixed'))
         self._on_setting_changed()
 
     def _on_sync_clicked(self):
@@ -923,7 +925,7 @@ class SerialDataView(QtWidgets.QWidget):
     def _apply_reader_settings(self):
         """Push current UI settings to both reader objects."""
         dtype = self.type_combo.currentText()
-        endian = 'little' if self.endian_combo.currentText() == 'Little' else 'big'
+        endian = 'little' if self.endian_combo.currentText().startswith('Little') else 'big'
         nch = self.graph_channels.value()
 
         self._binary_reader.data_type = dtype
@@ -933,7 +935,8 @@ class SerialDataView(QtWidgets.QWidget):
         self._frame_reader.data_type = dtype
         self._frame_reader.endianness = endian
         self._frame_reader.num_channels = nch
-        self._frame_reader.size_field = self.size_field_combo.currentText().lower()
+        sf_text = self.size_field_combo.currentText()
+        self._frame_reader.size_field = 'fixed' if sf_text.startswith('Fixed') else sf_text.split(' ')[0]
         self._frame_reader.frame_size = self.frame_size_spin.value()
         self._frame_reader.checksum_enabled = self.checksum_check.isChecked()
 
@@ -958,13 +961,13 @@ class SerialDataView(QtWidgets.QWidget):
             'channel_colors': {str(k): v for k, v in self.channel_colors.items()},
             'binary': {
                 'data_type': self.type_combo.currentText(),
-                'endianness': self.endian_combo.currentText().lower(),
+                'endianness': 'little' if self.endian_combo.currentText().startswith('Little') else 'big',
             },
             'frame': {
                 'data_type': self.type_combo.currentText(),
-                'endianness': self.endian_combo.currentText().lower(),
+                'endianness': 'little' if self.endian_combo.currentText().startswith('Little') else 'big',
                 'sync_word': self.sync_word_edit.text(),
-                'size_field': self.size_field_combo.currentText().lower(),
+                'size_field': 'fixed' if self.size_field_combo.currentText().startswith('Fixed') else self.size_field_combo.currentText().split(' ')[0],
                 'frame_size': self.frame_size_spin.value(),
                 'checksum': self.checksum_check.isChecked(),
             },
@@ -1012,10 +1015,10 @@ class SerialDataView(QtWidgets.QWidget):
             endian = frame.get('endianness', binary.get('endianness', 'little'))
 
             self.type_combo.setCurrentText(dtype)
-            self.endian_combo.setCurrentText(endian.capitalize())
+            self.endian_combo.setCurrentText('Little Endian' if endian == 'little' else 'Big Endian')
             self.sync_word_edit.setText(frame.get('sync_word', 'AA'))
             sf = frame.get('size_field', 'fixed')
-            sf_map = {'fixed': 'Fixed', '1-byte': '1-byte', '2-byte': '2-byte'}
+            sf_map = {'fixed': 'Fixed', '1-byte': '1-byte size field', '2-byte': '2-byte size field'}
             self.size_field_combo.setCurrentText(sf_map.get(sf, 'Fixed'))
             self.frame_size_spin.setValue(frame.get('frame_size', 12))
             self.checksum_check.setChecked(frame.get('checksum', False))
@@ -1026,7 +1029,7 @@ class SerialDataView(QtWidgets.QWidget):
             w.blockSignals(False)
 
         self._apply_reader_settings()
-        self.frame_size_spin.setEnabled(self.size_field_combo.currentText() == 'Fixed')
+        self.frame_size_spin.setEnabled(self.size_field_combo.currentText().startswith('Fixed'))
         self.delimiter_custom.setVisible(self.delimiter_combo.currentText() == 'Other')
         self._on_mode_changed()
 
