@@ -1482,7 +1482,7 @@ class ToolBar(QtWidgets.QToolBar):
         toolbar_font = QtGui.QFont('Segoe UI', 12)
 
         serial_label = QtWidgets.QLabel(' Serial Port: ')
-        serial_label.setFont(QtGui.QFont('Segoe UI', 12, QtGui.QFont.Bold))
+        serial_label.setFont(QtGui.QFont('Segoe UI', 12))
         self.addWidget(serial_label)
 
         self.portOpenButton = QtWidgets.QPushButton('Open')
@@ -1582,5 +1582,7 @@ if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
     app.setWindowIcon(QIcon(create_connector_pixmap('#22bb22')))
     window = SerialMonitor()
+    screen = app.primaryScreen().availableGeometry()
+    window.resize(screen.width() * 2 // 3, screen.height() * 3 // 4)
     window.show()
     app.exec()
