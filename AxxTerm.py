@@ -328,6 +328,12 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._auto_reconnect_action.triggered.connect(self._toggle_auto_reconnect)
         self._auto_reconnect = True
 
+        ### Edit Menu ###
+        edit_menu = menubar.addMenu('Edit')
+        find_action = edit_menu.addAction('Find')
+        find_action.setShortcut('Ctrl+F')
+        find_action.triggered.connect(lambda: self.serialDataView.toggle_search())
+
         ### Tool Bar ###
         self.toolBar = ToolBar(self)
         self.addToolBar(self.toolBar)
@@ -969,17 +975,41 @@ class SerialDataView(QtWidgets.QWidget):
 
         self.splitter.addWidget(data_panel)
 
+        # Search bar (toggled via Ctrl+F)
+        self.search_bar = QtWidgets.QWidget()
+        self.search_bar.setVisible(False)
+        sb_layout = QtWidgets.QHBoxLayout(self.search_bar)
+        sb_layout.setContentsMargins(0, 2, 0, 2)
+        self.search_input = QtWidgets.QLineEdit()
+        self.search_input.setPlaceholderText('Search...')
+        self.search_input.setFont(QtGui.QFont('Segoe UI', 10))
+        self.search_input.returnPressed.connect(self._do_search)
+        self.search_count = QtWidgets.QLabel('')
+        self.search_count.setFont(QtGui.QFont('Segoe UI', 10))
+        find_btn = QtWidgets.QPushButton('Find')
+        find_btn.setFont(QtGui.QFont('Segoe UI', 10))
+        find_btn.clicked.connect(self._do_search)
+        clear_search_btn = QtWidgets.QPushButton('Clear')
+        clear_search_btn.setFont(QtGui.QFont('Segoe UI', 10))
+        clear_search_btn.clicked.connect(self._clear_search)
+        sb_layout.addWidget(self.search_input)
+        sb_layout.addWidget(find_btn)
+        sb_layout.addWidget(clear_search_btn)
+        sb_layout.addWidget(self.search_count)
+        sb_layout.addStretch()
+
         self.setLayout(QtWidgets.QGridLayout())
         self.layout().addWidget(controls,               0, 0, 1, 7)
-        self.layout().addWidget(self.splitter,          1, 0, 1, 7)
-        self.layout().addWidget(self.converter_label,   2, 1, 1, 1)
-        self.layout().addWidget(self.label,             3, 0, 1, 1)
-        self.layout().addWidget(self.convert_A_type,    3, 1, 1, 1)
-        self.layout().addWidget(self.convert_A_text,    3, 2, 1, 1)
-        self.layout().addWidget(self.convert_arrow,     3, 3, 1, 1)
-        self.layout().addWidget(self.convert_B_text,    3, 4, 1, 2)
-        self.layout().addWidget(self.clear_button,      3, 6, 1, 1, alignment=QtCore.Qt.AlignRight)
-        self.layout().setRowStretch(1, 1)
+        self.layout().addWidget(self.search_bar,        1, 0, 1, 7)
+        self.layout().addWidget(self.splitter,          2, 0, 1, 7)
+        self.layout().addWidget(self.converter_label,   3, 1, 1, 1)
+        self.layout().addWidget(self.label,             4, 0, 1, 1)
+        self.layout().addWidget(self.convert_A_type,    4, 1, 1, 1)
+        self.layout().addWidget(self.convert_A_text,    4, 2, 1, 1)
+        self.layout().addWidget(self.convert_arrow,     4, 3, 1, 1)
+        self.layout().addWidget(self.convert_B_text,    4, 4, 1, 2)
+        self.layout().addWidget(self.clear_button,      4, 6, 1, 1, alignment=QtCore.Qt.AlignRight)
+        self.layout().setRowStretch(2, 1)
         self.layout().setContentsMargins(2, 2, 2, 2)
 
     def _channel_name(self, index):
@@ -1291,6 +1321,49 @@ class SerialDataView(QtWidgets.QWidget):
                 self.convert_B_text.insertPlainText(converter(input_text))
             except Exception:
                 self.convert_B_text.insertPlainText("not valid")
+
+    def _do_search(self):
+        """Highlight all occurrences of search text in the ASCII view."""
+        term = self.search_input.text()
+        if not term:
+            self._clear_search()
+            return
+        # Reset all formatting first
+        cursor = self.serialData.textCursor()
+        cursor.select(QTextCursor.Document)
+        fmt = QtGui.QTextCharFormat()
+        fmt.setBackground(QColor('transparent'))
+        cursor.mergeCharFormat(fmt)
+        cursor.clearSelection()
+        # Find and highlight all matches
+        highlight_fmt = QtGui.QTextCharFormat()
+        highlight_fmt.setBackground(QColor('#FFFF00'))
+        highlight_fmt.setForeground(QColor('#000000'))
+        count = 0
+        find_cursor = self.serialData.document().find(term)
+        while not find_cursor.isNull():
+            find_cursor.mergeCharFormat(highlight_fmt)
+            count += 1
+            find_cursor = self.serialData.document().find(term, find_cursor)
+        self.search_count.setText(f'{count} matches')
+
+    def _clear_search(self):
+        """Remove all search highlights and clear the search field."""
+        self.search_input.clear()
+        self.search_count.setText('')
+        cursor = self.serialData.textCursor()
+        cursor.select(QTextCursor.Document)
+        fmt = QtGui.QTextCharFormat()
+        fmt.setBackground(QColor('transparent'))
+        cursor.mergeCharFormat(fmt)
+        cursor.clearSelection()
+
+    def toggle_search(self):
+        """Show or hide the search bar."""
+        vis = not self.search_bar.isVisible()
+        self.search_bar.setVisible(vis)
+        if vis:
+            self.search_input.setFocus()
 
     def clear_button_Clicked(self):
         self.serialDataHex.clear()
