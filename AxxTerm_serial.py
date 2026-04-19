@@ -623,6 +623,10 @@ class SerialDataView(QtWidgets.QWidget):
         self.convert_A_text.textChanged.connect(self.translate_data)
         self.convert_A_text.setFont(QtGui.QFont('Segoe UI', 12))
 
+        self.convert_arrow = QtWidgets.QLabel('\u2192')
+        self.convert_arrow.setFont(QtGui.QFont('Segoe UI', 14))
+        self.convert_arrow.setAlignment(QtCore.Qt.AlignCenter)
+
         self.convert_B_text = QtWidgets.QTextEdit(self)
         self.convert_B_text.setMaximumHeight(31)
         self.convert_B_text.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
@@ -739,14 +743,15 @@ class SerialDataView(QtWidgets.QWidget):
         self.splitter.addWidget(data_panel)
 
         self.setLayout(QtWidgets.QGridLayout(self))
-        self.layout().addWidget(controls,               0, 0, 1, 6)
-        self.layout().addWidget(self.splitter,          1, 0, 1, 6)
+        self.layout().addWidget(controls,               0, 0, 1, 7)
+        self.layout().addWidget(self.splitter,          1, 0, 1, 7)
         self.layout().addWidget(self.converter_label,   2, 1, 1, 1)
         self.layout().addWidget(self.label,             3, 0, 1, 1)
         self.layout().addWidget(self.convert_A_type,    3, 1, 1, 1)
         self.layout().addWidget(self.convert_A_text,    3, 2, 1, 1)
-        self.layout().addWidget(self.convert_B_text,    3, 3, 1, 2)
-        self.layout().addWidget(self.clear_button,      3, 5, 1, 1, alignment=QtCore.Qt.AlignRight)
+        self.layout().addWidget(self.convert_arrow,     3, 3, 1, 1)
+        self.layout().addWidget(self.convert_B_text,    3, 4, 1, 2)
+        self.layout().addWidget(self.clear_button,      3, 6, 1, 1, alignment=QtCore.Qt.AlignRight)
         self.layout().setRowStretch(1, 1)
         self.layout().setContentsMargins(2, 2, 2, 2)
 
