@@ -103,6 +103,100 @@ class BinaryStreamReader:
         self.buffer.clear()
 
 
+class FrameReader:
+    """Decodes framed binary packets with sync word, optional size, and optional checksum."""
+
+    SEARCHING = 0
+    READING_SIZE = 1
+    READING_PAYLOAD = 2
+
+    def __init__(self):
+        self.data_type = 'float32'
+        self.endianness = 'little'
+        self.num_channels = 4
+        self.sync_word = bytes([0xAA])
+        self.size_field = 'fixed'
+        self.frame_size = 12
+        self.checksum_enabled = False
+        self.state = self.SEARCHING
+        self._sync_index = 0
+        self._size_buffer = bytearray()
+        self._payload_buffer = bytearray()
+        self._payload_size = 0
+
+    def reset(self):
+        """Reset state machine and clear buffers."""
+        self.state = self.SEARCHING
+        self._sync_index = 0
+        self._size_buffer.clear()
+        self._payload_buffer.clear()
+        self._payload_size = 0
+
+    def feed(self, data):
+        """Feed raw bytes. Returns list of tuples, one per sample."""
+        results = []
+        fmt_char, type_size = DATA_TYPES[self.data_type]
+        prefix = '<' if self.endianness == 'little' else '>'
+        sample_size = self.num_channels * type_size
+        if sample_size == 0:
+            return []
+        fmt = prefix + fmt_char * self.num_channels
+
+        for byte in data:
+            if self.state == self.SEARCHING:
+                if byte == self.sync_word[self._sync_index]:
+                    self._sync_index += 1
+                    if self._sync_index == len(self.sync_word):
+                        self._sync_index = 0
+                        if self.size_field == 'fixed':
+                            self._payload_size = self.frame_size
+                            self.state = self.READING_PAYLOAD
+                            self._payload_buffer.clear()
+                        else:
+                            self.state = self.READING_SIZE
+                            self._size_buffer.clear()
+                else:
+                    self._sync_index = 1 if byte == self.sync_word[0] else 0
+
+            elif self.state == self.READING_SIZE:
+                self._size_buffer.append(byte)
+                needed = 1 if self.size_field == '1-byte' else 2
+                if len(self._size_buffer) >= needed:
+                    if needed == 1:
+                        self._payload_size = self._size_buffer[0]
+                    else:
+                        size_fmt = '<H' if self.endianness == 'little' else '>H'
+                        self._payload_size = struct.unpack(size_fmt, self._size_buffer[:2])[0]
+                    if self._payload_size == 0 or (self._payload_size % sample_size) != 0:
+                        self.state = self.SEARCHING
+                        self._sync_index = 0
+                    else:
+                        self.state = self.READING_PAYLOAD
+                        self._payload_buffer.clear()
+
+            elif self.state == self.READING_PAYLOAD:
+                self._payload_buffer.append(byte)
+                total_needed = self._payload_size + (1 if self.checksum_enabled else 0)
+                if len(self._payload_buffer) >= total_needed:
+                    payload = bytes(self._payload_buffer[:self._payload_size])
+                    valid = True
+                    if self.checksum_enabled:
+                        received = self._payload_buffer[self._payload_size]
+                        computed = sum(payload) & 0xFF
+                        if received != computed:
+                            valid = False
+                    if valid:
+                        offset = 0
+                        while offset + sample_size <= len(payload):
+                            values = struct.unpack_from(fmt, payload, offset)
+                            results.append(values)
+                            offset += sample_size
+                    self.state = self.SEARCHING
+                    self._sync_index = 0
+
+        return results
+
+
 def create_connector_pixmap(color, width=71, height=30):
     """Draw a DB-9 connector icon programmatically (no external PNG needed)."""
     pixmap = QPixmap(width, height)
