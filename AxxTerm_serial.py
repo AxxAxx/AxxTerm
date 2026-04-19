@@ -420,6 +420,18 @@ class SerialDataView(QtWidgets.QWidget):
         self.plot_length_spin.setFont(QtGui.QFont('Segoe UI', 12))
         self.plot_length_spin.valueChanged.connect(self._on_setting_changed)
 
+        self.delimiter_combo = QtWidgets.QComboBox()
+        self.delimiter_combo.addItems(['Auto', 'Comma', 'Semicolon', 'Space', 'Tab', 'Other'])
+        self.delimiter_combo.setFont(QtGui.QFont('Segoe UI', 12))
+        self.delimiter_combo.currentIndexChanged.connect(self._on_delimiter_changed)
+
+        self.delimiter_custom = QtWidgets.QLineEdit()
+        self.delimiter_custom.setMaximumWidth(50)
+        self.delimiter_custom.setPlaceholderText('...')
+        self.delimiter_custom.setFont(QtGui.QFont('Segoe UI', 12))
+        self.delimiter_custom.setVisible(False)
+        self.delimiter_custom.editingFinished.connect(self._on_setting_changed)
+
         self.clear_button = QtWidgets.QPushButton('Clear ALL')
         self.clear_button.clicked.connect(self.clear_button_Clicked)
         self.clear_button.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred)
@@ -513,6 +525,8 @@ class SerialDataView(QtWidgets.QWidget):
         gc_layout.setContentsMargins(0, 0, 0, 0)
         gc_layout.addWidget(self.plot_length_spin)
         gc_layout.addWidget(self.graph_channels)
+        gc_layout.addWidget(self.delimiter_combo)
+        gc_layout.addWidget(self.delimiter_custom)
         gc_layout.addWidget(self.data_mode)
         gc_layout.addWidget(self.graph_mode)
 
@@ -591,24 +605,37 @@ class SerialDataView(QtWidgets.QWidget):
         arr[-1] = value
         self.plot_lines[channel].setData(arr)
 
-    def _parse_plot_values(self, line):
-        """Parse a line of serial data into numeric values.
+    def _get_delimiter(self):
+        """Return the active delimiter string, or None for auto-detect."""
+        mode = self.delimiter_combo.currentText()
+        delim_map = {'Comma': ',', 'Semicolon': ';', 'Space': ' ', 'Tab': '\t'}
+        if mode == 'Auto':
+            return None
+        if mode == 'Other':
+            custom = self.delimiter_custom.text()
+            return custom if custom else None
+        return delim_map.get(mode)
 
-        Supports:
-          - Tab-separated:   1.0\\t2.0\\t3.0
-          - Comma-separated: 1.0,2.0,3.0
-          - Space-separated: 1.0 2.0 3.0
-          - Labeled:         ch0:1.0\\tch1:2.0\\tch2:3.0
-        """
+    def _parse_plot_values(self, line):
+        """Parse a line of serial data into numeric values."""
         line = line.strip()
         if not line:
             return []
-        if '\t' in line:
-            fields = line.split('\t')
-        elif ',' in line:
-            fields = line.split(',')
-        else:
+        delim = self._get_delimiter()
+        if delim is None:
+            # Auto-detect: tab > comma > semicolon > space
+            if '\t' in line:
+                fields = line.split('\t')
+            elif ',' in line:
+                fields = line.split(',')
+            elif ';' in line:
+                fields = line.split(';')
+            else:
+                fields = line.split()
+        elif delim == ' ':
             fields = line.split()
+        else:
+            fields = line.split(delim)
         values = []
         for field in fields:
             field = field.strip()
@@ -676,6 +703,11 @@ class SerialDataView(QtWidgets.QWidget):
         self._apply_reader_settings()
         self._save_settings()
 
+    def _on_delimiter_changed(self):
+        """Show/hide custom delimiter input and save."""
+        self.delimiter_custom.setVisible(self.delimiter_combo.currentText() == 'Other')
+        self._save_settings()
+
     def _on_size_field_changed(self):
         """Enable/disable frame size spinner based on size field type."""
         self.frame_size_spin.setEnabled(self.size_field_combo.currentText() == 'Fixed')
@@ -717,6 +749,8 @@ class SerialDataView(QtWidgets.QWidget):
             'mode': self.data_mode.currentText(),
             'num_channels': self.graph_channels.value(),
             'num_points': self.plot_length_spin.value(),
+            'delimiter': self.delimiter_combo.currentText(),
+            'delimiter_custom': self.delimiter_custom.text(),
             'binary': {
                 'data_type': self.type_combo.currentText(),
                 'endianness': self.endian_combo.currentText().lower(),
@@ -746,6 +780,7 @@ class SerialDataView(QtWidgets.QWidget):
 
         widgets = [self.data_mode, self.type_combo, self.endian_combo,
                    self.graph_channels, self.plot_length_spin,
+                   self.delimiter_combo, self.delimiter_custom,
                    self.sync_word_edit, self.size_field_combo,
                    self.frame_size_spin, self.checksum_check]
         for w in widgets:
@@ -755,6 +790,8 @@ class SerialDataView(QtWidgets.QWidget):
             self.data_mode.setCurrentText(s.get('mode', 'ASCII'))
             self.graph_channels.setValue(s.get('num_channels', 4))
             self.plot_length_spin.setValue(s.get('num_points', DEFAULT_PLOT_LENGTH))
+            self.delimiter_combo.setCurrentText(s.get('delimiter', 'Auto'))
+            self.delimiter_custom.setText(s.get('delimiter_custom', ''))
 
             frame = s.get('frame', {})
             binary = s.get('binary', {})
@@ -777,6 +814,7 @@ class SerialDataView(QtWidgets.QWidget):
 
         self._apply_reader_settings()
         self.frame_size_spin.setEnabled(self.size_field_combo.currentText() == 'Fixed')
+        self.delimiter_custom.setVisible(self.delimiter_combo.currentText() == 'Other')
         self._on_mode_changed()
 
     def handleReceivedData(self, raw_bytes):
