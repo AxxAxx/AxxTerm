@@ -380,6 +380,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self.serialDataView.handleReceivedData(raw_bytes)
 
     def sendFromPort(self, text):
+        if not self.port.isOpen():
+            self.statusText.setText('Port is not open')
+            return
+        sent = False
         if self.serialSendView.charMode.currentText() == 'HEX':
             if self.serialSendView.lineEnding.currentIndex() == 1:
                 text = text + '0A'
@@ -393,6 +397,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self._tx_bytes += len(tx)
                 self._tx_total += len(tx)
                 self.statusText.setText('')
+                sent = True
             except ValueError:
                 self.statusText.setText('Not a valid HEX string')
 
@@ -409,6 +414,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self._tx_bytes += len(tx)
                 self._tx_total += len(tx)
                 self.statusText.setText('')
+                sent = True
             except (UnicodeEncodeError, ValueError):
                 self.statusText.setText('Not a valid ASCII string')
 
@@ -421,10 +427,12 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self._tx_bytes += len(tx)
                 self._tx_total += len(tx)
                 self.statusText.setText('')
+                sent = True
             except (ValueError, OverflowError):
                 self.statusText.setText('Not a valid BINARY string')
 
-        self.serialDataView.appendSerialText(text, "send", self.serialSendView.charMode.currentText())
+        if sent:
+            self.serialDataView.appendSerialText(text, "send", self.serialSendView.charMode.currentText())
 
     def _update_stats(self):
         """Update status bar with throughput and totals (called every second)."""
@@ -480,14 +488,20 @@ class SerialMonitor(QtWidgets.QMainWindow):
         plot = s.get('plot', s)  # fallback: old format had plot keys at top level
         self.serialDataView._load_plot_settings(plot)
 
-        # Serial port settings
+        # Serial port settings (block signals to avoid cascading saves)
         serial = s.get('serial', {})
         if serial:
+            for w in [self.toolBar.baudRates, self.toolBar.dataBits,
+                      self.toolBar._parity, self.toolBar.stopBits, self.toolBar._flowControl]:
+                w.blockSignals(True)
             self.toolBar.baudRates.setCurrentText(serial.get('baud_rate', '115200'))
             self.toolBar.dataBits.setCurrentIndex(serial.get('data_bits', 3))
             self.toolBar._parity.setCurrentIndex(serial.get('parity', 0))
             self.toolBar.stopBits.setCurrentIndex(serial.get('stop_bits', 0))
             self.toolBar._flowControl.setCurrentIndex(serial.get('flow_control', 0))
+            for w in [self.toolBar.baudRates, self.toolBar.dataBits,
+                      self.toolBar._parity, self.toolBar.stopBits, self.toolBar._flowControl]:
+                w.blockSignals(False)
 
         # Macros
         macros = s.get('macros', None)
@@ -752,7 +766,7 @@ class SerialDataView(QtWidgets.QWidget):
 
         self.splitter.addWidget(data_panel)
 
-        self.setLayout(QtWidgets.QGridLayout(self))
+        self.setLayout(QtWidgets.QGridLayout())
         self.layout().addWidget(controls,               0, 0, 1, 7)
         self.layout().addWidget(self.splitter,          1, 0, 1, 7)
         self.layout().addWidget(self.converter_label,   2, 1, 1, 1)
@@ -835,8 +849,9 @@ class SerialDataView(QtWidgets.QWidget):
                 self.graphWidget.setYRange(self._y_min, self._y_max)
             self.graphWidget.addLegend()
             self.graphWidget.scene().sigMouseClicked.connect(self._on_plot_mouse_clicked)
-            self.graphWidget.sigRangeChanged.connect(self._on_range_changed)
             self._create_plot_lines()
+            # Connect range signal AFTER setup to avoid overwriting restored Y-axis
+            self.graphWidget.sigRangeChanged.connect(self._on_range_changed)
             self.numberbuffer = []
             # Crosshair cursor
             self._crosshair = pg.InfiniteLine(angle=90, movable=False,
@@ -869,10 +884,9 @@ class SerialDataView(QtWidgets.QWidget):
 
     def _clear_graph(self):
         """Reset all plot data to zeros."""
-        for arr in self.plot_data:
+        for i, (arr, line) in enumerate(zip(self.plot_data, self.plot_lines)):
             arr[:] = 0
-        for line in self.plot_lines:
-            line.setData(self.plot_data[self.plot_lines.index(line)])
+            line.setData(arr)
 
     def _position_clear_graph_btn(self):
         """Position the Clear Plot button in the lower-right of the graph."""
@@ -1056,6 +1070,8 @@ class SerialDataView(QtWidgets.QWidget):
         self.convert_B_text.clear()
         self._binary_reader.sync()
         self._frame_reader.reset()
+        self._pending_cr = False
+        self.numberbuffer = []
 
     def _on_mode_changed(self):
         """Show/hide controls based on data mode."""
@@ -1089,6 +1105,8 @@ class SerialDataView(QtWidgets.QWidget):
         self.serialDataHex.clear()
         self._binary_reader.sync()
         self._frame_reader.reset()
+        self._pending_cr = False
+        self.numberbuffer = []
 
         self._apply_reader_settings()
         self._save_settings()
@@ -1145,6 +1163,7 @@ class SerialDataView(QtWidgets.QWidget):
             'mode': self.data_mode.currentText(),
             'num_channels': self.graph_channels.value(),
             'num_points': self.plot_length_spin.value(),
+            'show_plot': self.graph_mode.isChecked(),
             'delimiter': self.delimiter_combo.currentText(),
             'delimiter_custom': self.delimiter_custom.text(),
             'channel_names': {str(k): v for k, v in self.channel_names.items()},
@@ -1186,6 +1205,7 @@ class SerialDataView(QtWidgets.QWidget):
             self.data_mode.setCurrentText(s.get('mode', 'ASCII'))
             self.graph_channels.setValue(s.get('num_channels', 4))
             self.plot_length_spin.setValue(s.get('num_points', DEFAULT_PLOT_LENGTH))
+            self.graph_mode.setChecked(s.get('show_plot', False))
             self.delimiter_combo.setCurrentText(s.get('delimiter', 'Auto'))
             self.delimiter_custom.setText(s.get('delimiter_custom', ''))
 
@@ -1384,7 +1404,8 @@ class SerialDataView(QtWidgets.QWidget):
 class HLine(QFrame):
     def __init__(self):
         super().__init__()
-        self.setFrameShape(self.HLine | self.Sunken)
+        self.setFrameShape(QFrame.HLine)
+        self.setFrameShadow(QFrame.Sunken)
 
 
 class MacroEditDialog(QtWidgets.QDialog):
@@ -1553,7 +1574,7 @@ class SerialSendView(QtWidgets.QWidget):
             "No line ending",
             "LF '\\n', 0x0A",
             "CR '\\r', 0x0D",
-            "Both LF CR '\\r\\n'",
+            "Both CR LF '\\r\\n'",
         ])
         self.lineEnding.setCurrentIndex(1)
         self.lineEnding.setMinimumHeight(30)
@@ -1581,7 +1602,7 @@ class SerialSendView(QtWidgets.QWidget):
             btn.macroChanged.connect(self._save_macros)
             self.macro_buttons.append(btn)
 
-        self.setLayout(QtWidgets.QGridLayout(self))
+        self.setLayout(QtWidgets.QGridLayout())
 
         self.layout().addWidget(HLine(),       0, 0, 1, NUM_MACRO_BUTTONS)
         for i, btn in enumerate(self.macro_buttons):
@@ -1693,7 +1714,7 @@ class ToolBar(QtWidgets.QToolBar):
         self.portOpenButton.setFont(toolbar_font)
 
         self.portScanButton = QtWidgets.QPushButton('Scan')
-        self.portScanButton.setCheckable(True)
+        self.portScanButton.setCheckable(False)
         self.portScanButton.clicked.connect(self.scan_button_Clicked)
         self.portScanButton.setMinimumHeight(32)
         self.portScanButton.setFont(toolbar_font)

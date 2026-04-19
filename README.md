@@ -1,117 +1,178 @@
 # AxxTerm
 
-Serial terminal with dual ASCII/HEX view, real-time plotting, data converter, and configurable macro buttons.
+A professional serial terminal with dual ASCII/HEX view, real-time plotting, binary/frame decoding, data converter, and configurable macro buttons. Built with Python and PyQt5.
 
 ![AxxTerm GUI](AxxTerm_GUI.PNG)
 
 ## Features
 
-- **Dual data view** - ASCII and HEX side by side, color-coded (red = received, blue = sent)
-- **Real-time plotting** - Graph incoming data with 1-12 channels, auto-scaling Y axis, and adjustable plot length. Supports ASCII text, binary stream, and custom frame decoding modes
-- **Send modes** - ASCII, HEX, and Binary with configurable line endings (LF, CR, CRLF)
-- **Macro buttons** - 8 quick-send buttons, right-click to edit label and payload
-- **Data converter** - Convert between HEX, ASCII, Decimal, and Binary
-- **Serial configuration** - Baud rate, data bits, parity, stop bits, flow control
+### Serial Communication
+- Auto-detect serial ports with device name and VID:PID display
+- Configurable baud rate (9600 to 921600), data bits, parity, stop bits, flow control
+- Visual connection indicator (DB-9 connector icon: green = connected, red = disconnected)
+- Live status bar with RX/TX throughput (bytes/sec), totals, and baud rate
+
+### Dual Data View
+- ASCII and HEX views side by side, updated in real-time
+- Color-coded: red for received data, blue for sent data
+- Resizable splitter between the plot and data views
+
+### Sending Data
+- Three send modes: ASCII, HEX, BINARY
+- Configurable line endings: None, LF, CR, CR+LF
+- Command history with Up/Down arrow keys
+- 8 macro buttons for quick-send (right-click to edit label and payload)
+
+### Real-Time Plotting
+- 1 to 12 channels with auto-scaling Y-axis
+- Configurable scrolling window (10 to 10,000 points)
+- Crosshair cursor showing all channel values at the mouse position
+- Right-click legend entries to rename channels or change colors
+- Right-click plot area for axis settings (auto-range, manual Y-axis limits)
+- Clear Plot button to reset all data
+- Export plot as PNG image
+- Export plot data as CSV with channel name headers
+
+### Data Decoding Modes
+
+**ASCII** (default) -- Parses newline-delimited text values for plotting.
+
+| Delimiter | Example |
+|-----------|---------|
+| Auto-detect | Detects tab, comma, semicolon, or space |
+| Comma | `1.0,2.0,3.0` |
+| Semicolon | `1.0;2.0;3.0` |
+| Space | `1.0 2.0 3.0` |
+| Tab | `1.0\t2.0\t3.0` |
+| Other | User-defined custom delimiter |
+
+Supports labeled values (e.g., `temp:23.5,hum:45.2`).
+
+**Binary Stream** -- Decodes continuous raw binary data.
+
+| Setting | Options |
+|---------|---------|
+| Data Type | uint8, int8, uint16, int16, uint32, int32, float32, double64 |
+| Endianness | Little Endian, Big Endian |
+| Sync | Button to re-align stream |
+
+Each sample is `channels x sizeof(type)` bytes. In this mode, the left panel shows color-coded decoded channel values.
+
+**Custom Frame** -- Decodes framed binary packets.
+
+Frame structure: `[Start Byte(s)] [Optional Size Field] [Payload] [Optional Checksum]`
+
+| Setting | Options |
+|---------|---------|
+| Start byte | Variable-length hex sequence (e.g., `AA BB`) |
+| Payload Size | Fixed (user-specified), 1-byte size field, 2-byte size field |
+| Data Type | Same 8 types as Binary Stream |
+| Endianness | Little Endian, Big Endian |
+| Checksum | Optional 8-bit sum validation |
+
+### Data Converter
+- Real-time conversion between HEX, ASCII, Decimal, and Binary
+- 12 conversion combinations
+- Input/output with arrow indicator
+
+### Settings Persistence
+- All settings saved automatically to `AxxTerm_settings.json`
+- Includes: serial port config, decode mode, plot settings, channel names/colors, macros
+- File > Save Settings / Load Settings for explicit save/load to custom files
+
+### Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| Enter | Send data |
+| Up/Down | Navigate send history |
+| Ctrl+S | Save settings to file |
+| Ctrl+O | Load settings from file |
+| Ctrl+Q | Quit |
 
 ## Requirements
 
 - Python 3.8+
-- PyQt5
-- pyqtgraph
-- NumPy
+- PyQt5 >= 5.15
+- pyqtgraph >= 0.13
+- NumPy >= 1.24
 
 ## Installation
 
-### Run from source
-
 ```bash
+git clone https://github.com/AxxAxx/AxxTerm.git
+cd AxxTerm
 pip install -r requirements.txt
 python AxxTerm_serial.py
 ```
 
-### Build standalone .exe (no Python needed on target machine)
+## Building Standalone .exe
+
+### Using the build script (Windows)
 
 ```bash
 build.bat
 ```
 
-This installs PyInstaller if needed, then creates `dist\AxxTerm.exe` - a single portable executable. Copy it anywhere and run.
+This installs PyInstaller if needed, then creates `dist\AxxTerm.exe` -- a single portable executable. Copy it anywhere and run. No Python installation needed on the target machine.
 
-You can also build manually:
+### Manual build
 
 ```bash
 pip install pyinstaller
 pyinstaller --onefile --windowed --name AxxTerm --clean AxxTerm_serial.py
 ```
 
-## Usage
+The resulting executable is in the `dist/` folder.
 
-### Connecting
+### Build notes
 
-1. Select the COM port from the dropdown (click **Scan** to refresh the list)
-2. Set baud rate (default 115200) and serial parameters (data bits, parity, stop bits, flow control)
-3. Click **Open** to connect - the DB-9 connector icon turns green when connected
+- The .exe resolves config files (settings, macros) relative to the executable location, not the temp folder
+- First launch creates `AxxTerm_settings.json` next to the executable when you change any setting
+- File size is typically 30-50 MB (includes Python runtime and all dependencies)
 
-### Sending data
-
-- Type in the input field and press **Enter** or click **Send**
-- Select **ASCII**, **HEX**, or **BINARY** mode from the dropdown on the left
-- Select line ending from the dropdown on the right (LF, CR, CRLF, or none)
-- Use **Up/Down arrows** to navigate send history
-
-### Macro buttons
-
-The 8 green buttons at the bottom send pre-configured hex data with a single click.
-
-- **Right-click** any macro button to edit it
-- Set a custom label and payload using HEX, ASCII, Decimal, or Binary input
-- Macros are saved automatically to `macros.json` next to the application
-
-### Real-time plotting
-
-1. Check **Show Graph** to enable the plot
-2. Set the number of channels with the **Ch** spinner (1-12)
-3. Set the scrolling window size with the **Pts** spinner
-4. Select the data mode from the **Mode** dropdown
-
-#### Data modes
-
-**ASCII** (default) - Parses incoming text lines. Supports several formats:
-
-| Format | Example |
-|--------|---------|
-| Tab-separated | `1.0\t2.0\t3.0` |
-| Comma-separated | `1.0,2.0,3.0` |
-| Space-separated | `1.0 2.0 3.0` |
-| Labeled | `temp:23.5\thum:45.2\tpres:1013` |
-
-Each line (terminated by `\n`) is parsed and plotted. Values beyond the configured channel count are ignored.
-
-**Binary Stream** - Decodes a continuous stream of raw binary data. Configure the data type (uint8, int8, uint16, int16, uint32, int32, float32, double64) and byte order (little/big endian). Each sample is `channels x sizeof(type)` bytes. Use the **Sync** button to re-align if the stream gets out of phase.
-
-**Custom Frame** - Decodes framed binary packets with the structure: `[Sync Word] [Optional Size] [Payload] [Optional Checksum]`. Configure:
-- **Sync Word** - hex bytes to match at frame start (e.g., `AA BB`)
-- **Size Field** - Fixed (known size), 1-byte, or 2-byte length field after sync
-- **Frame Size** - payload size in bytes (when using Fixed size field)
-- **Checksum** - optional 8-bit sum validation
-
-In Binary Stream and Custom Frame modes, the left panel shows color-coded decoded channel values and the right panel shows the raw hex dump. Settings are saved automatically to `plot_settings.json`.
-
-### Data converter
-
-The converter at the bottom converts between HEX, ASCII, Decimal, and Binary in real time. Select the conversion type from the dropdown and type in the left field - the result appears in the right field. Changing the conversion type re-converts the current input automatically.
-
-## Files
+## File Structure
 
 | File | Description |
 |------|-------------|
-| `AxxTerm_serial.py` | Main application source |
+| `AxxTerm_serial.py` | Main application (single-file, self-contained) |
 | `requirements.txt` | Python dependencies |
-| `build.bat` | Build script for standalone .exe |
-| `macros.json` | Macro button config (auto-created on first edit) |
-| `plot_settings.json` | Plot/decode settings (auto-created on change) |
+| `build.bat` | Windows build script for standalone .exe |
 | `test_readers.py` | Unit tests for binary/frame reader classes |
+| `AxxTerm_GUI.PNG` | Screenshot |
+| `LICENSE` | MIT License |
+
+## Settings File Format
+
+`AxxTerm_settings.json` is auto-created and contains:
+
+```json
+{
+  "plot": {
+    "mode": "ASCII",
+    "num_channels": 4,
+    "num_points": 100,
+    "show_plot": false,
+    "delimiter": "Auto",
+    "channel_names": {},
+    "channel_colors": {},
+    "y_auto_scale": true,
+    "binary": { "data_type": "float32", "endianness": "little" },
+    "frame": { "sync_word": "AA", "size_field": "fixed", "frame_size": 12, "checksum": false }
+  },
+  "serial": {
+    "baud_rate": "115200",
+    "data_bits": 3,
+    "parity": 0,
+    "stop_bits": 0,
+    "flow_control": 0
+  },
+  "macros": [
+    { "label": "0x7F", "hex": "7F" }
+  ]
+}
+```
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](LICENSE) for details.

@@ -1,7 +1,10 @@
 # AxxTerm user config
 AxxTerm_settings.json
-macros.json
-plot_settings.json
+
+# Build artifacts
+build/
+dist/
+*.spec
 .superpowers/
 
 # Byte-compiled / optimized / DLL files
