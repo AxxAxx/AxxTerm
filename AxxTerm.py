@@ -5,6 +5,7 @@ import re
 import struct
 import os
 import json
+from datetime import datetime
 from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 from PyQt5.QtSerialPort import QSerialPort, QSerialPortInfo
@@ -295,6 +296,12 @@ class SerialMonitor(QtWidgets.QMainWindow):
 
         file_menu.addSeparator()
 
+        self._record_action = file_menu.addAction('Start Recording')
+        self._record_action.setShortcut('Ctrl+R')
+        self._record_action.triggered.connect(self._toggle_recording)
+
+        file_menu.addSeparator()
+
         export_csv_action = file_menu.addAction('Export CSV...')
         export_csv_action.triggered.connect(self._menu_export_csv)
 
@@ -327,11 +334,20 @@ class SerialMonitor(QtWidgets.QMainWindow):
 
         ### Status Bar ###
         self.setStatusBar(QtWidgets.QStatusBar(self))
+        self._record_btn = QtWidgets.QPushButton('Record', self)
+        self._record_btn.setCheckable(True)
+        self._record_btn.setFixedHeight(22)
+        self._record_btn.clicked.connect(self._toggle_recording)
+        self.statusBar().addWidget(self._record_btn)
         self.statusText = QtWidgets.QLabel(self)
         self.statusBar().addWidget(self.statusText)
         self.statsLabel = QtWidgets.QLabel(self)
         self.statsLabel.setFont(QtGui.QFont('Segoe UI', 10))
         self.statusBar().addPermanentWidget(self.statsLabel)
+
+        ### Recording state ###
+        self._log_file = None
+        self._recording = False
 
         ### Throughput tracking ###
         self._rx_bytes = 0
@@ -401,6 +417,12 @@ class SerialMonitor(QtWidgets.QMainWindow):
             raw_bytes = bytes(data.data())
             self._rx_bytes += len(raw_bytes)
             self._rx_total += len(raw_bytes)
+            mode = self.serialDataView.data_mode.currentText()
+            if mode == 'ASCII':
+                self._log_data('RX', raw_bytes.decode('ISO-8859-1'))
+            else:
+                hex_str = raw_bytes.hex().upper()
+                self._log_data('RX', f'[HEX] {hex_str}')
             self.serialDataView.handleReceivedData(raw_bytes)
 
     def sendFromPort(self, text):
@@ -456,7 +478,14 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self.statusText.setText('Not a valid BINARY string')
 
         if sent:
-            self.serialDataView.appendSerialText(text, "send", self.serialSendView.charMode.currentText())
+            mode = self.serialSendView.charMode.currentText()
+            if mode == 'HEX':
+                self._log_data('TX', f'[HEX] {text.upper()}')
+            elif mode == 'BINARY':
+                self._log_data('TX', f'[BIN] {text}')
+            else:
+                self._log_data('TX', text)
+            self.serialDataView.appendSerialText(text, "send", mode)
 
     def _update_stats(self):
         """Update status bar with throughput and totals (called every second)."""
@@ -563,6 +592,59 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self._rx_total = 0
             self._tx_total = 0
             self.statusText.setText('Port reconnected')
+
+    # --- Recording / Logging ---------------------------------------------------
+
+    def _log_data(self, direction, text):
+        """Write a timestamped line to the log file if recording is active."""
+        if not self._recording or self._log_file is None:
+            return
+        now = datetime.now()
+        ts = now.strftime('%Y-%m-%d %H:%M:%S.') + f'{now.microsecond // 1000:03d}'
+        for line in text.splitlines():
+            if line:
+                self._log_file.write(f'[{ts}] {direction}: {line}\n')
+        self._log_file.flush()
+
+    def _toggle_recording(self):
+        """Start or stop recording serial data to a log file."""
+        if self._recording:
+            # Stop recording
+            if self._log_file is not None:
+                self._log_file.close()
+                self._log_file = None
+            self._recording = False
+            self._record_btn.setChecked(False)
+            self._record_btn.setText('Record')
+            self._record_btn.setStyleSheet('')
+            self._record_action.setText('Start Recording')
+            self.statusText.setText('Recording stopped')
+        else:
+            # Start recording
+            ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            filename = f'AxxTerm_log_{ts}.txt'
+            filepath = os.path.join(SCRIPT_DIR, filename)
+            try:
+                self._log_file = open(filepath, 'w', encoding='utf-8')
+            except OSError as e:
+                self.statusText.setText(f'Cannot create log file: {e}')
+                self._record_btn.setChecked(False)
+                return
+            self._recording = True
+            self._record_btn.setChecked(True)
+            self._record_btn.setText('Recording...')
+            self._record_btn.setStyleSheet(
+                'QPushButton { background-color: #cc2222; color: white; font-weight: bold; }')
+            self._record_action.setText('Stop Recording')
+            self.statusText.setText(f'Recording to {filename}')
+
+    def closeEvent(self, event):
+        """Ensure the log file is closed when the application exits."""
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+        self._recording = False
+        super().closeEvent(event)
 
     def save_all_settings(self, path=None):
         """Save all settings (plot, serial port, macros) to one JSON file."""
