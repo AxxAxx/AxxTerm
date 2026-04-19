@@ -450,24 +450,11 @@ class SerialDataView(QtWidgets.QWidget):
         self.convert_B_text.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         self.convert_B_text.setFont(QtGui.QFont('Segoe UI', 12))
 
-        # --- Mode settings panel (shown for all modes, content varies) ---
+        # --- Binary/Frame settings panel ---
         self.settings_panel = QtWidgets.QWidget()
         sp_layout = QtWidgets.QHBoxLayout(self.settings_panel)
         sp_layout.setContentsMargins(4, 2, 4, 2)
 
-        # ASCII-only: delimiter selector
-        self._delimiter_label = QtWidgets.QLabel('Separator:')
-        self.delimiter_combo = QtWidgets.QComboBox()
-        self.delimiter_combo.addItems(['Auto', 'Comma', 'Semicolon', 'Space', 'Tab', 'Other'])
-        self.delimiter_combo.currentIndexChanged.connect(self._on_delimiter_changed)
-
-        self.delimiter_custom = QtWidgets.QLineEdit()
-        self.delimiter_custom.setMaximumWidth(50)
-        self.delimiter_custom.setPlaceholderText('...')
-        self.delimiter_custom.setVisible(False)
-        self.delimiter_custom.editingFinished.connect(self._on_setting_changed)
-
-        # Binary/Frame: type and endianness
         self._type_label = QtWidgets.QLabel('Type:')
         self.type_combo = QtWidgets.QComboBox()
         self.type_combo.addItems(list(DATA_TYPES.keys()))
@@ -479,12 +466,10 @@ class SerialDataView(QtWidgets.QWidget):
         self.endian_combo.addItems(['Little', 'Big'])
         self.endian_combo.currentTextChanged.connect(self._on_setting_changed)
 
-        # Binary-only: sync button
         self.sync_button = QtWidgets.QPushButton('Sync')
         self.sync_button.setToolTip('Clear byte buffer to re-align stream')
         self.sync_button.clicked.connect(self._on_sync_clicked)
 
-        # Frame-only controls
         self._sync_word_label = QtWidgets.QLabel('Sync Word:')
         self.sync_word_edit = QtWidgets.QLineEdit('AA')
         self.sync_word_edit.setMaximumWidth(120)
@@ -503,10 +488,6 @@ class SerialDataView(QtWidgets.QWidget):
         self.checksum_check = QtWidgets.QCheckBox('Checksum')
         self.checksum_check.stateChanged.connect(self._on_setting_changed)
 
-        # Layout all widgets in panel
-        sp_layout.addWidget(self._delimiter_label)
-        sp_layout.addWidget(self.delimiter_combo)
-        sp_layout.addWidget(self.delimiter_custom)
         sp_layout.addWidget(self._type_label)
         sp_layout.addWidget(self.type_combo)
         sp_layout.addWidget(self._endian_label)
@@ -520,14 +501,6 @@ class SerialDataView(QtWidgets.QWidget):
         sp_layout.addWidget(self.checksum_check)
         sp_layout.addStretch()
 
-        # Widget groups for per-mode visibility
-        self._ascii_only_widgets = [
-            self._delimiter_label, self.delimiter_combo, self.delimiter_custom,
-        ]
-        self._binary_frame_widgets = [
-            self._type_label, self.type_combo,
-            self._endian_label, self.endian_combo,
-        ]
         self._frame_only_widgets = [
             self._sync_word_label, self.sync_word_edit,
             self._size_field_label, self.size_field_combo,
@@ -536,28 +509,52 @@ class SerialDataView(QtWidgets.QWidget):
 
         self.settings_panel.setVisible(False)
 
+        # Delimiter (ASCII mode) -- lives in graph controls row
+        self.delimiter_combo = QtWidgets.QComboBox()
+        self.delimiter_combo.addItems(['Auto', 'Comma', 'Semicolon', 'Space', 'Tab', 'Other'])
+        self.delimiter_combo.currentIndexChanged.connect(self._on_delimiter_changed)
+
+        self.delimiter_custom = QtWidgets.QLineEdit()
+        self.delimiter_custom.setMaximumWidth(50)
+        self.delimiter_custom.setPlaceholderText('...')
+        self.delimiter_custom.setVisible(False)
+        self.delimiter_custom.editingFinished.connect(self._on_setting_changed)
+
         # Graph controls container
         graph_controls = QtWidgets.QWidget()
         gc_layout = QtWidgets.QHBoxLayout(graph_controls)
         gc_layout.setContentsMargins(0, 0, 0, 0)
         gc_layout.addWidget(self.plot_length_spin)
         gc_layout.addWidget(self.graph_channels)
+        gc_layout.addWidget(self.delimiter_combo)
+        gc_layout.addWidget(self.delimiter_custom)
         gc_layout.addWidget(self.data_mode)
         gc_layout.addWidget(self.graph_mode)
 
+        # Vertical splitter: graph (top) | data views (bottom)
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+
+        data_panel = QtWidgets.QWidget()
+        dp_layout = QtWidgets.QGridLayout(data_panel)
+        dp_layout.setContentsMargins(0, 0, 0, 0)
+        dp_layout.addWidget(self.label_sent_data,   0, 0, 1, 3)
+        dp_layout.addWidget(self.label_data_flow,   0, 3, 1, 3)
+        dp_layout.addWidget(self.serialData,         1, 0, 1, 3)
+        dp_layout.addWidget(self.serialDataHex,      1, 3, 1, 3)
+
+        self.splitter.addWidget(data_panel)
+
         self.setLayout(QtWidgets.QGridLayout(self))
-        self.layout().addWidget(graph_controls,         1, 0, 1, 6, alignment=QtCore.Qt.AlignRight)
-        self.layout().addWidget(self.settings_panel,    2, 0, 1, 6)
-        self.layout().addWidget(self.label_sent_data,   3, 0, 1, 3)
-        self.layout().addWidget(self.label_data_flow,   3, 3, 1, 3)
-        self.layout().addWidget(self.serialData,        4, 0, 1, 3)
-        self.layout().addWidget(self.serialDataHex,     4, 3, 1, 3)
-        self.layout().addWidget(self.converter_label,   5, 1, 1, 1)
-        self.layout().addWidget(self.label,             6, 0, 1, 1)
-        self.layout().addWidget(self.convert_A_type,    6, 1, 1, 1)
-        self.layout().addWidget(self.convert_A_text,    6, 2, 1, 1)
-        self.layout().addWidget(self.convert_B_text,    6, 3, 1, 2)
-        self.layout().addWidget(self.clear_button,      6, 5, 1, 1, alignment=QtCore.Qt.AlignRight)
+        self.layout().addWidget(graph_controls,         0, 0, 1, 6, alignment=QtCore.Qt.AlignRight)
+        self.layout().addWidget(self.settings_panel,    1, 0, 1, 6)
+        self.layout().addWidget(self.splitter,          2, 0, 1, 6)
+        self.layout().addWidget(self.converter_label,   3, 1, 1, 1)
+        self.layout().addWidget(self.label,             4, 0, 1, 1)
+        self.layout().addWidget(self.convert_A_type,    4, 1, 1, 1)
+        self.layout().addWidget(self.convert_A_text,    4, 2, 1, 1)
+        self.layout().addWidget(self.convert_B_text,    4, 3, 1, 2)
+        self.layout().addWidget(self.clear_button,      4, 5, 1, 1, alignment=QtCore.Qt.AlignRight)
+        self.layout().setRowStretch(2, 1)
         self.layout().setContentsMargins(2, 2, 2, 2)
 
         self._load_settings()
@@ -598,7 +595,7 @@ class SerialDataView(QtWidgets.QWidget):
         if self.graph_mode.isChecked():
             self.graphWidget = pg.PlotWidget(title="Plot")
             self.graphWidget.setBackground('#FFFFFFFF')
-            self.graphWidget.setMinimumHeight(300)
+            self.graphWidget.setMinimumHeight(150)
             self.graphWidget.plotItem.getAxis('bottom').setPen(pg.mkPen(color='#000000'))
             self.graphWidget.plotItem.getAxis('left').setPen(pg.mkPen(color='#000000'))
             self.graphWidget.plotItem.showGrid(True, True, 0.3)
@@ -608,9 +605,9 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.plotItem.legend.sigDoubleClicked.connect(self._on_legend_double_clicked)
             self._create_plot_lines()
             self.numberbuffer = []
-            self.layout().addWidget(self.graphWidget, 0, 0, 1, 6)
+            self.splitter.insertWidget(0, self.graphWidget)
         else:
-            self.layout().removeWidget(self.graphWidget)
+            self.graphWidget.setParent(None)
             self.graphWidget.deleteLater()
             self.graphWidget = None
             self.plot_lines = []
@@ -713,19 +710,13 @@ class SerialDataView(QtWidgets.QWidget):
         is_binary = (mode == 'Binary Stream')
         is_frame = (mode == 'Custom Frame')
 
-        # Panel always visible (each mode has settings)
-        self.settings_panel.setVisible(True)
+        # Settings panel only for binary/frame modes
+        self.settings_panel.setVisible(is_binary or is_frame)
 
-        # ASCII-only widgets
-        for w in self._ascii_only_widgets:
-            w.setVisible(is_ascii)
-        # Show custom delimiter input only when "Other" is selected
-        if is_ascii:
-            self.delimiter_custom.setVisible(self.delimiter_combo.currentText() == 'Other')
-
-        # Binary/Frame widgets
-        for w in self._binary_frame_widgets:
-            w.setVisible(is_binary or is_frame)
+        # Delimiter in graph controls row -- only for ASCII mode
+        self.delimiter_combo.setVisible(is_ascii)
+        self.delimiter_custom.setVisible(
+            is_ascii and self.delimiter_combo.currentText() == 'Other')
 
         # Frame-only widgets
         for w in self._frame_only_widgets:
