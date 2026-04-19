@@ -10,7 +10,7 @@ if errorlevel 1 (
 )
 
 echo Building AxxTerm.exe...
-python -m PyInstaller --onefile --windowed --name AxxTerm --clean AxxTerm_serial.py
+python -m PyInstaller --onefile --windowed --name AxxTerm --clean AxxTerm.py
 
 echo.
 if exist dist\AxxTerm.exe (

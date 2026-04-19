@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''AxxTerm_serial.py'', doraise=True\\); print\\(''Syntax OK''\\)\")"
+    ]
+  }
+}

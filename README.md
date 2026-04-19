@@ -103,7 +103,7 @@ Frame structure: `[Start Byte(s)] [Optional Size Field] [Payload] [Optional Chec
 git clone https://github.com/AxxAxx/AxxTerm.git
 cd AxxTerm
 pip install -r requirements.txt
-python AxxTerm_serial.py
+python AxxTerm.py
 ```
 
 ## Building Standalone .exe
@@ -120,7 +120,7 @@ This installs PyInstaller if needed, then creates `dist\AxxTerm.exe` -- a single
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name AxxTerm --clean AxxTerm_serial.py
+pyinstaller --onefile --windowed --name AxxTerm --clean AxxTerm.py
 ```
 
 The resulting executable is in the `dist/` folder.
@@ -135,10 +135,9 @@ The resulting executable is in the `dist/` folder.
 
 | File | Description |
 |------|-------------|
-| `AxxTerm_serial.py` | Main application (single-file, self-contained) |
+| `AxxTerm.py` | Main application (single-file, self-contained) |
 | `requirements.txt` | Python dependencies |
 | `build.bat` | Windows build script for standalone .exe |
-| `test_readers.py` | Unit tests for binary/frame reader classes |
 | `AxxTerm_GUI.PNG` | Screenshot |
 | `LICENSE` | MIT License |
 
