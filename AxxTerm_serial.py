@@ -104,7 +104,12 @@ class BinaryStreamReader:
 
 
 class FrameReader:
-    """Decodes framed binary packets with sync word, optional size, and optional checksum."""
+    """Decodes framed binary packets with sync word, optional size, and optional checksum.
+
+    Note: Sync word matching uses a simple byte-by-byte scan. Sync words with
+    internal prefix repetition (e.g. 01 02 01 03) may miss valid frames if the
+    pattern overlaps in the stream. Simple sync words (AA, AA BB, etc.) work correctly.
+    """
 
     SEARCHING = 0
     READING_SIZE = 1
@@ -771,6 +776,7 @@ class SerialDataView(QtWidgets.QWidget):
             w.blockSignals(False)
 
         self._apply_reader_settings()
+        self.frame_size_spin.setEnabled(self.size_field_combo.currentText() == 'Fixed')
         self._on_mode_changed()
 
     def handleReceivedData(self, raw_bytes):
