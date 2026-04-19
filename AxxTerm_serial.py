@@ -1779,6 +1779,6 @@ if __name__ == '__main__':
     app.setWindowIcon(QIcon(create_connector_pixmap('#22bb22')))
     window = SerialMonitor()
     screen = app.primaryScreen().availableGeometry()
-    window.resize(screen.width() * 2 // 3, screen.height() * 3 // 4)
+    window.resize(screen.width() * 8 // 15, screen.height() * 3 // 5)
     window.show()
     app.exec()
