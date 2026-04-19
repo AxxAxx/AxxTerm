@@ -386,14 +386,11 @@ class SerialDataView(QtWidgets.QWidget):
         self.serialData = QtWidgets.QTextEdit(self)
         self.serialData.setReadOnly(True)
         self.serialData.setFontFamily('Segoe UI')
-        self.serialData.setMinimumWidth(500)
-        self.serialData.setMinimumHeight(300)
         self.serialData.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
         self.serialDataHex = QtWidgets.QTextEdit(self)
         self.serialDataHex.setReadOnly(True)
         self.serialDataHex.setFontFamily('Segoe UI')
-        self.serialDataHex.setMinimumWidth(500)
         self.serialDataHex.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
         self.label_data_flow = QtWidgets.QLabel('Data: HEX')
