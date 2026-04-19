@@ -861,9 +861,11 @@ class SerialDataView(QtWidgets.QWidget):
         self.data_mode.setMinimumWidth(130)
         self.data_mode.currentIndexChanged.connect(self._on_mode_changed)
 
-        self.plot_length_spin = QSpinBox(minimum=10, maximum=10000, value=DEFAULT_PLOT_LENGTH, prefix="Pts: ", singleStep=50)
+        self._pts_label = QtWidgets.QLabel('Pts:')
+        self._pts_label.setFont(QtGui.QFont('Segoe UI', 10))
+        self.plot_length_spin = QSpinBox(minimum=10, maximum=10000, value=DEFAULT_PLOT_LENGTH, singleStep=50)
         self.plot_length_spin.setFont(QtGui.QFont('Segoe UI', 10))
-        self.plot_length_spin.valueChanged.connect(self._on_setting_changed)
+        self.plot_length_spin.valueChanged.connect(self._on_pts_changed)
 
         self.clear_button = QtWidgets.QPushButton('Clear ALL')
         self.clear_button.setFont(QtGui.QFont('Segoe UI', 10))
@@ -972,9 +974,9 @@ class SerialDataView(QtWidgets.QWidget):
             self.data_mode, self.type_combo, self.delimiter_combo,
             self.delimiter_custom, self.graph_channels, self.endian_combo,
             self.sync_button, self.sync_word_edit, self.size_field_combo,
-            self.frame_size_spin, self.checksum_check, self.plot_length_spin,
-            self.graph_mode, self._fft_check, self._frame_start_label,
-            self._payload_size_label,
+            self.frame_size_spin, self.checksum_check, self._pts_label,
+            self.plot_length_spin, self.graph_mode, self._fft_check,
+            self._frame_start_label, self._payload_size_label,
         ]
         row_font = QtGui.QFont('Segoe UI', 10)
         for w in row_widgets:
@@ -1054,6 +1056,7 @@ class SerialDataView(QtWidgets.QWidget):
         cl.addWidget(self._math_btn)
 
         # Right: plot controls
+        cl.addWidget(self._pts_label)
         cl.addWidget(self.plot_length_spin)
         cl.addWidget(self.graph_mode)
         cl.addWidget(self._fft_check)
@@ -1917,6 +1920,22 @@ class SerialDataView(QtWidgets.QWidget):
     def _on_setting_changed(self):
         """Apply current settings to readers."""
         self._apply_reader_settings()
+        self._save_settings()
+
+    def _on_pts_changed(self):
+        """Rebuild plot arrays when the Pts value changes."""
+        if self.graphWidget is not None:
+            # Rebuild main plot lines with new array length
+            for line in self.plot_lines:
+                self.graphWidget.plotItem.removeItem(line)
+            if self._y2_viewbox:
+                for line in self._y2_plot_lines.values():
+                    self._y2_viewbox.removeItem(line)
+                self._y2_plot_lines.clear()
+            if self.graphWidget.plotItem.legend is not None:
+                self.graphWidget.plotItem.legend.clear()
+            self._create_plot_lines()
+            self.graphWidget.setXRange(0, self.plot_length_spin.value())
         self._save_settings()
 
     def _on_delimiter_changed(self):
