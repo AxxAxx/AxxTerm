@@ -413,6 +413,7 @@ class SerialDataView(QtWidgets.QWidget):
 
         self.plot_length_spin = QSpinBox(minimum=10, maximum=10000, value=DEFAULT_PLOT_LENGTH, prefix="Pts: ", singleStep=50)
         self.plot_length_spin.setFont(QtGui.QFont('Segoe UI', 12))
+        self.plot_length_spin.valueChanged.connect(self._on_setting_changed)
 
         self.clear_button = QtWidgets.QPushButton('Clear ALL')
         self.clear_button.clicked.connect(self.clear_button_Clicked)
@@ -525,6 +526,8 @@ class SerialDataView(QtWidgets.QWidget):
         self.layout().addWidget(self.clear_button,      5, 5, 1, 1, alignment=QtCore.Qt.AlignRight)
         self.layout().setContentsMargins(2, 2, 2, 2)
 
+        self._load_settings()
+
     def _create_plot_lines(self):
         """Create plot lines based on the current channel count spinbox."""
         n = self.graph_channels.value()
@@ -551,6 +554,7 @@ class SerialDataView(QtWidgets.QWidget):
                 self.graphWidget.plotItem.legend.clear()
             self._create_plot_lines()
         self._apply_reader_settings()
+        self._save_settings()
 
     def graph_state_changed(self):
         if self.graph_mode.isChecked():
@@ -657,10 +661,12 @@ class SerialDataView(QtWidgets.QWidget):
         self._frame_reader.reset()
 
         self._apply_reader_settings()
+        self._save_settings()
 
     def _on_setting_changed(self):
         """Apply current settings to readers."""
         self._apply_reader_settings()
+        self._save_settings()
 
     def _on_size_field_changed(self):
         """Enable/disable frame size spinner based on size field type."""
@@ -696,6 +702,73 @@ class SerialDataView(QtWidgets.QWidget):
             pass
 
         self._frame_reader.reset()
+
+    def _save_settings(self):
+        """Persist current plot/decode settings to JSON file."""
+        settings = {
+            'mode': self.data_mode.currentText(),
+            'num_channels': self.graph_channels.value(),
+            'num_points': self.plot_length_spin.value(),
+            'binary': {
+                'data_type': self.type_combo.currentText(),
+                'endianness': self.endian_combo.currentText().lower(),
+            },
+            'frame': {
+                'data_type': self.type_combo.currentText(),
+                'endianness': self.endian_combo.currentText().lower(),
+                'sync_word': self.sync_word_edit.text(),
+                'size_field': self.size_field_combo.currentText().lower(),
+                'frame_size': self.frame_size_spin.value(),
+                'checksum': self.checksum_check.isChecked(),
+            },
+        }
+        try:
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except OSError:
+            pass
+
+    def _load_settings(self):
+        """Restore plot/decode settings from JSON file."""
+        try:
+            with open(SETTINGS_FILE, 'r') as f:
+                s = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            return
+
+        widgets = [self.data_mode, self.type_combo, self.endian_combo,
+                   self.graph_channels, self.plot_length_spin,
+                   self.sync_word_edit, self.size_field_combo,
+                   self.frame_size_spin, self.checksum_check]
+        for w in widgets:
+            w.blockSignals(True)
+
+        try:
+            self.data_mode.setCurrentText(s.get('mode', 'ASCII'))
+            self.graph_channels.setValue(s.get('num_channels', 4))
+            self.plot_length_spin.setValue(s.get('num_points', DEFAULT_PLOT_LENGTH))
+
+            frame = s.get('frame', {})
+            binary = s.get('binary', {})
+            dtype = frame.get('data_type', binary.get('data_type', 'float32'))
+            endian = frame.get('endianness', binary.get('endianness', 'little'))
+
+            self.type_combo.setCurrentText(dtype)
+            self.endian_combo.setCurrentText(endian.capitalize())
+            self.sync_word_edit.setText(frame.get('sync_word', 'AA'))
+            sf = frame.get('size_field', 'fixed')
+            sf_map = {'fixed': 'Fixed', '1-byte': '1-byte', '2-byte': '2-byte'}
+            self.size_field_combo.setCurrentText(sf_map.get(sf, 'Fixed'))
+            self.frame_size_spin.setValue(frame.get('frame_size', 12))
+            self.checksum_check.setChecked(frame.get('checksum', False))
+        except (KeyError, TypeError):
+            pass
+
+        for w in widgets:
+            w.blockSignals(False)
+
+        self._apply_reader_settings()
+        self._on_mode_changed()
 
     def handleReceivedData(self, raw_bytes):
         """Route incoming serial bytes based on current data mode."""
