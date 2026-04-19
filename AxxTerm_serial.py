@@ -636,6 +636,8 @@ class SerialDataView(QtWidgets.QWidget):
         self.serialData.clear()
         self.convert_A_text.clear()
         self.convert_B_text.clear()
+        self._binary_reader.sync()
+        self._frame_reader.reset()
 
     def _on_mode_changed(self):
         """Show/hide settings panel and update left panel label based on data mode."""
