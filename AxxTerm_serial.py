@@ -820,10 +820,13 @@ class SerialDataView(QtWidgets.QWidget):
                 ax = self.graphWidget.plotItem.getAxis(axis_name)
                 ax.setAcceptedMouseButtons(QtCore.Qt.NoButton)
                 ax.setAcceptHoverEvents(False)
-            # Disable non-functional menu items
+            # Customize context menus
             for action in self.graphWidget.plotItem.ctrlMenu.actions():
                 if action.text() in ('Average', 'Downsample', 'Alpha'):
                     action.setVisible(False)
+            for action in self.graphWidget.plotItem.vb.menu.actions():
+                if action.text() == 'View All':
+                    action.setText('Reset Zoom')
             self.graphWidget.setXRange(0, self.plot_length_spin.value())
             # Restore Y-axis settings
             if self._y_auto_scale:
