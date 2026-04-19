@@ -794,6 +794,12 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.plotItem.getAxis('bottom').setPen(pg.mkPen(color='#000000'))
             self.graphWidget.plotItem.getAxis('left').setPen(pg.mkPen(color='#000000'))
             self.graphWidget.plotItem.showGrid(True, True, 0.3)
+            # Force 3-button mouse mode (left=pan, right=menu)
+            self.graphWidget.plotItem.vb.setMouseMode(pg.ViewBox.PanMode)
+            # Disable non-functional menu items
+            for action in self.graphWidget.plotItem.ctrlMenu.actions():
+                if action.text() in ('Average', 'Downsample', 'Alpha'):
+                    action.setVisible(False)
             self.graphWidget.setXRange(0, self.plot_length_spin.value())
             # Restore Y-axis settings
             if self._y_auto_scale:
@@ -805,6 +811,15 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.sigRangeChanged.connect(self._on_range_changed)
             self._create_plot_lines()
             self.numberbuffer = []
+            # Crosshair cursor
+            self._crosshair = pg.InfiniteLine(angle=90, movable=False,
+                                               pen=pg.mkPen('#888888', width=1, style=QtCore.Qt.DashLine))
+            self._crosshair.setVisible(False)
+            self.graphWidget.addItem(self._crosshair)
+            self._cursor_label = pg.TextItem(anchor=(0, 1), color='#000000')
+            self._cursor_label.setVisible(False)
+            self.graphWidget.addItem(self._cursor_label)
+            self.graphWidget.scene().sigMouseMoved.connect(self._on_mouse_moved)
             # Clear Plot button overlaid in lower-right corner
             self._clear_graph_btn = QtWidgets.QPushButton('Clear Plot', self.graphWidget)
             self._clear_graph_btn.setStyleSheet(
@@ -820,6 +835,8 @@ class SerialDataView(QtWidgets.QWidget):
             self.graphWidget.deleteLater()
             self.graphWidget = None
             self._clear_graph_btn = None
+            self._crosshair = None
+            self._cursor_label = None
             self.plot_lines = []
             self.plot_data = []
 
@@ -841,6 +858,37 @@ class SerialDataView(QtWidgets.QWidget):
         if obj is self.graphWidget and event.type() == QtCore.QEvent.Resize:
             self._position_clear_graph_btn()
         return super().eventFilter(obj, event)
+
+    def _on_mouse_moved(self, scene_pos):
+        """Update crosshair cursor and show channel values at mouse X position."""
+        if self.graphWidget is None or not self.plot_data:
+            return
+        vb = self.graphWidget.plotItem.vb
+        if not vb.sceneBoundingRect().contains(scene_pos):
+            self._crosshair.setVisible(False)
+            self._cursor_label.setVisible(False)
+            return
+        mouse_point = vb.mapSceneToView(scene_pos)
+        x = mouse_point.x()
+        x_idx = int(round(x))
+        n_points = len(self.plot_data[0]) if self.plot_data else 0
+        if x_idx < 0 or x_idx >= n_points:
+            self._crosshair.setVisible(False)
+            self._cursor_label.setVisible(False)
+            return
+        self._crosshair.setPos(x)
+        self._crosshair.setVisible(True)
+        # Build value text with channel colors
+        parts = []
+        for i, arr in enumerate(self.plot_data):
+            name = self._channel_name(i)
+            color = self._channel_color(i)
+            val = arr[x_idx]
+            parts.append(f'<span style="color:{color}"><b>{name}</b>: {val:.4f}</span>')
+        html = '<br>'.join(parts)
+        self._cursor_label.setHtml(f'<div style="background:rgba(255,255,255,200);padding:2px">{html}</div>')
+        self._cursor_label.setPos(x, mouse_point.y())
+        self._cursor_label.setVisible(True)
 
     def _on_range_changed(self):
         """Track Y-axis range changes and save."""
