@@ -1478,18 +1478,23 @@ class ToolBar(QtWidgets.QToolBar):
     def __init__(self, parent):
         super().__init__(parent)
 
+        toolbar_font = QtGui.QFont('Segoe UI', 12)
+
         self.portOpenButton = QtWidgets.QPushButton('Open')
         self.portOpenButton.setCheckable(True)
         self.portOpenButton.setMinimumHeight(32)
+        self.portOpenButton.setFont(toolbar_font)
 
         self.portScanButton = QtWidgets.QPushButton('Scan')
         self.portScanButton.setCheckable(True)
         self.portScanButton.clicked.connect(self.scan_button_Clicked)
         self.portScanButton.setMinimumHeight(32)
+        self.portScanButton.setFont(toolbar_font)
 
         self.portNames = QtWidgets.QComboBox(self)
         self.portNames.addItems([port.portName() for port in QSerialPortInfo().availablePorts()])
         self.portNames.setMinimumHeight(30)
+        self.portNames.setFont(toolbar_font)
 
         self.baudRates = QtWidgets.QComboBox(self)
         self.baudRates.addItems([
@@ -1498,25 +1503,30 @@ class ToolBar(QtWidgets.QToolBar):
         ])
         self.baudRates.setCurrentText('115200')
         self.baudRates.setMinimumHeight(30)
+        self.baudRates.setFont(toolbar_font)
 
         self.dataBits = QtWidgets.QComboBox(self)
         self.dataBits.addItems(['5 bit', '6 bit', '7 bit', '8 bit'])
         self.dataBits.setCurrentIndex(3)
         self.dataBits.setMinimumHeight(30)
+        self.dataBits.setFont(toolbar_font)
 
         self._parity = QtWidgets.QComboBox(self)
         self._parity.addItems(['No Parity', 'Even Parity', 'Odd Parity', 'Space Parity', 'Mark Parity'])
         self._parity.setCurrentIndex(0)
         self._parity.setMinimumHeight(30)
+        self._parity.setFont(toolbar_font)
 
         self.stopBits = QtWidgets.QComboBox(self)
         self.stopBits.addItems(['One Stop', 'One And Half Stop', 'Two Stop'])
         self.stopBits.setCurrentIndex(0)
         self.stopBits.setMinimumHeight(30)
+        self.stopBits.setFont(toolbar_font)
 
         self._flowControl = QtWidgets.QComboBox(self)
         self._flowControl.addItems(['No Flow Control', 'Hardware Control', 'Software Control'])
         self._flowControl.setCurrentIndex(0)
+        self._flowControl.setFont(toolbar_font)
         self._flowControl.setMinimumHeight(30)
 
         self.addWidget(self.portOpenButton)
