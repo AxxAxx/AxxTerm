@@ -420,18 +420,6 @@ class SerialDataView(QtWidgets.QWidget):
         self.plot_length_spin.setFont(QtGui.QFont('Segoe UI', 12))
         self.plot_length_spin.valueChanged.connect(self._on_setting_changed)
 
-        self.delimiter_combo = QtWidgets.QComboBox()
-        self.delimiter_combo.addItems(['Auto', 'Comma', 'Semicolon', 'Space', 'Tab', 'Other'])
-        self.delimiter_combo.setFont(QtGui.QFont('Segoe UI', 12))
-        self.delimiter_combo.currentIndexChanged.connect(self._on_delimiter_changed)
-
-        self.delimiter_custom = QtWidgets.QLineEdit()
-        self.delimiter_custom.setMaximumWidth(50)
-        self.delimiter_custom.setPlaceholderText('...')
-        self.delimiter_custom.setFont(QtGui.QFont('Segoe UI', 12))
-        self.delimiter_custom.setVisible(False)
-        self.delimiter_custom.editingFinished.connect(self._on_setting_changed)
-
         self.clear_button = QtWidgets.QPushButton('Clear ALL')
         self.clear_button.clicked.connect(self.clear_button_Clicked)
         self.clear_button.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred)
@@ -461,29 +449,48 @@ class SerialDataView(QtWidgets.QWidget):
         self.convert_B_text.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
         self.convert_B_text.setFont(QtGui.QFont('Segoe UI', 12))
 
-        # --- Binary/Frame settings panel ---
+        # --- Mode settings panel (shown for all modes, content varies) ---
         self.settings_panel = QtWidgets.QWidget()
         sp_layout = QtWidgets.QHBoxLayout(self.settings_panel)
         sp_layout.setContentsMargins(4, 2, 4, 2)
 
+        # ASCII-only: delimiter selector
+        self._delimiter_label = QtWidgets.QLabel('Separator:')
+        self.delimiter_combo = QtWidgets.QComboBox()
+        self.delimiter_combo.addItems(['Auto', 'Comma', 'Semicolon', 'Space', 'Tab', 'Other'])
+        self.delimiter_combo.currentIndexChanged.connect(self._on_delimiter_changed)
+
+        self.delimiter_custom = QtWidgets.QLineEdit()
+        self.delimiter_custom.setMaximumWidth(50)
+        self.delimiter_custom.setPlaceholderText('...')
+        self.delimiter_custom.setVisible(False)
+        self.delimiter_custom.editingFinished.connect(self._on_setting_changed)
+
+        # Binary/Frame: type and endianness
+        self._type_label = QtWidgets.QLabel('Type:')
         self.type_combo = QtWidgets.QComboBox()
         self.type_combo.addItems(list(DATA_TYPES.keys()))
         self.type_combo.setCurrentText('float32')
         self.type_combo.currentTextChanged.connect(self._on_setting_changed)
 
+        self._endian_label = QtWidgets.QLabel('Endian:')
         self.endian_combo = QtWidgets.QComboBox()
         self.endian_combo.addItems(['Little', 'Big'])
         self.endian_combo.currentTextChanged.connect(self._on_setting_changed)
 
+        # Binary-only: sync button
         self.sync_button = QtWidgets.QPushButton('Sync')
         self.sync_button.setToolTip('Clear byte buffer to re-align stream')
         self.sync_button.clicked.connect(self._on_sync_clicked)
 
+        # Frame-only controls
+        self._sync_word_label = QtWidgets.QLabel('Sync Word:')
         self.sync_word_edit = QtWidgets.QLineEdit('AA')
         self.sync_word_edit.setMaximumWidth(120)
         self.sync_word_edit.setPlaceholderText('e.g. AA BB')
         self.sync_word_edit.editingFinished.connect(self._on_setting_changed)
 
+        self._size_field_label = QtWidgets.QLabel('Size Field:')
         self.size_field_combo = QtWidgets.QComboBox()
         self.size_field_combo.addItems(['Fixed', '1-byte', '2-byte'])
         self.size_field_combo.currentTextChanged.connect(self._on_size_field_changed)
@@ -495,12 +502,13 @@ class SerialDataView(QtWidgets.QWidget):
         self.checksum_check = QtWidgets.QCheckBox('Checksum')
         self.checksum_check.stateChanged.connect(self._on_setting_changed)
 
-        self._sync_word_label = QtWidgets.QLabel('Sync Word:')
-        self._size_field_label = QtWidgets.QLabel('Size Field:')
-
-        sp_layout.addWidget(QtWidgets.QLabel('Type:'))
+        # Layout all widgets in panel
+        sp_layout.addWidget(self._delimiter_label)
+        sp_layout.addWidget(self.delimiter_combo)
+        sp_layout.addWidget(self.delimiter_custom)
+        sp_layout.addWidget(self._type_label)
         sp_layout.addWidget(self.type_combo)
-        sp_layout.addWidget(QtWidgets.QLabel('Endian:'))
+        sp_layout.addWidget(self._endian_label)
         sp_layout.addWidget(self.endian_combo)
         sp_layout.addWidget(self.sync_button)
         sp_layout.addWidget(self._sync_word_label)
@@ -511,10 +519,18 @@ class SerialDataView(QtWidgets.QWidget):
         sp_layout.addWidget(self.checksum_check)
         sp_layout.addStretch()
 
+        # Widget groups for per-mode visibility
+        self._ascii_only_widgets = [
+            self._delimiter_label, self.delimiter_combo, self.delimiter_custom,
+        ]
+        self._binary_frame_widgets = [
+            self._type_label, self.type_combo,
+            self._endian_label, self.endian_combo,
+        ]
         self._frame_only_widgets = [
-            self.sync_word_edit, self.size_field_combo,
+            self._sync_word_label, self.sync_word_edit,
+            self._size_field_label, self.size_field_combo,
             self.frame_size_spin, self.checksum_check,
-            self._sync_word_label, self._size_field_label,
         ]
 
         self.settings_panel.setVisible(False)
@@ -525,8 +541,6 @@ class SerialDataView(QtWidgets.QWidget):
         gc_layout.setContentsMargins(0, 0, 0, 0)
         gc_layout.addWidget(self.plot_length_spin)
         gc_layout.addWidget(self.graph_channels)
-        gc_layout.addWidget(self.delimiter_combo)
-        gc_layout.addWidget(self.delimiter_custom)
         gc_layout.addWidget(self.data_mode)
         gc_layout.addWidget(self.graph_mode)
 
@@ -674,21 +688,35 @@ class SerialDataView(QtWidgets.QWidget):
     def _on_mode_changed(self):
         """Show/hide settings panel and update left panel label based on data mode."""
         mode = self.data_mode.currentText()
+        is_ascii = (mode == 'ASCII')
         is_binary = (mode == 'Binary Stream')
         is_frame = (mode == 'Custom Frame')
-        is_data_mode = is_binary or is_frame
 
-        self.settings_panel.setVisible(is_data_mode)
+        # Panel always visible (each mode has settings)
+        self.settings_panel.setVisible(True)
 
+        # ASCII-only widgets
+        for w in self._ascii_only_widgets:
+            w.setVisible(is_ascii)
+        # Show custom delimiter input only when "Other" is selected
+        if is_ascii:
+            self.delimiter_custom.setVisible(self.delimiter_combo.currentText() == 'Other')
+
+        # Binary/Frame widgets
+        for w in self._binary_frame_widgets:
+            w.setVisible(is_binary or is_frame)
+
+        # Frame-only widgets
         for w in self._frame_only_widgets:
             w.setVisible(is_frame)
 
+        # Binary-only sync button
         self.sync_button.setVisible(is_binary)
 
-        if is_data_mode:
-            self.label_sent_data.setText('Data: Decoded')
-        else:
+        if is_ascii:
             self.label_sent_data.setText('Data: ASCII')
+        else:
+            self.label_sent_data.setText('Data: Decoded')
 
         self.serialData.clear()
         self.serialDataHex.clear()
