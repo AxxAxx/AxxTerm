@@ -73,6 +73,36 @@ CONVERTERS = {
 }
 
 
+class BinaryStreamReader:
+    """Decodes a continuous binary byte stream into channel values."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self.data_type = 'float32'
+        self.endianness = 'little'
+        self.num_channels = 4
+
+    def feed(self, data):
+        """Feed raw bytes. Returns list of tuples, one per sample."""
+        self.buffer.extend(data)
+        fmt_char, type_size = DATA_TYPES[self.data_type]
+        package_size = self.num_channels * type_size
+        if package_size == 0:
+            return []
+        prefix = '<' if self.endianness == 'little' else '>'
+        fmt = prefix + fmt_char * self.num_channels
+        results = []
+        while len(self.buffer) >= package_size:
+            values = struct.unpack(fmt, self.buffer[:package_size])
+            self.buffer = self.buffer[package_size:]
+            results.append(values)
+        return results
+
+    def sync(self):
+        """Clear buffer to re-align stream."""
+        self.buffer.clear()
+
+
 def create_connector_pixmap(color, width=71, height=30):
     """Draw a DB-9 connector icon programmatically (no external PNG needed)."""
     pixmap = QPixmap(width, height)
