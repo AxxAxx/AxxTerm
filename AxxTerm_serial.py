@@ -1476,9 +1476,14 @@ class SerialSendView(QtWidgets.QWidget):
 
 class ToolBar(QtWidgets.QToolBar):
     def __init__(self, parent):
-        super().__init__(parent)
+        super().__init__('Serial Port', parent)
+        self.setMovable(False)
 
         toolbar_font = QtGui.QFont('Segoe UI', 12)
+
+        serial_label = QtWidgets.QLabel(' Serial Port: ')
+        serial_label.setFont(QtGui.QFont('Segoe UI', 12, QtGui.QFont.Bold))
+        self.addWidget(serial_label)
 
         self.portOpenButton = QtWidgets.QPushButton('Open')
         self.portOpenButton.setCheckable(True)
