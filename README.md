@@ -108,26 +108,18 @@ python AxxTerm.py
 
 ## Building Standalone .exe
 
-### Using the build script (Windows)
-
-```bash
-build.bat
-```
-
-This installs PyInstaller if needed, then creates `dist\AxxTerm.exe` -- a single portable executable. Copy it anywhere and run. No Python installation needed on the target machine.
-
-### Manual build
+No Python installation is needed on the target machine. Build a single portable executable with PyInstaller:
 
 ```bash
 pip install pyinstaller
 pyinstaller --onefile --windowed --name AxxTerm --clean AxxTerm.py
 ```
 
-The resulting executable is in the `dist/` folder.
+This creates `dist/AxxTerm.exe`. Copy it anywhere and run.
 
 ### Build notes
 
-- The .exe resolves config files (settings, macros) relative to the executable location, not the temp folder
+- The .exe resolves config files relative to the executable location, not the temp folder
 - First launch creates `AxxTerm_settings.json` next to the executable when you change any setting
 - File size is typically 30-50 MB (includes Python runtime and all dependencies)
 
@@ -137,7 +129,6 @@ The resulting executable is in the `dist/` folder.
 |------|-------------|
 | `AxxTerm.py` | Main application (single-file, self-contained) |
 | `requirements.txt` | Python dependencies |
-| `build.bat` | Windows build script for standalone .exe |
 | `AxxTerm_GUI.PNG` | Screenshot |
 | `LICENSE` | MIT License |
 
