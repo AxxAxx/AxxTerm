@@ -493,6 +493,7 @@ class SerialDataView(QtWidgets.QWidget):
         self.data_mode = QtWidgets.QComboBox()
         self.data_mode.addItems(['ASCII', 'Binary Stream', 'Custom Frame'])
         self.data_mode.setFont(QtGui.QFont('Segoe UI', 12))
+        self.data_mode.setMinimumWidth(130)
         self.data_mode.currentIndexChanged.connect(self._on_mode_changed)
 
         self.plot_length_spin = QSpinBox(minimum=10, maximum=10000, value=DEFAULT_PLOT_LENGTH, prefix="Pts: ", singleStep=50)
@@ -534,11 +535,13 @@ class SerialDataView(QtWidgets.QWidget):
         self.type_combo = QtWidgets.QComboBox()
         self.type_combo.addItems(list(DATA_TYPES.keys()))
         self.type_combo.setCurrentText('float32')
+        self.type_combo.setMinimumWidth(100)
         self.type_combo.currentTextChanged.connect(self._on_setting_changed)
 
         # Delimiter (ASCII mode)
         self.delimiter_combo = QtWidgets.QComboBox()
         self.delimiter_combo.addItems(['Auto', 'Comma', 'Semicolon', 'Space', 'Tab', 'Other'])
+        self.delimiter_combo.setMinimumWidth(100)
         self.delimiter_combo.currentIndexChanged.connect(self._on_delimiter_changed)
 
         self.delimiter_custom = QtWidgets.QLineEdit()
@@ -550,6 +553,7 @@ class SerialDataView(QtWidgets.QWidget):
         # Endianness (binary/frame)
         self.endian_combo = QtWidgets.QComboBox()
         self.endian_combo.addItems(['Little', 'Big'])
+        self.endian_combo.setMinimumWidth(70)
         self.endian_combo.currentTextChanged.connect(self._on_setting_changed)
 
         # Binary-only: sync button
@@ -567,6 +571,7 @@ class SerialDataView(QtWidgets.QWidget):
         # Frame-only: payload size
         self.size_field_combo = QtWidgets.QComboBox()
         self.size_field_combo.addItems(['Fixed', '1-byte', '2-byte'])
+        self.size_field_combo.setMinimumWidth(70)
         self.size_field_combo.currentTextChanged.connect(self._on_size_field_changed)
 
         self.frame_size_spin = QtWidgets.QSpinBox(minimum=1, maximum=65535, value=12)
@@ -674,25 +679,56 @@ class SerialDataView(QtWidgets.QWidget):
 
     def graph_state_changed(self):
         if self.graph_mode.isChecked():
-            self.graphWidget = pg.PlotWidget(title="Plot")
+            self.graphWidget = pg.PlotWidget()
             self.graphWidget.setBackground('#FFFFFFFF')
             self.graphWidget.setMinimumHeight(150)
             self.graphWidget.plotItem.getAxis('bottom').setPen(pg.mkPen(color='#000000'))
             self.graphWidget.plotItem.getAxis('left').setPen(pg.mkPen(color='#000000'))
             self.graphWidget.plotItem.showGrid(True, True, 0.3)
+            self.graphWidget.plotItem.setMenuEnabled(False)
+            self.graphWidget.plotItem.vb.setMenuEnabled(False)
             self.graphWidget.setXRange(0, self.plot_length_spin.value())
             self.graphWidget.enableAutoRange(axis='y')
             self.graphWidget.addLegend()
             self.graphWidget.scene().sigMouseClicked.connect(self._on_plot_mouse_clicked)
             self._create_plot_lines()
             self.numberbuffer = []
+            # Clear Graph button overlaid in lower-right corner
+            self._clear_graph_btn = QtWidgets.QPushButton('Clear Graph', self.graphWidget)
+            self._clear_graph_btn.setStyleSheet(
+                'background-color: rgba(255,255,255,180); border: 1px solid #aaa; padding: 2px 8px;')
+            self._clear_graph_btn.clicked.connect(self._clear_graph)
+            self._clear_graph_btn.adjustSize()
+            self.graphWidget.installEventFilter(self)
             self.splitter.insertWidget(0, self.graphWidget)
+            self._position_clear_graph_btn()
         else:
+            self.graphWidget.removeEventFilter(self)
             self.graphWidget.setParent(None)
             self.graphWidget.deleteLater()
             self.graphWidget = None
+            self._clear_graph_btn = None
             self.plot_lines = []
             self.plot_data = []
+
+    def _clear_graph(self):
+        """Reset all plot data to zeros."""
+        for arr in self.plot_data:
+            arr[:] = 0
+        for line in self.plot_lines:
+            line.setData(self.plot_data[self.plot_lines.index(line)])
+
+    def _position_clear_graph_btn(self):
+        """Position the Clear Graph button in the lower-right of the graph."""
+        if self._clear_graph_btn and self.graphWidget:
+            btn = self._clear_graph_btn
+            gw = self.graphWidget
+            btn.move(gw.width() - btn.width() - 5, gw.height() - btn.height() - 5)
+
+    def eventFilter(self, obj, event):
+        if obj is self.graphWidget and event.type() == QtCore.QEvent.Resize:
+            self._position_clear_graph_btn()
+        return super().eventFilter(obj, event)
 
     def _on_plot_mouse_clicked(self, ev):
         """Right-click on a legend entry to rename or change color."""
