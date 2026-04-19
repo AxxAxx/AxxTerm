@@ -601,10 +601,12 @@ class SerialDataView(QtWidgets.QWidget):
             self.delimiter_custom, self.graph_channels, self.endian_combo,
             self.sync_button, self.sync_word_edit, self.size_field_combo,
             self.frame_size_spin, self.checksum_check, self.plot_length_spin,
-            self.graph_mode,
+            self.graph_mode, self._frame_start_label, self._payload_size_label,
         ]
+        row_font = QtGui.QFont('Segoe UI', 12)
         for w in row_widgets:
             w.setFixedHeight(30)
+            w.setFont(row_font)
         # Left: decoding group
         cl.addWidget(self.data_mode)
         cl.addWidget(self.type_combo)
