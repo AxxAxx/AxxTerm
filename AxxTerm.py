@@ -790,6 +790,11 @@ class SerialDataView(QtWidgets.QWidget):
         # serial reads (otherwise Qt renders a blank line between messages).
         self._pending_cr = False
 
+        # FFT view state
+        self._fft_widget = None
+        self._fft_lines = []
+        self._fft_update_counter = 0
+
         self._binary_reader = BinaryStreamReader()
         self._frame_reader = FrameReader()
 
@@ -824,6 +829,11 @@ class SerialDataView(QtWidgets.QWidget):
         self.graph_mode = QCheckBox("Show Plot")
         self.graph_mode.setFont(QtGui.QFont('Segoe UI', 10))
         self.graph_mode.stateChanged.connect(self.graph_state_changed)
+
+        self._fft_check = QCheckBox("Show FFT")
+        self._fft_check.setFont(QtGui.QFont('Segoe UI', 10))
+        self._fft_check.stateChanged.connect(self._fft_state_changed)
+        self._fft_check.stateChanged.connect(lambda: self._save_settings())
 
         self.graph_channels = QSpinBox(minimum=1, maximum=12, value=4, prefix="Ch: ")
         self.graph_channels.setFont(QtGui.QFont('Segoe UI', 10))
@@ -947,7 +957,8 @@ class SerialDataView(QtWidgets.QWidget):
             self.delimiter_custom, self.graph_channels, self.endian_combo,
             self.sync_button, self.sync_word_edit, self.size_field_combo,
             self.frame_size_spin, self.checksum_check, self.plot_length_spin,
-            self.graph_mode, self._frame_start_label, self._payload_size_label,
+            self.graph_mode, self._fft_check, self._frame_start_label,
+            self._payload_size_label,
         ]
         row_font = QtGui.QFont('Segoe UI', 10)
         for w in row_widgets:
@@ -1021,6 +1032,7 @@ class SerialDataView(QtWidgets.QWidget):
         # Right: plot controls
         cl.addWidget(self.plot_length_spin)
         cl.addWidget(self.graph_mode)
+        cl.addWidget(self._fft_check)
 
         # Vertical splitter: graph (top) | data views (bottom)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
@@ -1105,6 +1117,9 @@ class SerialDataView(QtWidgets.QWidget):
             if self.graphWidget.plotItem.legend is not None:
                 self.graphWidget.plotItem.legend.clear()
             self._create_plot_lines()
+        # Rebuild FFT lines if FFT widget exists
+        if self._fft_widget is not None:
+            self._create_fft_lines()
         self._apply_reader_settings()
         self._save_settings()
 
@@ -1172,6 +1187,8 @@ class SerialDataView(QtWidgets.QWidget):
             self._position_overlay_buttons()
             self._update_graph_theme()
         else:
+            # Destroy FFT widget first if it exists
+            self._destroy_fft_widget()
             self.graphWidget.removeEventFilter(self)
             self.graphWidget.setParent(None)
             self.graphWidget.deleteLater()
@@ -1274,6 +1291,18 @@ class SerialDataView(QtWidgets.QWidget):
                         'background-color: #ffffff; border: 1px solid #aaa; padding: 2px 8px;')
             if hasattr(self, '_pause_btn') and self._pause_btn is not None:
                 self._update_pause_btn_style()
+        # Update FFT widget theme
+        if self._fft_widget is not None:
+            if dark:
+                self._fft_widget.setBackground('#2b2b2b')
+                fft_axis_color = '#ffffff'
+            else:
+                self._fft_widget.setBackground('#FFFFFF')
+                fft_axis_color = '#000000'
+            self._fft_widget.plotItem.getAxis('bottom').setPen(pg.mkPen(color=fft_axis_color))
+            self._fft_widget.plotItem.getAxis('left').setPen(pg.mkPen(color=fft_axis_color))
+            self._fft_widget.plotItem.getAxis('bottom').setTextPen(pg.mkPen(color=fft_axis_color))
+            self._fft_widget.plotItem.getAxis('left').setTextPen(pg.mkPen(color=fft_axis_color))
 
     def _position_overlay_buttons(self):
         """Position the Pause and Clear Plot buttons in the lower-right of the graph."""
@@ -1396,6 +1425,67 @@ class SerialDataView(QtWidgets.QWidget):
             sample.update()
             self._save_settings()
 
+    def _fft_state_changed(self):
+        """Create or destroy the FFT widget when the checkbox toggles."""
+        if self._fft_check.isChecked():
+            if self.graphWidget is not None and self._fft_widget is None:
+                self._create_fft_widget()
+        else:
+            self._destroy_fft_widget()
+
+    def _create_fft_widget(self):
+        """Create the FFT PlotWidget and add it to the splitter below the main graph."""
+        dark = getattr(self.window(), '_dark_mode', False)
+        self._fft_widget = pg.PlotWidget()
+        self._fft_widget.setBackground('#2b2b2b' if dark else '#FFFFFF')
+        self._fft_widget.setMinimumHeight(120)
+        axis_color = '#ffffff' if dark else '#000000'
+        self._fft_widget.plotItem.getAxis('bottom').setPen(pg.mkPen(color=axis_color))
+        self._fft_widget.plotItem.getAxis('left').setPen(pg.mkPen(color=axis_color))
+        self._fft_widget.plotItem.getAxis('bottom').setTextPen(pg.mkPen(color=axis_color))
+        self._fft_widget.plotItem.getAxis('left').setTextPen(pg.mkPen(color=axis_color))
+        self._fft_widget.plotItem.setLabel('bottom', 'Frequency bin')
+        self._fft_widget.plotItem.setLabel('left', 'Magnitude')
+        self._fft_widget.plotItem.showGrid(True, True, 0.3)
+        self._fft_widget.plotItem.vb.setMouseMode(pg.ViewBox.PanMode)
+        # Insert after the main graph (index 1 in the splitter)
+        self.splitter.insertWidget(1, self._fft_widget)
+        self._create_fft_lines()
+        self._fft_update_counter = 0
+
+    def _create_fft_lines(self):
+        """Create FFT plot lines matching current channel count and colors."""
+        if self._fft_widget is None:
+            return
+        # Remove old lines
+        for line in self._fft_lines:
+            self._fft_widget.plotItem.removeItem(line)
+        self._fft_lines = []
+        n = self.graph_channels.value()
+        for i in range(n):
+            color = self._channel_color(i)
+            line = self._fft_widget.plotItem.plot(pen=pg.mkPen(color, width=2))
+            self._fft_lines.append(line)
+
+    def _destroy_fft_widget(self):
+        """Remove and destroy the FFT widget."""
+        if self._fft_widget is not None:
+            self._fft_widget.setParent(None)
+            self._fft_widget.deleteLater()
+            self._fft_widget = None
+            self._fft_lines = []
+            self._fft_update_counter = 0
+
+    def _update_fft(self):
+        """Compute and display FFT magnitude for each channel."""
+        if self._fft_widget is None or not self.plot_data:
+            return
+        for i, arr in enumerate(self.plot_data):
+            if i >= len(self._fft_lines):
+                break
+            fft_mag = np.abs(np.fft.rfft(arr))
+            self._fft_lines[i].setData(fft_mag)
+
     def _append_data_point(self, value, channel):
         """Append a data point to a plot channel using in-place array shift."""
         if channel >= len(self.plot_data):
@@ -1434,6 +1524,13 @@ class SerialDataView(QtWidgets.QWidget):
         arr[:-1] = arr[1:]
         arr[-1] = value
         self.plot_lines[channel].setData(arr)
+
+        # Update FFT every 10 samples (count on channel 0)
+        if channel == 0 and self._fft_widget is not None:
+            self._fft_update_counter += 1
+            if self._fft_update_counter >= 10:
+                self._fft_update_counter = 0
+                self._update_fft()
 
     def _get_delimiter(self):
         """Return the active delimiter string, or None for auto-detect."""
@@ -1637,6 +1734,7 @@ class SerialDataView(QtWidgets.QWidget):
             'num_channels': self.graph_channels.value(),
             'num_points': self.plot_length_spin.value(),
             'show_plot': self.graph_mode.isChecked(),
+            'show_fft': self._fft_check.isChecked(),
             'delimiter': self.delimiter_combo.currentText(),
             'delimiter_custom': self.delimiter_custom.text(),
             'channel_names': {str(k): v for k, v in self.channel_names.items()},
@@ -1670,7 +1768,8 @@ class SerialDataView(QtWidgets.QWidget):
                    self.graph_channels, self.plot_length_spin,
                    self.delimiter_combo, self.delimiter_custom,
                    self.sync_word_edit, self.size_field_combo,
-                   self.frame_size_spin, self.checksum_check]
+                   self.frame_size_spin, self.checksum_check,
+                   self._fft_check]
         for w in widgets:
             w.blockSignals(True)
 
@@ -1679,6 +1778,7 @@ class SerialDataView(QtWidgets.QWidget):
             self.graph_channels.setValue(s.get('num_channels', 4))
             self.plot_length_spin.setValue(s.get('num_points', DEFAULT_PLOT_LENGTH))
             self.graph_mode.setChecked(s.get('show_plot', False))
+            self._fft_check.setChecked(s.get('show_fft', False))
             self.delimiter_combo.setCurrentText(s.get('delimiter', 'Auto'))
             self.delimiter_custom.setText(s.get('delimiter_custom', ''))
 
