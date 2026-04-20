@@ -806,6 +806,9 @@ class SerialDataView(QtWidgets.QWidget):
         self.channel_names = {}   # {index: 'custom name'} for renamed channels
         self.channel_colors = {}  # {index: '#hex'} for custom channel colors
         self.channel_axes = {}    # {index: 1 or 2} axis assignment (1=left, 2=right)
+        self.hidden_channels = set()  # set of channel indices toggled off
+        self._graph_container = None
+        self._channel_toggle_bar = None
         self._y2_viewbox = None
         self._y2_plot_lines = {}  # {channel_index: PlotDataItem} for Y2 channels
         self._y_auto_scale = True
@@ -1137,6 +1140,78 @@ class SerialDataView(QtWidgets.QWidget):
         """Return custom color for a channel, or default from PLOT_COLORS."""
         return self.channel_colors.get(index, PLOT_COLORS[index % len(PLOT_COLORS)])
 
+    def _create_channel_toggle_bar(self):
+        """Create a horizontal bar of channel toggle checkboxes below the graph."""
+        self._channel_toggle_bar = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(self._channel_toggle_bar)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(10)
+        n = self.graph_channels.value()
+        for i in range(n):
+            name = self._channel_name(i)
+            color = self._channel_color(i)
+            cb = QCheckBox(name)
+            cb.setFont(QtGui.QFont('Segoe UI', 9, QtGui.QFont.Bold))
+            cb.setStyleSheet(
+                f'QCheckBox {{ color: #000000; }}'
+                f'QCheckBox::indicator:checked {{ background-color: {color}; border: 1px solid #888; }}'
+                f'QCheckBox::indicator:unchecked {{ background-color: #ffffff; border: 1px solid #888; }}')
+            cb.setChecked(i not in self.hidden_channels)
+            cb.toggled.connect(lambda checked, idx=i: self._on_channel_toggled(idx, checked))
+            layout.addWidget(cb)
+        layout.addStretch()
+
+    def _rebuild_channel_toggles(self):
+        """Rebuild channel toggle checkboxes when channel count or names change."""
+        if self._channel_toggle_bar is None:
+            return
+        layout = self._channel_toggle_bar.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        n = self.graph_channels.value()
+        for i in range(n):
+            name = self._channel_name(i)
+            color = self._channel_color(i)
+            cb = QCheckBox(name)
+            cb.setFont(QtGui.QFont('Segoe UI', 9, QtGui.QFont.Bold))
+            cb.setStyleSheet(
+                f'QCheckBox {{ color: #000000; }}'
+                f'QCheckBox::indicator:checked {{ background-color: {color}; border: 1px solid #888; }}'
+                f'QCheckBox::indicator:unchecked {{ background-color: #ffffff; border: 1px solid #888; }}')
+            cb.setChecked(i not in self.hidden_channels)
+            cb.toggled.connect(lambda checked, idx=i: self._on_channel_toggled(idx, checked))
+            layout.addWidget(cb)
+        layout.addStretch()
+
+    def _on_channel_toggled(self, index, checked):
+        """Show or hide a channel when its toggle checkbox changes."""
+        if checked:
+            self.hidden_channels.discard(index)
+        else:
+            self.hidden_channels.add(index)
+        # Update plot line visibility
+        if index < len(self.plot_lines):
+            self.plot_lines[index].setVisible(checked)
+        # Update Y2 line visibility
+        if index in self._y2_plot_lines:
+            self._y2_plot_lines[index].setVisible(checked)
+        # Rebuild legend to only show visible channels
+        if self.graphWidget is not None and self.graphWidget.plotItem.legend is not None:
+            legend = self.graphWidget.plotItem.legend
+            legend.clear()
+            for i, line in enumerate(self.plot_lines):
+                if i not in self.hidden_channels:
+                    legend.addItem(line, self._channel_name(i))
+            for i, mch in enumerate(self._math_channels):
+                if i < len(self._math_lines):
+                    legend.addItem(self._math_lines[i], mch.get('name', f'Math {i}'))
+        # Update FFT line visibility
+        if index < len(self._fft_lines):
+            self._fft_lines[index].setVisible(checked)
+        self._save_settings()
+
     def _setup_y2_axis(self):
         """Create a second Y-axis viewbox linked to the main plot."""
         if self._y2_viewbox is not None:
@@ -1202,16 +1277,18 @@ class SerialDataView(QtWidgets.QWidget):
             if axis == 2 and self._y2_viewbox is not None:
                 # Dashed pen for Y2 channels
                 pen = pg.mkPen(color, width=2, style=QtCore.Qt.DashLine)
-                line = pg.PlotDataItem(pen=pen, name=self._channel_name(i))
+                line = pg.PlotDataItem(pen=pen)
                 self._y2_viewbox.addItem(line)
                 self._y2_plot_lines[i] = line
             else:
                 pen = pg.mkPen(color, width=2)
-                line = pg.PlotDataItem(pen=pen, name=self._channel_name(i))
+                line = pg.PlotDataItem(pen=pen)
                 self.graphWidget.plotItem.addItem(line)
-            # Add all channels to legend in order
-            if self.graphWidget.plotItem.legend is not None:
+            # Add visible channels to legend; apply visibility
+            visible = i not in self.hidden_channels
+            if self.graphWidget.plotItem.legend is not None and visible:
                 self.graphWidget.plotItem.legend.addItem(line, self._channel_name(i))
+            line.setVisible(visible)
             line.setData(arr)
             self.plot_lines.append(line)
             self.plot_data.append(arr)
@@ -1220,6 +1297,9 @@ class SerialDataView(QtWidgets.QWidget):
 
     def _on_channels_changed(self):
         """Rebuild plot lines when channel count changes while graph is active."""
+        # Remove hidden state for channels beyond the new count
+        n = self.graph_channels.value()
+        self.hidden_channels = {i for i in self.hidden_channels if i < n}
         if self.graphWidget is not None:
             for line in self.plot_lines:
                 self.graphWidget.plotItem.removeItem(line)
@@ -1234,6 +1314,7 @@ class SerialDataView(QtWidgets.QWidget):
         # Rebuild FFT lines if FFT widget exists
         if self._fft_widget is not None:
             self._create_fft_lines()
+        self._rebuild_channel_toggles()
         self._apply_reader_settings()
         self._save_settings()
 
@@ -1297,7 +1378,15 @@ class SerialDataView(QtWidgets.QWidget):
             self._clear_graph_btn.clicked.connect(self._clear_graph)
             self._clear_graph_btn.adjustSize()
             self.graphWidget.installEventFilter(self)
-            self.splitter.insertWidget(0, self.graphWidget)
+            # Wrap graph + channel toggle bar in a container
+            self._graph_container = QtWidgets.QWidget()
+            _gc_layout = QtWidgets.QVBoxLayout(self._graph_container)
+            _gc_layout.setContentsMargins(0, 0, 0, 0)
+            _gc_layout.setSpacing(0)
+            _gc_layout.addWidget(self.graphWidget, stretch=1)
+            self._create_channel_toggle_bar()
+            _gc_layout.addWidget(self._channel_toggle_bar)
+            self.splitter.insertWidget(0, self._graph_container)
             self._position_overlay_buttons()
             self._update_graph_theme()
         else:
@@ -1307,8 +1396,10 @@ class SerialDataView(QtWidgets.QWidget):
             self._y2_plot_lines = {}
             self._y2_viewbox = None
             self.graphWidget.removeEventFilter(self)
-            self.graphWidget.setParent(None)
-            self.graphWidget.deleteLater()
+            self._channel_toggle_bar = None
+            self._graph_container.setParent(None)
+            self._graph_container.deleteLater()
+            self._graph_container = None
             self.graphWidget = None
             self._clear_graph_btn = None
             self._pause_btn = None
@@ -1479,6 +1570,8 @@ class SerialDataView(QtWidgets.QWidget):
         # Build value text with channel colors
         parts = []
         for i, arr in enumerate(self.plot_data):
+            if i in self.hidden_channels:
+                continue
             name = self._channel_name(i)
             color = self._channel_color(i)
             val = arr[x_idx]
@@ -1557,6 +1650,7 @@ class SerialDataView(QtWidgets.QWidget):
             if ok and new_name.strip():
                 self.channel_names[channel_index] = new_name.strip()
                 label.setText(new_name.strip())
+                self._rebuild_channel_toggles()
                 self._save_settings()
         elif action == color_action:
             current_color = QColor(self._channel_color(channel_index))
@@ -1569,6 +1663,7 @@ class SerialDataView(QtWidgets.QWidget):
                 self.plot_lines[channel_index].setPen(pg.mkPen(hex_color, width=2, style=pen_style))
                 sample.item = self.plot_lines[channel_index]
                 sample.update()
+                self._rebuild_channel_toggles()
                 self._save_settings()
         elif action == reset_action:
             was_y2 = self.channel_axes.get(channel_index, 1) == 2
@@ -1585,6 +1680,7 @@ class SerialDataView(QtWidgets.QWidget):
                 self.plot_lines[channel_index].setPen(pg.mkPen(default_color, width=2))
                 sample.item = self.plot_lines[channel_index]
                 sample.update()
+                self._rebuild_channel_toggles()
                 self._save_settings()
 
     def _fft_state_changed(self):
@@ -1627,6 +1723,7 @@ class SerialDataView(QtWidgets.QWidget):
         for i in range(n):
             color = self._channel_color(i)
             line = self._fft_widget.plotItem.plot(pen=pg.mkPen(color, width=2))
+            line.setVisible(i not in self.hidden_channels)
             self._fft_lines.append(line)
 
     def _destroy_fft_widget(self):
@@ -1645,6 +1742,8 @@ class SerialDataView(QtWidgets.QWidget):
         for i, arr in enumerate(self.plot_data):
             if i >= len(self._fft_lines):
                 break
+            if i in self.hidden_channels:
+                continue
             fft_mag = np.abs(np.fft.rfft(arr))
             self._fft_lines[i].setData(fft_mag)
 
@@ -2012,6 +2111,7 @@ class SerialDataView(QtWidgets.QWidget):
             'channel_names': {str(k): v for k, v in self.channel_names.items()},
             'channel_colors': {str(k): v for k, v in self.channel_colors.items()},
             'channel_axes': {str(k): v for k, v in self.channel_axes.items()},
+            'hidden_channels': sorted(self.hidden_channels),
             'y_auto_scale': self._y_auto_scale,
             'y_min': self._y_min,
             'y_max': self._y_max,
@@ -2051,17 +2151,21 @@ class SerialDataView(QtWidgets.QWidget):
             self.data_mode.setCurrentText(s.get('mode', 'ASCII'))
             self.graph_channels.setValue(s.get('num_channels', 4))
             self.plot_length_spin.setValue(s.get('num_points', DEFAULT_PLOT_LENGTH))
-            self.graph_mode.setChecked(s.get('show_plot', False))
-            self._fft_check.setChecked(s.get('show_fft', False))
             self.delimiter_combo.setCurrentText(s.get('delimiter', 'Auto'))
             self.delimiter_custom.setText(s.get('delimiter_custom', ''))
 
+            # Load channel properties BEFORE enabling the graph so that
+            # graph_state_changed() sees the correct names/colors/axes/hidden.
             saved_names = s.get('channel_names', {})
             self.channel_names = {int(k): v for k, v in saved_names.items()}
             saved_colors = s.get('channel_colors', {})
             self.channel_colors = {int(k): v for k, v in saved_colors.items()}
             saved_axes = s.get('channel_axes', {})
             self.channel_axes = {int(k): v for k, v in saved_axes.items()}
+            self.hidden_channels = set(s.get('hidden_channels', []))
+
+            self.graph_mode.setChecked(s.get('show_plot', False))
+            self._fft_check.setChecked(s.get('show_fft', False))
 
             self._y_auto_scale = s.get('y_auto_scale', True)
             self._y_min = s.get('y_min', -1.0)
