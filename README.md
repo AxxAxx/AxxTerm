@@ -9,12 +9,18 @@ A professional serial terminal with dual ASCII/HEX view, real-time plotting, bin
 ### Serial Communication
 - Auto-detect serial ports with device name and VID:PID display
 - Configurable baud rate (9600 to 921600), data bits, parity, stop bits, flow control
+- Auto-reconnect when an unplugged USB device reappears (View > Auto-Reconnect)
 - Visual connection indicator (DB-9 connector icon: green = connected, red = disconnected)
 - Live status bar with RX/TX throughput (bytes/sec), totals, and baud rate
+- Timestamped logging to file (Record button / Ctrl+R), one log line per device line
 
 ### Dual Data View
-- ASCII and HEX views side by side, updated in real-time
+- ASCII and HEX views side by side, updated in real-time (batched at ~30 fps,
+  so the GUI stays responsive at high baud rates)
 - Color-coded: red for received data, blue for sent data
+- Scroll position and text selection are preserved while data streams in;
+  the view only auto-scrolls when already at the bottom
+- Search/highlight in scrollback (Ctrl+F)
 - Resizable splitter between the plot and data views
 
 ### Sending Data
@@ -26,6 +32,18 @@ A professional serial terminal with dual ASCII/HEX view, real-time plotting, bin
 ### Real-Time Plotting
 - 1 to 12 channels with auto-scaling Y-axis
 - Configurable scrolling window (10 to 10,000 points)
+- High-throughput rendering: samples are batched into preallocated numpy
+  buffers and each curve redraws once per display frame (~30 fps) with
+  peak-preserving downsampling, independent of the incoming sample rate.
+  Binary streams are decoded vectorized (`np.frombuffer`, no per-sample
+  Python), so the plot keeps up with multi-MB/s USB-CDC sources, far beyond
+  any real serial baud rate
+- Dual Y-axes: right-click a legend entry to move a channel to Y2 (dashed)
+- Per-channel show/hide toggle checkboxes below the plot
+- Math/computed channels with numpy expressions (e.g. `ch0 * ch1`);
+  expressions are validated against a whitelist and compiled once
+- FFT frequency spectrum view (Hann window, amplitude-normalized)
+- Pause button and oscilloscope-style trigger mode (level + edge, centered)
 - Crosshair cursor showing all channel values at the mouse position
 - Right-click legend entries to rename channels or change colors
 - Right-click plot area for axis settings (auto-range, manual Y-axis limits)
@@ -76,8 +94,11 @@ Frame structure: `[Start Byte(s)] [Optional Size Field] [Payload] [Optional Chec
 - Input/output with arrow indicator
 
 ### Settings Persistence
-- All settings saved automatically to `AxxTerm_settings.json`
-- Includes: serial port config, decode mode, plot settings, channel names/colors, macros
+- All settings saved automatically to `AxxTerm_settings.json` (writes are
+  debounced so rapid changes coalesce into one disk write)
+- Includes: serial port config, decode mode, plot settings, channel
+  names/colors/axes/visibility, math channels, macros, dark mode, and
+  window/splitter geometry
 - File > Save Settings / Load Settings for explicit save/load to custom files
 
 ### Keyboard Shortcuts
@@ -86,6 +107,9 @@ Frame structure: `[Start Byte(s)] [Optional Size Field] [Payload] [Optional Chec
 |----------|--------|
 | Enter | Send data |
 | Up/Down | Navigate send history |
+| Ctrl+F | Find in scrollback |
+| Ctrl+R | Start/stop recording to log file |
+| Ctrl+D | Toggle dark mode |
 | Ctrl+S | Save settings to file |
 | Ctrl+O | Load settings from file |
 | Ctrl+Q | Quit |
@@ -138,15 +162,22 @@ This creates `dist/AxxTerm.exe`. Copy it anywhere and run.
 
 ```json
 {
+  "dark_mode": false,
+  "auto_reconnect": true,
+  "window": { "geometry": "<hex>", "splitter": [300, 400] },
   "plot": {
     "mode": "ASCII",
     "num_channels": 4,
     "num_points": 100,
     "show_plot": false,
+    "show_fft": false,
     "delimiter": "Auto",
     "channel_names": {},
     "channel_colors": {},
+    "channel_axes": {},
+    "hidden_channels": [],
     "y_auto_scale": true,
+    "math_channels": [],
     "binary": { "data_type": "float32", "endianness": "little" },
     "frame": { "sync_word": "AA", "size_field": "fixed", "frame_size": 12, "checksum": false }
   },

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 import sys
+import ast
+import html
 import math
-import re
 import struct
 import os
 import json
@@ -46,6 +47,18 @@ DATA_TYPES = {
     'double64': ('d', 8),
 }
 
+# numpy base dtype per data type, for vectorized (per-chunk) binary decoding
+NUMPY_DTYPES = {
+    'uint8':    np.uint8,
+    'int8':     np.int8,
+    'uint16':   np.uint16,
+    'int16':    np.int16,
+    'uint32':   np.uint32,
+    'int32':    np.int32,
+    'float32':  np.float32,
+    'double64': np.float64,
+}
+
 DEFAULT_MACROS = [
     {"label": "0x7F",           "hex": "7F"},
     {"label": "FF",             "hex": "FF"},
@@ -59,17 +72,18 @@ DEFAULT_MACROS = [
 
 CONVERTERS = {
     'HEX --> ASCII': lambda v: bytes.fromhex(v).decode('ISO-8859-1'),
-    'HEX --> DECIMAL': lambda v: str(int(v, 16)),
-    'HEX --> BINARY': lambda v: bin(int(v, 16))[2:].zfill(8),
+    'HEX --> DECIMAL': lambda v: str(int(v.replace(' ', ''), 16)),
+    'HEX --> BINARY': lambda v: format(int(v.replace(' ', ''), 16),
+                                       '0{}b'.format(len(v.replace(' ', '')) * 4)),
     'ASCII --> HEX': lambda v: '0x' + v.encode('ISO-8859-1').hex(),
     'ASCII --> DECIMAL': lambda v: ' '.join(str(b) for b in v.encode('ISO-8859-1')),
-    'ASCII --> BINARY': lambda v: bin(int.from_bytes(v.encode('ISO-8859-1'), 'big')),
+    'ASCII --> BINARY': lambda v: ' '.join(format(b, '08b') for b in v.encode('ISO-8859-1')),
     'DECIMAL --> HEX': lambda v: hex(int(v)),
     'DECIMAL --> ASCII': lambda v: chr(int(v)),
     'DECIMAL --> BINARY': lambda v: format(int(v), '08b'),
-    'BINARY --> HEX': lambda v: hex(int(v, 2)),
-    'BINARY --> ASCII': lambda v: chr(int(v, 2)),
-    'BINARY --> DECIMAL': lambda v: str(int(v, 2)),
+    'BINARY --> HEX': lambda v: hex(int(v.replace(' ', ''), 2)),
+    'BINARY --> ASCII': lambda v: chr(int(v.replace(' ', ''), 2)),
+    'BINARY --> DECIMAL': lambda v: str(int(v.replace(' ', ''), 2)),
 }
 
 
@@ -91,12 +105,40 @@ class BinaryStreamReader:
             return []
         prefix = '<' if self.endianness == 'little' else '>'
         fmt = prefix + fmt_char * self.num_channels
-        results = []
-        while len(self.buffer) >= package_size:
-            values = struct.unpack(fmt, self.buffer[:package_size])
-            self.buffer = self.buffer[package_size:]
-            results.append(values)
-        return results
+        n_samples = len(self.buffer) // package_size
+        if n_samples == 0:
+            return []
+        chunk = bytes(self.buffer[:n_samples * package_size])
+        del self.buffer[:n_samples * package_size]
+        return list(struct.iter_unpack(fmt, chunk))
+
+    def feed_np(self, data):
+        """Feed raw bytes; return a complete-samples numpy array shaped
+        (n_samples, num_channels) as float64, or None if no full sample yet.
+
+        Fully vectorized: np.frombuffer over the whole chunk, no per-sample
+        Python. This is the hot path for high-rate binary streams.
+        """
+        self.buffer.extend(data)
+        if self.num_channels == 0:
+            return None
+        base = NUMPY_DTYPES[self.data_type]
+        type_size = np.dtype(base).itemsize
+        package_size = self.num_channels * type_size
+        n_samples = len(self.buffer) // package_size
+        if n_samples == 0:
+            return None
+        nbytes = n_samples * package_size
+        raw = bytes(self.buffer[:nbytes])
+        del self.buffer[:nbytes]
+        order = '<' if self.endianness == 'little' else '>'
+        dt = np.dtype(base).newbyteorder(order)
+        arr = np.frombuffer(raw, dtype=dt, count=n_samples * self.num_channels)
+        # Garbage/uninitialized bytes can decode to inf/NaN float32; the cast is
+        # still correct, so silence the cosmetic warning (flush_plot turns any
+        # non-finite value into a plot gap).
+        with np.errstate(invalid='ignore'):
+            return arr.astype(np.float64).reshape(n_samples, self.num_channels)
 
     def sync(self):
         """Clear buffer to re-align stream."""
@@ -106,14 +148,13 @@ class BinaryStreamReader:
 class FrameReader:
     """Decodes framed binary packets with sync word, optional size, and optional checksum.
 
-    Note: Sync word matching uses a simple byte-by-byte scan. Sync words with
-    internal prefix repetition (e.g. 01 02 01 03) may miss valid frames if the
-    pattern overlaps in the stream. Simple sync words (AA, AA BB, etc.) work correctly.
+    Buffer-based: scans for the sync word with bytes.find (handles sync words
+    with internal prefix repetition), and re-scans from the byte after a false
+    sync when a size check or checksum fails, so one corrupt byte never
+    swallows subsequent valid frames.
     """
 
-    SEARCHING = 0
-    READING_SIZE = 1
-    READING_PAYLOAD = 2
+    MAX_BUFFER = 1 << 20  # 1 MB cap against garbage input with no sync words
 
     def __init__(self):
         self.data_type = 'float32'
@@ -123,22 +164,15 @@ class FrameReader:
         self.size_field = 'fixed'
         self.frame_size = 12
         self.checksum_enabled = False
-        self.state = self.SEARCHING
-        self._sync_index = 0
-        self._size_buffer = bytearray()
-        self._payload_buffer = bytearray()
-        self._payload_size = 0
+        self.buffer = bytearray()
 
     def reset(self):
-        """Reset state machine and clear buffers."""
-        self.state = self.SEARCHING
-        self._sync_index = 0
-        self._size_buffer.clear()
-        self._payload_buffer.clear()
-        self._payload_size = 0
+        """Clear buffered bytes."""
+        self.buffer.clear()
 
     def feed(self, data):
         """Feed raw bytes. Returns list of tuples, one per sample."""
+        self.buffer.extend(data)
         results = []
         fmt_char, type_size = DATA_TYPES[self.data_type]
         prefix = '<' if self.endianness == 'little' else '>'
@@ -146,59 +180,50 @@ class FrameReader:
         if sample_size == 0:
             return []
         fmt = prefix + fmt_char * self.num_channels
+        sync = self.sync_word
+        size_len = {'fixed': 0, '1-byte': 1, '2-byte': 2}.get(self.size_field, 0)
+        checksum_len = 1 if self.checksum_enabled else 0
 
-        for byte in data:
-            if self.state == self.SEARCHING:
-                if byte == self.sync_word[self._sync_index]:
-                    self._sync_index += 1
-                    if self._sync_index == len(self.sync_word):
-                        self._sync_index = 0
-                        if self.size_field == 'fixed':
-                            self._payload_size = self.frame_size
-                            self.state = self.READING_PAYLOAD
-                            self._payload_buffer.clear()
-                        else:
-                            self.state = self.READING_SIZE
-                            self._size_buffer.clear()
-                else:
-                    self._sync_index = 1 if byte == self.sync_word[0] else 0
+        pos = 0
+        buf = self.buffer
+        while True:
+            start = buf.find(sync, pos)
+            if start < 0:
+                # Keep a potential partial sync word at the tail
+                pos = max(pos, len(buf) - (len(sync) - 1))
+                break
+            header_end = start + len(sync) + size_len
+            if len(buf) < header_end:
+                pos = start
+                break  # wait for size field bytes
+            if size_len == 0:
+                payload_size = self.frame_size
+            elif size_len == 1:
+                payload_size = buf[start + len(sync)]
+            else:
+                size_fmt = '<H' if self.endianness == 'little' else '>H'
+                payload_size = struct.unpack_from(size_fmt, buf, start + len(sync))[0]
+            if payload_size == 0 or (size_len > 0 and payload_size % sample_size != 0):
+                pos = start + 1  # false sync: re-scan from the next byte
+                continue
+            frame_end = header_end + payload_size + checksum_len
+            if len(buf) < frame_end:
+                pos = start
+                break  # wait for full frame
+            payload = bytes(buf[header_end:header_end + payload_size])
+            if checksum_len and buf[header_end + payload_size] != (sum(payload) & 0xFF):
+                pos = start + 1  # bad checksum: re-scan from the next byte
+                continue
+            offset = 0
+            while offset + sample_size <= len(payload):
+                results.append(struct.unpack_from(fmt, payload, offset))
+                offset += sample_size
+            pos = frame_end
 
-            elif self.state == self.READING_SIZE:
-                self._size_buffer.append(byte)
-                needed = 1 if self.size_field == '1-byte' else 2
-                if len(self._size_buffer) >= needed:
-                    if needed == 1:
-                        self._payload_size = self._size_buffer[0]
-                    else:
-                        size_fmt = '<H' if self.endianness == 'little' else '>H'
-                        self._payload_size = struct.unpack(size_fmt, self._size_buffer[:2])[0]
-                    if self._payload_size == 0 or (self._payload_size % sample_size) != 0:
-                        self.state = self.SEARCHING
-                        self._sync_index = 0
-                    else:
-                        self.state = self.READING_PAYLOAD
-                        self._payload_buffer.clear()
-
-            elif self.state == self.READING_PAYLOAD:
-                self._payload_buffer.append(byte)
-                total_needed = self._payload_size + (1 if self.checksum_enabled else 0)
-                if len(self._payload_buffer) >= total_needed:
-                    payload = bytes(self._payload_buffer[:self._payload_size])
-                    valid = True
-                    if self.checksum_enabled:
-                        received = self._payload_buffer[self._payload_size]
-                        computed = sum(payload) & 0xFF
-                        if received != computed:
-                            valid = False
-                    if valid:
-                        offset = 0
-                        while offset + sample_size <= len(payload):
-                            values = struct.unpack_from(fmt, payload, offset)
-                            results.append(values)
-                            offset += sample_size
-                    self.state = self.SEARCHING
-                    self._sync_index = 0
-
+        if pos > 0:
+            del buf[:pos]
+        if len(buf) > self.MAX_BUFFER:
+            del buf[:len(buf) - self.MAX_BUFFER]
         return results
 
 
@@ -355,6 +380,17 @@ class SerialMonitor(QtWidgets.QMainWindow):
         ### Recording state ###
         self._log_file = None
         self._recording = False
+        self._rx_log_pending = ''  # partial RX line awaiting its newline
+
+        ### Window state restore ###
+        self._geometry_restored = False
+        self._splitter_sizes_to_restore = None
+
+        ### Debounced settings save (coalesce rapid changes into one disk write) ###
+        self._save_timer = QtCore.QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(750)
+        self._save_timer.timeout.connect(lambda: self.save_all_settings())
 
         ### Throughput tracking ###
         self._rx_bytes = 0
@@ -382,12 +418,12 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.port.readyRead.connect(self.readFromPort)
         self.port.errorOccurred.connect(self._on_port_error)
 
-        # Save when serial port settings change
-        self.toolBar.baudRates.currentIndexChanged.connect(lambda: self.save_all_settings())
-        self.toolBar.dataBits.currentIndexChanged.connect(lambda: self.save_all_settings())
-        self.toolBar._parity.currentIndexChanged.connect(lambda: self.save_all_settings())
-        self.toolBar.stopBits.currentIndexChanged.connect(lambda: self.save_all_settings())
-        self.toolBar._flowControl.currentIndexChanged.connect(lambda: self.save_all_settings())
+        # Save when serial port settings change (debounced)
+        self.toolBar.baudRates.currentIndexChanged.connect(lambda: self.schedule_save())
+        self.toolBar.dataBits.currentIndexChanged.connect(lambda: self.schedule_save())
+        self.toolBar._parity.currentIndexChanged.connect(lambda: self.schedule_save())
+        self.toolBar.stopBits.currentIndexChanged.connect(lambda: self.schedule_save())
+        self.toolBar._flowControl.currentIndexChanged.connect(lambda: self.schedule_save())
 
         ### Load all settings ###
         self.load_all_settings()
@@ -416,6 +452,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self._tx_bytes = 0
                 self._rx_total = 0
                 self._tx_total = 0
+                self._reset_stream_state()
                 self.toolBar.serialControlEnable(False)
                 self.serialDataView.label.setPixmap(create_connector_pixmap('#22bb22'))
         else:
@@ -424,6 +461,11 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self.toolBar.serialControlEnable(True)
             self.serialDataView.label.setPixmap(create_connector_pixmap('#cc2222'))
 
+    def _reset_stream_state(self):
+        """Drop buffered/partial stream state so a new connection starts clean."""
+        self._rx_buffer.clear()
+        self.serialDataView.reset_stream_state()
+
     def readFromPort(self):
         data = self.port.readAll()
         if len(data) > 0:
@@ -431,22 +473,30 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self._rx_bytes += len(raw_bytes)
             self._rx_total += len(raw_bytes)
             # Log immediately for accurate timestamps
-            mode = self.serialDataView.data_mode.currentText()
-            if mode == 'ASCII':
-                self._log_data('RX', raw_bytes.decode('ISO-8859-1'))
-            else:
-                hex_str = raw_bytes.hex().upper()
-                self._log_data('RX', f'[HEX] {hex_str}')
+            if self._recording and self._log_file is not None:
+                mode = self.serialDataView.data_mode.currentText()
+                if mode == 'ASCII':
+                    # Buffer partial lines so each logged line is one device line
+                    text = self._rx_log_pending + raw_bytes.decode('ISO-8859-1')
+                    lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+                    self._rx_log_pending = lines[-1][-4096:]
+                    complete = '\n'.join(lines[:-1])
+                    if complete:
+                        self._log_data('RX', complete)
+                else:
+                    hex_str = raw_bytes.hex().upper()
+                    self._log_data('RX', f'[HEX] {hex_str}')
             # Buffer for throttled display update
             self._rx_buffer.extend(raw_bytes)
 
     def _flush_display(self):
         """Process buffered RX data and update the display (~30 fps)."""
-        if not self._rx_buffer:
-            return
-        data = bytes(self._rx_buffer)
-        self._rx_buffer.clear()
-        self.serialDataView.handleReceivedData(data)
+        if self._rx_buffer:
+            data = bytes(self._rx_buffer)
+            self._rx_buffer.clear()
+            self.serialDataView.handleReceivedData(data)
+        # Push any pending plot samples to the curves (one setData per channel)
+        self.serialDataView.flush_plot()
 
     def sendFromPort(self, text):
         if not self.port.isOpen():
@@ -478,7 +528,12 @@ class SerialMonitor(QtWidgets.QMainWindow):
             elif self.serialSendView.lineEnding.currentIndex() == 3:
                 text = text + '\r\n'
             try:
-                tx = text.encode()
+                # Match the RX/display encoding (ISO-8859-1); fall back to
+                # UTF-8 only for characters outside Latin-1.
+                try:
+                    tx = text.encode('ISO-8859-1')
+                except UnicodeEncodeError:
+                    tx = text.encode('utf-8')
                 self.port.write(tx)
                 self._tx_bytes += len(tx)
                 self._tx_total += len(tx)
@@ -489,9 +544,13 @@ class SerialMonitor(QtWidgets.QMainWindow):
 
         elif self.serialSendView.charMode.currentText() == 'BINARY':
             try:
-                value = int(text, 2)
-                num_bytes = max(1, (value.bit_length() + 7) // 8)
+                bits = text.replace(' ', '')
+                value = int(bits, 2)
+                # Width from the typed bit string, so leading zero bytes survive
+                num_bytes = max(1, (len(bits) + 7) // 8)
                 tx = value.to_bytes(num_bytes, byteorder='big')
+                ending = [b'', b'\n', b'\r', b'\r\n'][self.serialSendView.lineEnding.currentIndex()]
+                tx += ending
                 self.port.write(tx)
                 self._tx_bytes += len(tx)
                 self._tx_total += len(tx)
@@ -614,6 +673,9 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self._tx_bytes = 0
             self._rx_total = 0
             self._tx_total = 0
+            # Drop partial frames/lines from before the disconnect so the
+            # decoders don't permanently misalign on the reconnected stream
+            self._reset_stream_state()
             self.statusText.setText('Port reconnected')
 
     # --- Recording / Logging ---------------------------------------------------
@@ -624,17 +686,38 @@ class SerialMonitor(QtWidgets.QMainWindow):
             return
         now = datetime.now()
         ts = now.strftime('%Y-%m-%d %H:%M:%S.') + f'{now.microsecond // 1000:03d}'
-        for line in text.splitlines():
-            if line:
-                self._log_file.write(f'[{ts}] {direction}: {line}\n')
-        self._log_file.flush()
+        try:
+            for line in text.splitlines():
+                if line:
+                    self._log_file.write(f'[{ts}] {direction}: {line}\n')
+            self._log_file.flush()
+        except (OSError, ValueError):
+            # Disk full / file gone: stop recording instead of crashing the RX path
+            try:
+                self._log_file.close()
+            except (OSError, ValueError):
+                pass
+            self._log_file = None
+            self._recording = False
+            self._rx_log_pending = ''
+            self._record_btn.setChecked(False)
+            self._record_btn.setText('Record')
+            self._record_btn.setStyleSheet('')
+            self._record_action.setText('Start Recording')
+            self.statusText.setText('Recording stopped: log file write failed')
 
     def _toggle_recording(self):
         """Start or stop recording serial data to a log file."""
         if self._recording:
-            # Stop recording
+            # Stop recording: flush any partial RX line first
+            if self._rx_log_pending:
+                pending, self._rx_log_pending = self._rx_log_pending, ''
+                self._log_data('RX', pending)
             if self._log_file is not None:
-                self._log_file.close()
+                try:
+                    self._log_file.close()
+                except OSError:
+                    pass
                 self._log_file = None
             self._recording = False
             self._record_btn.setChecked(False)
@@ -662,18 +745,31 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self.statusText.setText(f'Recording to {filename}')
 
     def closeEvent(self, event):
-        """Ensure the log file is closed when the application exits."""
+        """Flush pending state and close the log file when the application exits."""
+        self._save_timer.stop()
+        self.save_all_settings()  # also captures final window/splitter geometry
         if self._log_file is not None:
-            self._log_file.close()
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
             self._log_file = None
         self._recording = False
         super().closeEvent(event)
+
+    def schedule_save(self):
+        """Request a debounced settings save (rapid changes coalesce into one write)."""
+        self._save_timer.start()
 
     def save_all_settings(self, path=None):
         """Save all settings (plot, serial port, macros) to one JSON file."""
         settings = {
             'dark_mode': self._dark_mode,
             'auto_reconnect': self._auto_reconnect,
+            'window': {
+                'geometry': bytes(self.saveGeometry().toHex()).decode('ascii'),
+                'splitter': self.serialDataView.splitter.sizes(),
+            },
             'plot': self.serialDataView._get_settings_dict(),
             'serial': {
                 'baud_rate': self.toolBar.baudRates.currentText(),
@@ -695,8 +791,27 @@ class SerialMonitor(QtWidgets.QMainWindow):
         try:
             with open(path or SETTINGS_FILE, 'r') as f:
                 s = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        except (OSError, json.JSONDecodeError, ValueError, UnicodeDecodeError):
             return
+        if not isinstance(s, dict):
+            return
+
+        # Window geometry / splitter sizes. We restore the size/position but
+        # never reopen maximized or full-screen -- the app should always start
+        # as a normal resizable window.
+        win = s.get('window', {})
+        try:
+            geo = win.get('geometry', '')
+            if geo:
+                self.restoreGeometry(QtCore.QByteArray.fromHex(geo.encode('ascii')))
+                self.setWindowState(self.windowState() & ~(
+                    QtCore.Qt.WindowMaximized | QtCore.Qt.WindowFullScreen))
+                self._geometry_restored = True
+            sizes = win.get('splitter')
+            if sizes:
+                self._splitter_sizes_to_restore = [int(x) for x in sizes]
+        except (TypeError, ValueError):
+            pass
 
         # Dark mode
         self._dark_mode = s.get('dark_mode', False)
@@ -734,6 +849,13 @@ class SerialMonitor(QtWidgets.QMainWindow):
         if macros:
             self.serialSendView._load_macros_from_list(macros)
 
+        # Apply splitter sizes after the plot widget (if any) has been created
+        if self._splitter_sizes_to_restore:
+            sizes = self._splitter_sizes_to_restore
+            self._splitter_sizes_to_restore = None
+            if len(sizes) == self.serialDataView.splitter.count():
+                self.serialDataView.splitter.setSizes(sizes)
+
     def _menu_save_settings(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, 'Save Settings', '', 'JSON Files (*.json);;All Files (*)')
@@ -758,15 +880,23 @@ class SerialMonitor(QtWidgets.QMainWindow):
         if not path:
             return
         try:
+            def quote(name):
+                if any(c in name for c in ',"\n'):
+                    return '"' + name.replace('"', '""') + '"'
+                return name
+
+            dv._update_math_channels()  # make math values current, not up to a frame stale
             n_channels = len(dv.plot_data)
             n_points = len(dv.plot_data[0])
+            # Skip the NaN-prefilled head: export only rows that hold real samples
+            start = max(0, n_points - dv._plot_fill)
             # Build header: regular channels + math channels
-            headers = [dv._channel_name(i) for i in range(n_channels)]
+            headers = [quote(dv._channel_name(i)) for i in range(n_channels)]
             for mch in dv._math_channels:
-                headers.append(mch.get('name', 'Math'))
+                headers.append(quote(mch.get('name', 'Math')))
             header = ','.join(headers)
             lines = [header]
-            for row in range(n_points):
+            for row in range(start, n_points):
                 values = [str(dv.plot_data[ch][row]) for ch in range(n_channels)]
                 for arr in dv._math_data:
                     values.append(str(arr[row]) if row < len(arr) else '')
@@ -799,9 +929,12 @@ class SerialDataView(QtWidgets.QWidget):
     def __init__(self, parent):
         super().__init__(parent)
 
-        self.numberbuffer = []
         self.plot_lines = []
         self.plot_data = []
+        self._plot_fill = 0        # how many trailing samples in plot_data are real
+        self._pending_rows = []    # parsed sample rows (ASCII/frame) awaiting display flush
+        self._pending_blocks = []  # numpy (n, nch) blocks (binary) awaiting display flush
+        self._ascii_line_buffer = ''  # partial ASCII line awaiting its newline
         self.graphWidget = None
         self.channel_names = {}   # {index: 'custom name'} for renamed channels
         self.channel_colors = {}  # {index: '#hex'} for custom channel colors
@@ -830,7 +963,7 @@ class SerialDataView(QtWidgets.QWidget):
         self._math_lines = []      # PlotDataItem list
         self._math_data = []       # numpy array list
         self._math_errors = set()  # indices of channels with eval errors
-        self._math_update_counter = 0
+        self._math_expr_cache = {}  # {expression: compiled code or None if rejected}
 
         self._binary_reader = BinaryStreamReader()
         self._frame_reader = FrameReader()
@@ -847,11 +980,13 @@ class SerialDataView(QtWidgets.QWidget):
 
         self.serialData = QtWidgets.QTextEdit(self)
         self.serialData.setReadOnly(True)
+        self.serialData.setUndoRedoEnabled(False)
         self.serialData.setFontFamily('Segoe UI')
         self.serialData.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
         self.serialDataHex = QtWidgets.QTextEdit(self)
         self.serialDataHex.setReadOnly(True)
+        self.serialDataHex.setUndoRedoEnabled(False)
         self.serialDataHex.setFontFamily('Segoe UI')
         self.serialDataHex.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
@@ -1146,20 +1281,7 @@ class SerialDataView(QtWidgets.QWidget):
         layout = QtWidgets.QHBoxLayout(self._channel_toggle_bar)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(10)
-        n = self.graph_channels.value()
-        for i in range(n):
-            name = self._channel_name(i)
-            color = self._channel_color(i)
-            cb = QCheckBox(name)
-            cb.setFont(QtGui.QFont('Segoe UI', 9, QtGui.QFont.Bold))
-            cb.setStyleSheet(
-                f'QCheckBox {{ color: #000000; }}'
-                f'QCheckBox::indicator:checked {{ background-color: {color}; border: 1px solid #888; }}'
-                f'QCheckBox::indicator:unchecked {{ background-color: #ffffff; border: 1px solid #888; }}')
-            cb.setChecked(i not in self.hidden_channels)
-            cb.toggled.connect(lambda checked, idx=i: self._on_channel_toggled(idx, checked))
-            layout.addWidget(cb)
-        layout.addStretch()
+        self._populate_channel_toggles(layout)
 
     def _rebuild_channel_toggles(self):
         """Rebuild channel toggle checkboxes when channel count or names change."""
@@ -1170,6 +1292,12 @@ class SerialDataView(QtWidgets.QWidget):
             item = layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self._populate_channel_toggles(layout)
+
+    def _populate_channel_toggles(self, layout):
+        """Fill a layout with one toggle checkbox per channel."""
+        dark = getattr(self.window(), '_dark_mode', False)
+        label_color = '#ffffff' if dark else '#000000'
         n = self.graph_channels.value()
         for i in range(n):
             name = self._channel_name(i)
@@ -1177,7 +1305,7 @@ class SerialDataView(QtWidgets.QWidget):
             cb = QCheckBox(name)
             cb.setFont(QtGui.QFont('Segoe UI', 9, QtGui.QFont.Bold))
             cb.setStyleSheet(
-                f'QCheckBox {{ color: #000000; }}'
+                f'QCheckBox {{ color: {label_color}; }}'
                 f'QCheckBox::indicator:checked {{ background-color: {color}; border: 1px solid #888; }}'
                 f'QCheckBox::indicator:unchecked {{ background-color: #ffffff; border: 1px solid #888; }}')
             cb.setChecked(i not in self.hidden_channels)
@@ -1194,6 +1322,9 @@ class SerialDataView(QtWidgets.QWidget):
         # Update plot line visibility
         if index < len(self.plot_lines):
             self.plot_lines[index].setVisible(checked)
+            if checked and index < len(self.plot_data):
+                # Hidden channels skip setData during streaming; refresh on show
+                self.plot_lines[index].setData(self.plot_data[index])
         # Update Y2 line visibility
         if index in self._y2_plot_lines:
             self._y2_plot_lines[index].setVisible(checked)
@@ -1270,20 +1401,26 @@ class SerialDataView(QtWidgets.QWidget):
             self._setup_y2_axis()
         else:
             self._remove_y2_axis()
+        self._plot_fill = 0
+        self._pending_rows = []
+        self._pending_blocks = []
         for i in range(n):
             color = self._channel_color(i)
-            arr = np.zeros(plot_length)
+            # NaN-prefilled: curves start empty instead of as a flat zero line
+            arr = np.full(plot_length, np.nan)
             axis = self.channel_axes.get(i, 1)
             if axis == 2 and self._y2_viewbox is not None:
                 # Dashed pen for Y2 channels
                 pen = pg.mkPen(color, width=2, style=QtCore.Qt.DashLine)
-                line = pg.PlotDataItem(pen=pen)
+                line = pg.PlotDataItem(pen=pen, connect='finite')
                 self._y2_viewbox.addItem(line)
                 self._y2_plot_lines[i] = line
             else:
                 pen = pg.mkPen(color, width=2)
-                line = pg.PlotDataItem(pen=pen)
+                line = pg.PlotDataItem(pen=pen, connect='finite')
                 self.graphWidget.plotItem.addItem(line)
+            # Draw at most ~2 points per screen pixel while keeping spikes visible
+            line.setDownsampling(auto=True, method='peak')
             # Add visible channels to legend; apply visibility
             visible = i not in self.hidden_channels
             if self.graphWidget.plotItem.legend is not None and visible:
@@ -1355,7 +1492,7 @@ class SerialDataView(QtWidgets.QWidget):
             self._create_plot_lines()
             # Connect range signal AFTER setup to avoid overwriting restored Y-axis
             self.graphWidget.sigRangeChanged.connect(self._on_range_changed)
-            self.numberbuffer = []
+            self._ascii_line_buffer = ''
             # Crosshair cursor
             self._crosshair = pg.InfiniteLine(angle=90, movable=False,
                                                pen=pg.mkPen('#888888', width=1, style=QtCore.Qt.DashLine))
@@ -1389,6 +1526,9 @@ class SerialDataView(QtWidgets.QWidget):
             self.splitter.insertWidget(0, self._graph_container)
             self._position_overlay_buttons()
             self._update_graph_theme()
+            # Restore the FFT view if its checkbox is on (e.g. from saved settings)
+            if self._fft_check.isChecked() and self._fft_widget is None:
+                self._create_fft_widget()
         else:
             # Destroy FFT widget first if it exists
             self._destroy_fft_widget()
@@ -1407,18 +1547,24 @@ class SerialDataView(QtWidgets.QWidget):
             self._cursor_label = None
             self.plot_lines = []
             self.plot_data = []
+            self._plot_fill = 0
+            self._pending_rows = []
+            self._pending_blocks = []
             self._math_lines = []
             self._math_data = []
             self._math_errors = set()
             self._plot_paused = False
 
     def _clear_graph(self):
-        """Reset all plot data to zeros."""
-        for i, (arr, line) in enumerate(zip(self.plot_data, self.plot_lines)):
-            arr[:] = 0
+        """Reset all plot data to empty (NaN)."""
+        self._plot_fill = 0
+        self._pending_rows = []
+        self._pending_blocks = []
+        for arr, line in zip(self.plot_data, self.plot_lines):
+            arr[:] = np.nan
             line.setData(arr)
         for arr, line in zip(self._math_data, self._math_lines):
-            arr[:] = 0
+            arr[:] = np.nan
             line.setData(arr)
         if self._y2_viewbox:
             self._y2_viewbox.enableAutoRange(axis='y')
@@ -1510,6 +1656,7 @@ class SerialDataView(QtWidgets.QWidget):
                         'background-color: #ffffff; border: 1px solid #aaa; padding: 2px 8px;')
             if hasattr(self, '_pause_btn') and self._pause_btn is not None:
                 self._update_pause_btn_style()
+            self._rebuild_channel_toggles()  # label color depends on theme
         # Update FFT widget theme
         if self._fft_widget is not None:
             if dark:
@@ -1575,29 +1722,40 @@ class SerialDataView(QtWidgets.QWidget):
             name = self._channel_name(i)
             color = self._channel_color(i)
             val = arr[x_idx]
-            parts.append(f'<span style="color:{color}"><b>{name}</b>: {val:.4f}</span>')
+            val_str = f'{val:.4f}' if math.isfinite(val) else '—'
+            parts.append(f'<span style="color:{color}"><b>{name}</b>: {val_str}</span>')
         for i, (mch, arr) in enumerate(zip(self._math_channels, self._math_data)):
             color = self._math_channel_color(i)
             name = mch.get('name', f'Math {i}')
             if x_idx < len(arr):
                 val = arr[x_idx]
-                parts.append(f'<span style="color:{color}"><b>{name}</b>: {val:.4f}</span>')
+                val_str = f'{val:.4f}' if math.isfinite(val) else '—'
+                parts.append(f'<span style="color:{color}"><b>{name}</b>: {val_str}</span>')
         html = '<br>'.join(parts)
         self._cursor_label.setHtml(f'<div style="background:rgba(255,255,255,200);padding:2px">{html}</div>')
         self._cursor_label.setPos(x, mouse_point.y())
         self._cursor_label.setVisible(True)
 
     def _on_range_changed(self):
-        """Track Y-axis range changes and save."""
+        """Track Y-axis range changes and save (debounced).
+
+        While Y auto-range is on, this fires on virtually every data update;
+        there is nothing user-chosen to persist then, so skip saving entirely
+        rather than rewriting the settings file at the render rate.
+        """
         if self.graphWidget is None:
             return
         vb = self.graphWidget.plotItem.vb
         auto = vb.autoRangeEnabled()[1]  # [x_auto, y_auto]
+        was_auto = self._y_auto_scale
         self._y_auto_scale = bool(auto)
-        if not auto:
-            y_range = vb.viewRange()[1]
-            self._y_min = y_range[0]
-            self._y_max = y_range[1]
+        if auto:
+            if not was_auto:
+                self._save_settings()  # user just re-enabled auto-range
+            return
+        y_range = vb.viewRange()[1]
+        self._y_min = y_range[0]
+        self._y_max = y_range[1]
         self._save_settings()
 
     def _on_plot_mouse_clicked(self, ev):
@@ -1739,12 +1897,20 @@ class SerialDataView(QtWidgets.QWidget):
         """Compute and display FFT magnitude for each channel."""
         if self._fft_widget is None or not self.plot_data:
             return
+        n_total = len(self.plot_data[0])
+        n = min(self._plot_fill, n_total)
+        if n < 8:
+            return
+        # Hann window + amplitude normalization; skip the NaN-prefilled head
+        window = np.hanning(n)
+        scale = 2.0 / window.sum()
         for i, arr in enumerate(self.plot_data):
             if i >= len(self._fft_lines):
                 break
             if i in self.hidden_channels:
                 continue
-            fft_mag = np.abs(np.fft.rfft(arr))
+            data = np.nan_to_num(arr[n_total - n:])
+            fft_mag = np.abs(np.fft.rfft(data * window)) * scale
             self._fft_lines[i].setData(fft_mag)
 
     # --- Math / Computed Channels ---
@@ -1794,19 +1960,73 @@ class SerialDataView(QtWidgets.QWidget):
             self._math_lines.append(line)
             self._math_data.append(arr)
 
+    # AST node types allowed in math expressions. Names are restricted to
+    # ch0..chN / np / numpy, attribute access to non-underscore attributes
+    # rooted at np, so a hostile settings file cannot execute arbitrary code.
+    _MATH_ALLOWED_NODES = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp,
+        ast.IfExp, ast.Call, ast.Attribute, ast.Name, ast.Load,
+        ast.Constant, ast.Tuple, ast.List, ast.Subscript, ast.Slice, ast.Index,
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
+        ast.USub, ast.UAdd, ast.Invert, ast.BitAnd, ast.BitOr, ast.BitXor,
+        ast.LShift, ast.RShift, ast.And, ast.Or, ast.Not,
+        ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+        ast.keyword,
+    )
+
+    @classmethod
+    def _validate_math_ast(cls, tree):
+        """Return True if every node in the expression tree is whitelisted."""
+        for node in ast.walk(tree):
+            if not isinstance(node, cls._MATH_ALLOWED_NODES):
+                return False
+            if isinstance(node, ast.Name):
+                name = node.id
+                if name not in ('np', 'numpy') and not (
+                        name.startswith('ch') and name[2:].isdigit()):
+                    return False
+            elif isinstance(node, ast.Attribute):
+                if node.attr.startswith('_'):
+                    return False
+            elif isinstance(node, ast.Constant):
+                if not isinstance(node.value, (int, float, complex, bool)):
+                    return False
+        return True
+
+    def _compile_math_expression(self, expression):
+        """Validate + compile an expression once; cache the result (None = rejected)."""
+        if expression in self._math_expr_cache:
+            return self._math_expr_cache[expression]
+        code = None
+        try:
+            tree = ast.parse(expression, mode='eval')
+            if self._validate_math_ast(tree):
+                code = compile(tree, '<math channel>', 'eval')
+        except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+            code = None
+        if len(self._math_expr_cache) > 256:
+            self._math_expr_cache.clear()
+        self._math_expr_cache[expression] = code
+        return code
+
     def _eval_math_expression(self, expression):
         """Evaluate a math expression safely and return the result array."""
-        namespace = {'__builtins__': {}, 'np': np, 'numpy': np}
+        code = self._compile_math_expression(expression)
+        if code is None:
+            return None
+        namespace = {'np': np, 'numpy': np}
         for i, arr in enumerate(self.plot_data):
             namespace[f'ch{i}'] = arr
         try:
-            result = eval(expression, {"__builtins__": {}}, namespace)
+            result = eval(code, {"__builtins__": {}}, namespace)
             # Ensure result is a numpy array of the right length
             if isinstance(result, (int, float)):
                 result = np.full(len(self.plot_data[0]), result)
             result = np.asarray(result, dtype=float)
             if result.shape != self.plot_data[0].shape:
                 return None
+            # inf wrecks Y auto-range; render as a gap instead
+            result[~np.isfinite(result)] = np.nan
             return result
         except Exception:
             return None
@@ -1833,57 +2053,108 @@ class SerialDataView(QtWidgets.QWidget):
                     # Set red pen to indicate error
                     self._math_lines[i].setPen(pg.mkPen('#ff0000', width=2, style=QtCore.Qt.DotLine))
 
-    def _append_data_point(self, value, channel):
-        """Append a data point to a plot channel using in-place array shift."""
-        if channel >= len(self.plot_data):
+    def _ingest_row(self, values):
+        """Queue one sample row (one value per channel) for the next display flush.
+
+        Only cheap bookkeeping happens here; all numpy work and setData calls
+        are batched in flush_plot() at ~30 fps.
+        """
+        if self._plot_paused or not self.plot_data:
             return
 
-        # When paused, don't update arrays at all -- plot freezes
-        if self._plot_paused:
+        # Trigger detection on the configured channel, evaluated per row
+        if self._trigger_enabled:
+            if (self._trigger_armed and self._trigger_countdown < 0
+                    and self._trigger_channel < len(values)):
+                value = values[self._trigger_channel]
+                if value is not None and math.isfinite(value):
+                    prev = self._trigger_prev_value
+                    self._trigger_prev_value = value
+                    if prev is not None:
+                        if self._trigger_edge == 'rising':
+                            fired = prev < self._trigger_level <= value
+                        else:
+                            fired = prev > self._trigger_level >= value
+                        if fired:
+                            # Pause once the trigger point reaches mid-window
+                            self._trigger_countdown = len(self.plot_data[0]) // 2
+            elif self._trigger_countdown > 0:
+                self._trigger_countdown -= 1
+                if self._trigger_countdown <= 0:
+                    self._plot_paused = True
+                    self._trigger_armed = False
+                    self._trigger_countdown = -1
+                    self._update_pause_btn_style()
+                    self._position_overlay_buttons()
+                    return  # freeze with the trigger point centered
+
+        self._pending_rows.append(values)
+
+    def flush_plot(self):
+        """Push all queued samples into the plot buffers and redraw once.
+
+        Called from the ~30 fps display timer: one in-place array shift and one
+        setData per visible channel per frame, regardless of the sample rate.
+        Samples arrive either as numpy blocks (binary, fully vectorized) or as
+        rows (ASCII/frame); both are combined into one batch here.
+        """
+        if not self._pending_rows and not self._pending_blocks:
+            return
+        rows, self._pending_rows = self._pending_rows, []
+        blocks, self._pending_blocks = self._pending_blocks, []
+        if self.graphWidget is None or not self.plot_data:
             return
 
-        arr = self.plot_data[channel]
+        nch = len(self.plot_data)
+        n_points = len(self.plot_data[0])
 
-        # Trigger detection (only check on the trigger channel)
-        if (self._trigger_armed and self._trigger_countdown < 0
-                and channel == self._trigger_channel):
-            prev = self._trigger_prev_value
-            self._trigger_prev_value = value
-            if prev is not None:
-                fired = False
-                if self._trigger_edge == 'rising':
-                    fired = prev < self._trigger_level and value >= self._trigger_level
-                else:
-                    fired = prev > self._trigger_level and value <= self._trigger_level
-                if fired:
-                    self._trigger_countdown = len(arr) // 2
+        parts = []
+        if rows:
+            rb = np.full((len(rows), nch), np.nan)
+            for j, row in enumerate(rows):
+                m = min(len(row), nch)
+                rb[j, :m] = row[:m]
+            parts.append(rb)
+        for b in blocks:
+            if b.shape[1] == nch:
+                parts.append(b)
+            elif b.shape[1] > nch:
+                parts.append(b[:, :nch])  # extra channels in stream: clip
+            else:
+                pad = np.full((b.shape[0], nch), np.nan)  # fewer: NaN-pad
+                pad[:, :b.shape[1]] = b
+                parts.append(pad)
+        if not parts:
+            return
+        batch = parts[0] if len(parts) == 1 else np.vstack(parts)
 
-        # Decrement trigger countdown (per-sample on channel 0 to count once per sample set)
-        if self._trigger_countdown > 0 and channel == 0:
-            self._trigger_countdown -= 1
-            if self._trigger_countdown <= 0:
-                self._plot_paused = True
-                self._trigger_armed = False
-                self._trigger_countdown = -1
-                self._update_pause_btn_style()
-                self._position_overlay_buttons()
+        k = len(batch)
+        if k > n_points:
+            batch = batch[-n_points:]  # one flush delivered more than the window
+            k = n_points
 
-        arr[:-1] = arr[1:]
-        arr[-1] = value
-        self.plot_lines[channel].setData(arr)
+        # inf would collapse Y auto-range; render non-finite values as gaps.
+        # Runs on the size-capped batch (<= n_points rows), so it stays cheap.
+        if not np.isfinite(batch).all():
+            batch = np.where(np.isfinite(batch), batch, np.nan)
 
-        # Update FFT and math channels every 10 samples (count on channel 0)
-        if channel == 0:
-            if self._fft_widget is not None:
-                self._fft_update_counter += 1
-                if self._fft_update_counter >= 10:
-                    self._fft_update_counter = 0
-                    self._update_fft()
-            if self._math_lines:
-                self._math_update_counter += 1
-                if self._math_update_counter >= 10:
-                    self._math_update_counter = 0
-                    self._update_math_channels()
+        for i, arr in enumerate(self.plot_data):
+            if k >= n_points:
+                arr[:] = batch[:, i]
+            else:
+                arr[:-k] = arr[k:]
+                arr[-k:] = batch[:, i]
+            if i not in self.hidden_channels:
+                self.plot_lines[i].setData(arr)
+        self._plot_fill = min(n_points, self._plot_fill + k)
+
+        if self._math_lines:
+            self._update_math_channels()
+        if self._fft_widget is not None:
+            self._fft_update_counter += 1
+            if self._fft_update_counter >= 3:  # ~10 Hz is plenty for a spectrum
+                self._fft_update_counter = 0
+                self._update_fft()
 
     def _get_delimiter(self):
         """Return the active delimiter string, or None for auto-detect."""
@@ -1956,10 +2227,9 @@ class SerialDataView(QtWidgets.QWidget):
         fmt.setBackground(QColor('transparent'))
         cursor.mergeCharFormat(fmt)
         cursor.clearSelection()
-        # Find and highlight all matches
+        # Find and highlight all matches (background only, keep RX/TX colors)
         highlight_fmt = QtGui.QTextCharFormat()
         highlight_fmt.setBackground(QColor('#FFFF00'))
-        highlight_fmt.setForeground(QColor('#000000'))
         count = 0
         find_cursor = self.serialData.document().find(term)
         while not find_cursor.isNull():
@@ -1985,17 +2255,19 @@ class SerialDataView(QtWidgets.QWidget):
         self.search_bar.setVisible(vis)
         if vis:
             self.search_input.setFocus()
+        else:
+            self._clear_search()  # don't leave stale highlights behind
 
     def clear_button_Clicked(self):
         self.serialDataHex.clear()
         self.serialData.clear()
         self.convert_A_text.clear()
         self.convert_B_text.clear()
-        self._binary_reader.sync()
-        self._frame_reader.reset()
-        self._pending_cr = False
+        self.reset_stream_state()
         self._hex_col = 0
-        self.numberbuffer = []
+        monitor = self.window()
+        if hasattr(monitor, '_rx_buffer'):
+            monitor._rx_buffer.clear()
 
     def _on_mode_changed(self):
         """Show/hide controls based on data mode."""
@@ -2027,11 +2299,11 @@ class SerialDataView(QtWidgets.QWidget):
 
         self.serialData.clear()
         self.serialDataHex.clear()
-        self._binary_reader.sync()
-        self._frame_reader.reset()
-        self._pending_cr = False
+        self.reset_stream_state()
         self._hex_col = 0
-        self.numberbuffer = []
+        monitor = self.window()
+        if hasattr(monitor, '_rx_buffer'):
+            monitor._rx_buffer.clear()
 
         self._apply_reader_settings()
         self._save_settings()
@@ -2096,7 +2368,26 @@ class SerialDataView(QtWidgets.QWidget):
         except ValueError:
             pass
 
+        # Settings changed: leftover bytes from the old layout would misalign
+        self._binary_reader.sync()
         self._frame_reader.reset()
+
+        # Warn when a fixed frame can't hold a whole sample (decodes nothing)
+        if (self.data_mode.currentText() == 'Custom Frame'
+                and self._frame_reader.size_field == 'fixed'):
+            _, type_size = DATA_TYPES[dtype]
+            sample_size = nch * type_size
+            frame_size = self.frame_size_spin.value()
+            monitor = self.window()
+            if frame_size % sample_size != 0 and hasattr(monitor, 'statusText'):
+                detail = (f'sample size {sample_size} ({nch} ch x {type_size} B {dtype})')
+                if frame_size < sample_size:
+                    monitor.statusText.setText(
+                        f'Warning: frame size {frame_size} < {detail} - no samples will decode')
+                else:
+                    monitor.statusText.setText(
+                        f'Warning: frame size {frame_size} is not a multiple of {detail} - '
+                        f'trailing bytes are ignored')
 
     def _get_settings_dict(self):
         """Build the current settings as a dict."""
@@ -2131,13 +2422,22 @@ class SerialDataView(QtWidgets.QWidget):
         }
 
     def _save_settings(self, path=None):
-        """Persist settings via parent SerialMonitor (saves everything to one file)."""
+        """Persist settings via parent SerialMonitor (debounced unless a path is given)."""
         monitor = self.window()
-        if hasattr(monitor, 'save_all_settings'):
-            monitor.save_all_settings(path)
+        if path is not None:
+            if hasattr(monitor, 'save_all_settings'):
+                monitor.save_all_settings(path)
+        elif hasattr(monitor, 'schedule_save'):
+            monitor.schedule_save()
 
     def _load_plot_settings(self, s):
         """Restore plot/decode settings from a dict (subsection of full settings)."""
+        # If a plot is currently visible (File > Load Settings), tear it down
+        # first so it is rebuilt below with the loaded channel count/Pts/colors
+        # instead of staying stale.
+        if self.graph_mode.isChecked():
+            self.graph_mode.setChecked(False)
+
         widgets = [self.data_mode, self.type_combo, self.endian_combo,
                    self.graph_channels, self.plot_length_spin,
                    self.delimiter_combo, self.delimiter_custom,
@@ -2154,8 +2454,9 @@ class SerialDataView(QtWidgets.QWidget):
             self.delimiter_combo.setCurrentText(s.get('delimiter', 'Auto'))
             self.delimiter_custom.setText(s.get('delimiter_custom', ''))
 
-            # Load channel properties BEFORE enabling the graph so that
-            # graph_state_changed() sees the correct names/colors/axes/hidden.
+            # Load channel properties AND axis ranges BEFORE enabling the graph
+            # so that graph_state_changed() sees the correct names/colors/axes/
+            # hidden set and restores the saved manual Y range.
             saved_names = s.get('channel_names', {})
             self.channel_names = {int(k): v for k, v in saved_names.items()}
             saved_colors = s.get('channel_colors', {})
@@ -2164,12 +2465,21 @@ class SerialDataView(QtWidgets.QWidget):
             self.channel_axes = {int(k): v for k, v in saved_axes.items()}
             self.hidden_channels = set(s.get('hidden_channels', []))
 
-            self.graph_mode.setChecked(s.get('show_plot', False))
-            self._fft_check.setChecked(s.get('show_fft', False))
-
             self._y_auto_scale = s.get('y_auto_scale', True)
             self._y_min = s.get('y_min', -1.0)
             self._y_max = s.get('y_max', 1.0)
+
+            # Math channels must be known before the graph is created
+            saved_math = s.get('math_channels', [])
+            if isinstance(saved_math, list):
+                self._math_channels = [
+                    {'name': m.get('name', ''), 'expression': m.get('expression', '')}
+                    for m in saved_math
+                    if isinstance(m, dict) and m.get('expression', '').strip()
+                ]
+
+            self._fft_check.setChecked(s.get('show_fft', False))
+            self.graph_mode.setChecked(s.get('show_plot', False))
 
             frame = s.get('frame', {})
             binary = s.get('binary', {})
@@ -2184,16 +2494,7 @@ class SerialDataView(QtWidgets.QWidget):
             self.size_field_combo.setCurrentText(sf_map.get(sf, 'Fixed'))
             self.frame_size_spin.setValue(frame.get('frame_size', 12))
             self.checksum_check.setChecked(frame.get('checksum', False))
-
-            # Math channels
-            saved_math = s.get('math_channels', [])
-            if isinstance(saved_math, list):
-                self._math_channels = [
-                    {'name': m.get('name', ''), 'expression': m.get('expression', '')}
-                    for m in saved_math
-                    if isinstance(m, dict) and m.get('expression', '').strip()
-                ]
-        except (KeyError, TypeError):
+        except (KeyError, TypeError, ValueError, AttributeError):
             pass
 
         for w in widgets:
@@ -2203,6 +2504,15 @@ class SerialDataView(QtWidgets.QWidget):
         self.frame_size_spin.setEnabled(self.size_field_combo.currentText().startswith('Fixed'))
         self.delimiter_custom.setVisible(self.delimiter_combo.currentText() == 'Other')
         self._on_mode_changed()
+
+    def reset_stream_state(self):
+        """Drop partial decode/parse state (new connection or mode change)."""
+        self._binary_reader.sync()
+        self._frame_reader.reset()
+        self._pending_cr = False
+        self._ascii_line_buffer = ''
+        self._pending_rows = []
+        self._pending_blocks = []
 
     def handleReceivedData(self, raw_bytes):
         """Route incoming serial bytes based on current data mode."""
@@ -2215,56 +2525,104 @@ class SerialDataView(QtWidgets.QWidget):
 
         # Binary/Frame modes: always show raw HEX
         self._append_hex_view(raw_bytes)
+        plotting = self.graph_mode.isChecked() and self.graphWidget is not None
 
-        # Decode through appropriate reader
         if mode == 'Binary Stream':
-            samples = self._binary_reader.feed(raw_bytes)
+            # Fully vectorized decode -> numpy block, no per-sample Python.
+            block = self._binary_reader.feed_np(raw_bytes)
+            if block is None or len(block) == 0:
+                return
+            self._append_decoded_arr(block)
+            if plotting:
+                if self._trigger_enabled:
+                    # Trigger needs per-sample evaluation; use the row path
+                    for row in block:
+                        self._ingest_row(row.tolist())
+                else:
+                    self._pending_blocks.append(block)
         else:
             samples = self._frame_reader.feed(raw_bytes)
+            if not samples:
+                return
+            self._append_decoded_lines(samples)
+            if plotting:
+                for sample in samples:
+                    self._ingest_row([float(v) for v in sample])
 
-        # Display decoded values and feed plot
-        for sample in samples:
-            self._append_decoded_line(sample)
-            if self.graph_mode.isChecked() and self.graphWidget is not None:
-                for i, val in enumerate(sample):
-                    self._append_data_point(float(val), i)
+    def _format_hex(self, raw_bytes):
+        """Format bytes as space-separated uppercase pairs, 16 per line.
+
+        Uses and updates self._hex_col so chunks of any size continue the
+        current line correctly (with a separating space) and a newline is
+        emitted as soon as a line completes — chunk boundaries never merge
+        pairs or glue rows together.
+        """
+        hex_str = raw_bytes.hex().upper()
+        pairs = [hex_str[i:i + 2] for i in range(0, len(hex_str), 2)]
+        out = []
+        col = self._hex_col
+        i = 0
+        while i < len(pairs):
+            take = pairs[i:i + 16 - col]
+            if col > 0:
+                out.append(' ')
+            out.append(' '.join(take))
+            col += len(take)
+            i += len(take)
+            if col >= 16:
+                out.append('\n')
+                col = 0
+        self._hex_col = col
+        return ''.join(out)
+
+    def _insert_colored_text(self, text_edit, text, color):
+        """Append text at the end without disturbing user selection or scroll.
+
+        Uses a standalone cursor (so an active user selection survives) with an
+        explicit format (so new text never inherits a search highlight), and
+        only auto-scrolls when the view was already at the bottom.
+        """
+        sb = text_edit.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 4
+        fmt = QtGui.QTextCharFormat()
+        fmt.setForeground(color)
+        fmt.setBackground(QtGui.QBrush(QtCore.Qt.transparent))
+        fmt.setFontFamily('Segoe UI')
+        cursor = QTextCursor(text_edit.document())
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(text, fmt)
+        self._trim_text_buffer(text_edit)
+        if at_bottom:
+            sb.setValue(sb.maximum())
+
+    def _insert_html(self, text_edit, html_text):
+        """Append HTML at the end; same selection/scroll behavior as above."""
+        sb = text_edit.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 4
+        cursor = QTextCursor(text_edit.document())
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertHtml(html_text)
+        self._trim_text_buffer(text_edit)
+        if at_bottom:
+            sb.setValue(sb.maximum())
+
+    # ~120 KB/s worth of bytes per 33 ms flush. Normal serial (<=921600 baud
+    # = ~92 KB/s) never hits this; only multi-MB/s USB-CDC streams do, where
+    # formatting every byte to hex (only to have it trimmed) would dominate.
+    HEX_VIEW_MAX_BYTES_PER_FLUSH = 4096
 
     def _append_hex_view(self, raw_bytes):
         """Append raw bytes to the HEX text view (right panel)."""
-        self.serialDataHex.moveCursor(QtGui.QTextCursor.End)
-        self.serialDataHex.setFontFamily('Segoe UI')
-        self.serialDataHex.setTextColor(QtGui.QColor(255, 0, 0))
-
-        hex_str = raw_bytes.hex().upper()
-        lastLength = self._hex_col
-
-        pairs = [hex_str[i:i+2] for i in range(0, len(hex_str), 2)]
-        append_lists = []
-        if lastLength > 0 and lastLength < 16:
-            t = pairs[:16 - lastLength]
-            pairs = pairs[16 - lastLength:]
-            line = ' '.join(t)
-            if pairs:
-                line += '\n'
-                self._hex_col = 0
-            else:
-                self._hex_col = lastLength + len(t)
-            append_lists.append(line)
-
-        for i in range(0, len(pairs), 16):
-            chunk = pairs[i:i+16]
-            line = ' '.join(chunk)
-            if i + 16 < len(pairs):
-                line += '\n'
-                self._hex_col = 0
-            else:
-                self._hex_col = len(chunk)
-            append_lists.append(line)
-
-        for text in append_lists:
-            self.serialDataHex.insertPlainText(text)
-        self.serialDataHex.moveCursor(QtGui.QTextCursor.End)
-        self._trim_text_buffer(self.serialDataHex)
+        if len(raw_bytes) > self.HEX_VIEW_MAX_BYTES_PER_FLUSH:
+            dropped = len(raw_bytes) - self.HEX_VIEW_MAX_BYTES_PER_FLUSH
+            raw_bytes = raw_bytes[-self.HEX_VIEW_MAX_BYTES_PER_FLUSH:]
+            self._hex_col = 0
+            self._insert_colored_text(
+                self.serialDataHex,
+                f'... [{dropped} bytes not shown - stream too fast for hex view] ...\n',
+                QtGui.QColor(128, 128, 128))
+        self._insert_colored_text(
+            self.serialDataHex, self._format_hex(raw_bytes), QtGui.QColor(255, 0, 0))
 
     def _trim_text_buffer(self, text_edit, max_lines=MAX_TEXT_LINES):
         """Remove oldest lines if text exceeds max_lines."""
@@ -2274,40 +2632,70 @@ class SerialDataView(QtWidgets.QWidget):
             excess = doc.blockCount() - max_lines
             for _ in range(excess):
                 cursor.movePosition(QTextCursor.NextBlock, QTextCursor.KeepAnchor)
+            # Selection ends at the start of the first surviving block, so the
+            # removed blocks' newlines go with them — nothing extra to delete.
             cursor.removeSelectedText()
-            cursor.deleteChar()  # remove the leftover newline
 
-    def _append_decoded_line(self, sample):
-        """Append one decoded sample to the left panel with color-coded channels."""
-        self.serialData.moveCursor(QtGui.QTextCursor.End)
-        self.serialData.setFontFamily('Segoe UI')
-        for i, val in enumerate(sample):
-            color = QColor(self._channel_color(i))
-            self.serialData.setTextColor(color)
-            name = self._channel_name(i)
-            if isinstance(val, float):
-                text = f'{name}: {val:.4f}'
-            else:
-                text = f'{name}: {val}'
-            if i < len(sample) - 1:
-                text += '  '
-            self.serialData.insertPlainText(text)
-        self.serialData.setTextColor(QtGui.QColor(255, 0, 0))
-        self.serialData.insertPlainText('\n')
-        self.serialData.moveCursor(QtGui.QTextCursor.End)
-        self._trim_text_buffer(self.serialData)
+    MAX_DECODED_LINES_PER_FLUSH = 100
+    MAX_DECODED_CELLS_PER_FLUSH = 600  # rows x channels budget per flush
+
+    def _decoded_row_cap(self, nch):
+        """How many rows to render this flush, bounded by a cell budget so the
+        HTML cost stays flat regardless of channel count."""
+        if nch <= 0:
+            return self.MAX_DECODED_LINES_PER_FLUSH
+        return max(10, min(self.MAX_DECODED_LINES_PER_FLUSH,
+                           self.MAX_DECODED_CELLS_PER_FLUSH // nch))
+
+    def _append_decoded_lines(self, samples):
+        """Append decoded samples to the left panel as one batched HTML insert."""
+        nch = max((len(s) for s in samples), default=0)
+        cap = self._decoded_row_cap(nch)
+        skipped = 0
+        if len(samples) > cap:
+            skipped = len(samples) - cap
+            samples = samples[-cap:]
+        names = [html.escape(self._channel_name(i)) for i in range(nch)]
+        colors = [self._channel_color(i) for i in range(nch)]
+        lines = []
+        if skipped:
+            lines.append(f'<span style="color:#888888"><i>... {skipped} samples not shown</i></span>')
+        for sample in samples:
+            parts = []
+            for i, val in enumerate(sample):
+                text = f'{names[i]}: {val:.4f}' if isinstance(val, float) else f'{names[i]}: {val}'
+                parts.append(f'<span style="color:{colors[i]}">{text}</span>')
+            lines.append('&nbsp; '.join(parts))
+        self._insert_html(self.serialData, '<br>'.join(lines) + '<br>')
+
+    def _append_decoded_arr(self, block):
+        """Append a numpy (n, nch) decoded block to the left panel.
+
+        Only the last MAX_DECODED_LINES_PER_FLUSH rows are formatted -- at high
+        sample rates nobody can read more, and formatting every row would
+        re-introduce a per-sample cost in the hot path.
+        """
+        n = len(block)
+        nch = block.shape[1]
+        cap = self._decoded_row_cap(nch)
+        skipped = 0
+        if n > cap:
+            skipped = n - cap
+            block = block[-cap:]
+        names = [html.escape(self._channel_name(i)) for i in range(nch)]
+        colors = [self._channel_color(i) for i in range(nch)]
+        lines = []
+        if skipped:
+            lines.append(f'<span style="color:#888888"><i>... {skipped} samples not shown</i></span>')
+        for row in block.tolist():
+            parts = [f'<span style="color:{colors[i]}">{names[i]}: {row[i]:.4f}</span>'
+                     for i in range(nch)]
+            lines.append('&nbsp; '.join(parts))
+        self._insert_html(self.serialData, '<br>'.join(lines) + '<br>')
 
     def appendSerialText(self, appendText, direction, mode="ASCII"):
-        if direction == "send":
-            self.textcolor = QtGui.QColor(0, 0, 255)
-        else:
-            self.textcolor = QtGui.QColor(255, 0, 0)
-        self.serialData.moveCursor(QtGui.QTextCursor.End)
-        self.serialData.setFontFamily('Segoe UI')
-        self.serialData.setTextColor(self.textcolor)
-        self.serialDataHex.moveCursor(QtGui.QTextCursor.End)
-        self.serialDataHex.setFontFamily('Segoe UI')
-        self.serialDataHex.setTextColor(self.textcolor)
+        is_send = direction == "send"
+        color = QtGui.QColor(0, 0, 255) if is_send else QtGui.QColor(255, 0, 0)
 
         # QTextEdit treats BOTH '\r' and '\n' as paragraph separators, so a
         # CRLF stream renders with a blank line between each message. Keep
@@ -2316,79 +2704,53 @@ class SerialDataView(QtWidgets.QWidget):
         # split across two reads, so we also carry a _pending_cr flag that
         # swallows a leading '\n' when the previous chunk ended in '\r'.
         displayText = appendText.replace('\r\n', '\n').replace('\r', '\n')
-        if direction == "send":
+        if is_send:
             self._pending_cr = False
         else:
             if self._pending_cr and displayText.startswith('\n'):
                 displayText = displayText[1:]
             self._pending_cr = appendText.endswith('\r')
 
-        lastLength = self._hex_col
-
-        appendLists = []
-        splitedByTwoChar = re.split('(..)', appendText.encode().hex())[1::2]
-        num_new_pairs = len(splitedByTwoChar)
-        if lastLength > 0:
-            t = splitedByTwoChar[: 16 - lastLength] + ['\n']
-            appendLists.append(' '.join(t))
-            splitedByTwoChar = splitedByTwoChar[16 - lastLength:]
-
-        appendLists += [' '.join(splitedByTwoChar[i * 16: (i + 1) * 16] + ['\n'])
-                        for i in range(math.ceil(len(splitedByTwoChar) / 16))]
-
-        if appendLists and len(appendLists[-1]) < 47:
-            appendLists[-1] = appendLists[-1][:-1]
-
-        if direction == "send":
-            if mode == 'HEX':
-                try:
-                    decoded = bytes.fromhex(appendText).decode('ISO-8859-1')
-                    decoded = decoded.replace('\r\n', '\n').replace('\r', '\n')
-                    self.serialData.insertPlainText(decoded)
-                except ValueError:
-                    self.serialData.insertPlainText(displayText)
-                self.serialDataHex.insertPlainText(appendText.upper())
-                # HEX send inserts raw hex chars without line formatting
-                sent_pairs = len(appendText) // 2
-                self._hex_col = (lastLength + sent_pairs) % 16
-            elif mode == 'ASCII':
-                self.serialData.insertPlainText(displayText)
-                for insertText in appendLists:
-                    self.serialDataHex.insertPlainText(insertText.upper())
-                # Update _hex_col from appendLists (line-wrapped hex pairs)
-                self._hex_col = (lastLength + num_new_pairs) % 16
-            elif mode == 'BINARY':
-                self.serialData.insertPlainText(displayText)
-                try:
-                    hex_val = format(int(appendText, 2), 'X')
-                    if len(hex_val) % 2:
-                        hex_val = '0' + hex_val
-                    self.serialDataHex.insertPlainText(hex_val)
-                    sent_pairs = len(hex_val) // 2
-                    self._hex_col = (lastLength + sent_pairs) % 16
-                except ValueError:
-                    self.serialDataHex.insertPlainText(appendText)
+        # Recover the raw bytes so the HEX pane shows what actually went over
+        # the wire (ISO-8859-1 mirrors bytes 1:1; re-encoding as UTF-8 would
+        # corrupt every byte >= 0x80).
+        ascii_text = displayText
+        if is_send and mode == 'HEX':
+            try:
+                raw = bytes.fromhex(appendText)
+                ascii_text = raw.decode('ISO-8859-1').replace('\r\n', '\n').replace('\r', '\n')
+            except ValueError:
+                raw = appendText.encode('ISO-8859-1', 'replace')
+        elif is_send and mode == 'BINARY':
+            try:
+                bits = appendText.replace(' ', '')
+                raw = int(bits, 2).to_bytes(max(1, (len(bits) + 7) // 8), 'big')
+            except (ValueError, OverflowError):
+                raw = appendText.encode('ISO-8859-1', 'replace')
         else:
-            for insertText in appendLists:
-                self.serialDataHex.insertPlainText(insertText.upper())
-            self.serialData.insertPlainText(displayText)
-            # Update _hex_col from appendLists (line-wrapped hex pairs)
-            self._hex_col = (lastLength + num_new_pairs) % 16
+            raw = appendText.encode('ISO-8859-1', 'replace')
 
-            if self.graph_mode.isChecked() and self.graphWidget is not None:
-                for char in displayText:
-                    if char == '\n':
-                        values = self._parse_plot_values(''.join(self.numberbuffer))
-                        for i, val in enumerate(values):
-                            self._append_data_point(val, i)
-                        self.numberbuffer = []
-                    else:
-                        self.numberbuffer.append(char)
+        self._insert_colored_text(self.serialData, ascii_text, color)
+        if raw:
+            # One shared formatter for RX and TX keeps hex column tracking consistent
+            self._insert_colored_text(self.serialDataHex, self._format_hex(raw), color)
 
-        self.serialData.moveCursor(QtGui.QTextCursor.End)
-        self.serialDataHex.moveCursor(QtGui.QTextCursor.End)
-        self._trim_text_buffer(self.serialData)
-        self._trim_text_buffer(self.serialDataHex)
+        # Feed the plot from complete received lines
+        if not is_send and self.graph_mode.isChecked() and self.graphWidget is not None:
+            combined = self._ascii_line_buffer + displayText
+            lines = combined.split('\n')
+            # Cap the partial-line carry so a newline-free stream can't grow it forever
+            self._ascii_line_buffer = lines[-1][-4096:]
+            nch = len(self.plot_data)
+            for line in lines[:-1]:
+                values = self._parse_plot_values(line)
+                if not values:
+                    continue
+                row = values[:nch]
+                if len(row) < nch:
+                    # Pad so all channels advance together and stay time-aligned
+                    row = row + [float('nan')] * (nch - len(row))
+                self._ingest_row(row)
 
 
 # Horizontal separator line
@@ -2567,6 +2929,17 @@ class MacroEditDialog(QtWidgets.QDialog):
         # Initialize ASCII and Decimal fields from the hex data
         self._sync_from('hex')
 
+    def accept(self):
+        """Refuse to save an invalid hex payload (it would fail silently on send)."""
+        try:
+            bytes.fromhex(self.hex_edit.text())
+        except ValueError:
+            QtWidgets.QMessageBox.warning(
+                self, 'Invalid Macro',
+                'The hex payload is not valid. Fix it or cancel.')
+            return
+        super().accept()
+
     def _mode_changed(self, index):
         self.input_stack.setCurrentIndex(index)
 
@@ -2718,7 +3091,7 @@ class SerialSendView(QtWidgets.QWidget):
         if event.type() == QtCore.QEvent.KeyPress and obj is self.sendData:
             if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter) and self.sendData.hasFocus():
                 self.serialSendSignal.emit(self.sendData.toPlainText())
-                self.history.append(self.sendData.toPlainText())
+                self._record_history(self.sendData.toPlainText())
                 self.sendData.clear()
                 self.history_index = 0
                 return True
@@ -2752,9 +3125,16 @@ class SerialSendView(QtWidgets.QWidget):
         self.charMode.setCurrentIndex(oldmode)
         self.lineEnding.setCurrentIndex(oldending)
 
+    def _record_history(self, text):
+        """Add a sent command to history, skipping blanks and repeats."""
+        if text and (not self.history or self.history[-1] != text):
+            self.history.append(text)
+            if len(self.history) > 200:
+                del self.history[:-200]
+
     def sendButtonClicked(self):
         self.serialSendSignal.emit(self.sendData.toPlainText())
-        self.history.append(self.sendData.toPlainText())
+        self._record_history(self.sendData.toPlainText())
         self.sendData.clear()
         self.history_index = 0
 
@@ -2783,10 +3163,10 @@ class SerialSendView(QtWidgets.QWidget):
         return [dict(m) for m in DEFAULT_MACROS]
 
     def _save_macros(self):
-        """Persist macros via parent SerialMonitor."""
+        """Persist macros via parent SerialMonitor (debounced)."""
         monitor = self.window()
-        if hasattr(monitor, 'save_all_settings'):
-            monitor.save_all_settings()
+        if hasattr(monitor, 'schedule_save'):
+            monitor.schedule_save()
 
 
 class ToolBar(QtWidgets.QToolBar):
@@ -2859,6 +3239,7 @@ class ToolBar(QtWidgets.QToolBar):
         self.addWidget(self._flowControl)
 
     def _populate_ports(self):
+        previous = self.portNames.currentData()
         self.portNames.clear()
         for port in QSerialPortInfo().availablePorts():
             name = port.portName()
@@ -2871,6 +3252,11 @@ class ToolBar(QtWidgets.QToolBar):
             if vid or pid:
                 label += f'  [{vid:04X}:{pid:04X}]'
             self.portNames.addItem(label, name)
+        # Keep the previously selected port selected if it is still present
+        if previous:
+            idx = self.portNames.findData(previous)
+            if idx >= 0:
+                self.portNames.setCurrentIndex(idx)
 
     def scan_button_Clicked(self):
         self._populate_ports()
@@ -2910,7 +3296,8 @@ if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
     app.setWindowIcon(QIcon(create_connector_pixmap('#22bb22')))
     window = SerialMonitor()
-    screen = app.primaryScreen().availableGeometry()
-    window.resize(screen.width() * 8 // 15, screen.height() * 3 // 5)
+    if not window._geometry_restored:
+        screen = app.primaryScreen().availableGeometry()
+        window.resize(screen.width() * 8 // 15, screen.height() * 3 // 5)
     window.show()
     app.exec()
