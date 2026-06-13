@@ -40,6 +40,10 @@ A professional serial terminal with dual ASCII/HEX view, real-time plotting, bin
   any real serial baud rate
 - Dual Y-axes: right-click a legend entry to move a channel to Y2 (dashed)
 - Per-channel show/hide toggle checkboxes below the plot
+- Per-channel scale / offset / unit (right-click a legend entry): plotted
+  value = raw x scale + offset, with the unit shown in the legend and crosshair
+- Time-based X-axis ("Time X" checkbox): label the axis in seconds using the
+  measured sample rate, instead of the sample index
 - Math/computed channels with numpy expressions (e.g. `ch0 * ch1`);
   expressions are validated against a whitelist and compiled once
 - FFT frequency spectrum view (Hann window, amplitude-normalized)
@@ -64,7 +68,8 @@ A professional serial terminal with dual ASCII/HEX view, real-time plotting, bin
 | Tab | `1.0\t2.0\t3.0` |
 | Other | User-defined custom delimiter |
 
-Supports labeled values (e.g., `temp:23.5,hum:45.2`).
+Supports labeled values (e.g., `temp:23.5,hum:45.2`). A non-numeric or empty
+field is plotted as a gap so the remaining values stay on their own channels.
 
 **Binary Stream** -- Decodes continuous raw binary data.
 
@@ -152,9 +157,29 @@ This creates `dist/AxxTerm.exe`. Copy it anywhere and run.
 | File | Description |
 |------|-------------|
 | `AxxTerm.py` | Main application (single-file, self-contained) |
+| `tests/test_axxterm.py` | Headless tests (decoders, parsing, plot path, settings) |
 | `requirements.txt` | Python dependencies |
 | `AxxTerm_GUI.PNG` | Screenshot |
 | `LICENSE` | MIT License |
+
+## Running Tests
+
+The tests run headless via Qt's offscreen platform (no display needed) and use
+a throwaway settings file:
+
+```bash
+QT_QPA_PLATFORM=offscreen python tests/test_axxterm.py
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:QT_QPA_PLATFORM = "offscreen"; python tests/test_axxterm.py
+```
+
+They cover the binary/frame/ASCII decoders (including chunk boundaries and
+resync), the hex formatter, the math-expression sandbox, per-channel
+scale/offset, the time-axis sample-rate measurement, and a settings round-trip.
 
 ## Settings File Format
 
@@ -175,7 +200,11 @@ This creates `dist/AxxTerm.exe`. Copy it anywhere and run.
     "channel_names": {},
     "channel_colors": {},
     "channel_axes": {},
+    "channel_scale": {},
+    "channel_offset": {},
+    "channel_units": {},
     "hidden_channels": [],
+    "x_time_mode": false,
     "y_auto_scale": true,
     "math_channels": [],
     "binary": { "data_type": "float32", "endianness": "little" },

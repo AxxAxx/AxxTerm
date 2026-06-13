@@ -6,6 +6,7 @@ import math
 import struct
 import os
 import json
+import time
 from datetime import datetime
 from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
@@ -939,7 +940,12 @@ class SerialDataView(QtWidgets.QWidget):
         self.channel_names = {}   # {index: 'custom name'} for renamed channels
         self.channel_colors = {}  # {index: '#hex'} for custom channel colors
         self.channel_axes = {}    # {index: 1 or 2} axis assignment (1=left, 2=right)
+        self.channel_scale = {}   # {index: float} gain applied to plotted value
+        self.channel_offset = {}  # {index: float} offset added after gain
+        self.channel_units = {}   # {index: 'unit'} shown in legend/crosshair
         self.hidden_channels = set()  # set of channel indices toggled off
+        self._scale_vec = None    # cached (nch,) scale array; None until built
+        self._offset_vec = None
         self._graph_container = None
         self._channel_toggle_bar = None
         self._y2_viewbox = None
@@ -967,6 +973,15 @@ class SerialDataView(QtWidgets.QWidget):
 
         self._binary_reader = BinaryStreamReader()
         self._frame_reader = FrameReader()
+
+        # X-axis time mode: when enabled, the bottom axis is relabeled in
+        # seconds using a measured sample rate (samples are still stored by
+        # index; only the axis tick scale changes, so nothing in the data path
+        # or crosshair logic has to change).
+        self._x_time_mode = False
+        self._x_sample_total = 0      # samples since the last clear/start
+        self._x_start_time = None     # monotonic time of first sample
+        self._x_rate = 0.0            # measured samples/sec
 
         # Pause / Trigger state
         self._plot_paused = False
@@ -1006,6 +1021,13 @@ class SerialDataView(QtWidgets.QWidget):
         self._fft_check.setFont(QtGui.QFont('Segoe UI', 10))
         self._fft_check.stateChanged.connect(self._fft_state_changed)
         self._fft_check.stateChanged.connect(lambda: self._save_settings())
+
+        self._time_axis_check = QCheckBox("Time X")
+        self._time_axis_check.setFont(QtGui.QFont('Segoe UI', 10))
+        self._time_axis_check.setToolTip(
+            'Label the X axis in seconds using the measured sample rate\n'
+            '(instead of the sample index)')
+        self._time_axis_check.toggled.connect(self.set_x_time_mode)
 
         self.graph_channels = QSpinBox(minimum=1, maximum=12, value=4, prefix="Ch: ")
         self.graph_channels.setFont(QtGui.QFont('Segoe UI', 10))
@@ -1216,6 +1238,7 @@ class SerialDataView(QtWidgets.QWidget):
         cl.addWidget(self.plot_length_spin)
         cl.addWidget(self.graph_mode)
         cl.addWidget(self._fft_check)
+        cl.addWidget(self._time_axis_check)
 
         # Vertical splitter: graph (top) | data views (bottom)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
@@ -1271,9 +1294,35 @@ class SerialDataView(QtWidgets.QWidget):
         """Return custom name for a channel, or default 'Ch N'."""
         return self.channel_names.get(index, f'Ch {index}')
 
+    def _channel_display(self, index):
+        """Channel name with its unit suffix, e.g. 'Voltage (V)'. Used for
+        legend and crosshair; the bare name is kept for CSV headers/renames."""
+        name = self._channel_name(index)
+        unit = self.channel_units.get(index, '')
+        return f'{name} ({unit})' if unit else name
+
     def _channel_color(self, index):
         """Return custom color for a channel, or default from PLOT_COLORS."""
         return self.channel_colors.get(index, PLOT_COLORS[index % len(PLOT_COLORS)])
+
+    def _invalidate_scale_cache(self):
+        """Force the scale/offset vectors to rebuild on the next flush."""
+        self._scale_vec = None
+        self._offset_vec = None
+
+    def _build_scale_vectors(self, nch):
+        """Build (or reuse) the per-channel scale/offset arrays for nch channels."""
+        if (self._scale_vec is not None and len(self._scale_vec) == nch):
+            return self._scale_vec, self._offset_vec
+        if not self.channel_scale and not self.channel_offset:
+            self._scale_vec = None
+            self._offset_vec = None
+            return None, None
+        self._scale_vec = np.array(
+            [self.channel_scale.get(i, 1.0) for i in range(nch)], dtype=np.float64)
+        self._offset_vec = np.array(
+            [self.channel_offset.get(i, 0.0) for i in range(nch)], dtype=np.float64)
+        return self._scale_vec, self._offset_vec
 
     def _create_channel_toggle_bar(self):
         """Create a horizontal bar of channel toggle checkboxes below the graph."""
@@ -1334,7 +1383,7 @@ class SerialDataView(QtWidgets.QWidget):
             legend.clear()
             for i, line in enumerate(self.plot_lines):
                 if i not in self.hidden_channels:
-                    legend.addItem(line, self._channel_name(i))
+                    legend.addItem(line, self._channel_display(i))
             for i, mch in enumerate(self._math_channels):
                 if i < len(self._math_lines):
                     legend.addItem(self._math_lines[i], mch.get('name', f'Math {i}'))
@@ -1404,6 +1453,8 @@ class SerialDataView(QtWidgets.QWidget):
         self._plot_fill = 0
         self._pending_rows = []
         self._pending_blocks = []
+        self._invalidate_scale_cache()
+        self._reset_sample_rate()
         for i in range(n):
             color = self._channel_color(i)
             # NaN-prefilled: curves start empty instead of as a flat zero line
@@ -1424,7 +1475,7 @@ class SerialDataView(QtWidgets.QWidget):
             # Add visible channels to legend; apply visibility
             visible = i not in self.hidden_channels
             if self.graphWidget.plotItem.legend is not None and visible:
-                self.graphWidget.plotItem.legend.addItem(line, self._channel_name(i))
+                self.graphWidget.plotItem.legend.addItem(line, self._channel_display(i))
             line.setVisible(visible)
             line.setData(arr)
             self.plot_lines.append(line)
@@ -1526,6 +1577,7 @@ class SerialDataView(QtWidgets.QWidget):
             self.splitter.insertWidget(0, self._graph_container)
             self._position_overlay_buttons()
             self._update_graph_theme()
+            self._apply_x_axis_scale()  # honor saved time-axis mode
             # Restore the FFT view if its checkbox is on (e.g. from saved settings)
             if self._fft_check.isChecked() and self._fft_widget is None:
                 self._create_fft_widget()
@@ -1560,6 +1612,7 @@ class SerialDataView(QtWidgets.QWidget):
         self._plot_fill = 0
         self._pending_rows = []
         self._pending_blocks = []
+        self._reset_sample_rate()
         for arr, line in zip(self.plot_data, self.plot_lines):
             arr[:] = np.nan
             line.setData(arr)
@@ -1719,14 +1772,14 @@ class SerialDataView(QtWidgets.QWidget):
         for i, arr in enumerate(self.plot_data):
             if i in self.hidden_channels:
                 continue
-            name = self._channel_name(i)
+            name = html.escape(self._channel_display(i))
             color = self._channel_color(i)
             val = arr[x_idx]
             val_str = f'{val:.4f}' if math.isfinite(val) else '—'
             parts.append(f'<span style="color:{color}"><b>{name}</b>: {val_str}</span>')
         for i, (mch, arr) in enumerate(zip(self._math_channels, self._math_data)):
             color = self._math_channel_color(i)
-            name = mch.get('name', f'Math {i}')
+            name = html.escape(mch.get('name', f'Math {i}'))
             if x_idx < len(arr):
                 val = arr[x_idx]
                 val_str = f'{val:.4f}' if math.isfinite(val) else '—'
@@ -1785,6 +1838,7 @@ class SerialDataView(QtWidgets.QWidget):
         menu = QtWidgets.QMenu(self)
         rename_action = menu.addAction('Rename...')
         color_action = menu.addAction('Change Color...')
+        scale_action = menu.addAction('Scale / Offset / Units...')
         # Y-axis toggle
         current_axis = self.channel_axes.get(channel_index, 1)
         if current_axis == 1:
@@ -1794,7 +1848,9 @@ class SerialDataView(QtWidgets.QWidget):
         reset_action = menu.addAction('Reset to Default')
 
         action = menu.exec_(QtGui.QCursor.pos())
-        if action == axis_action:
+        if action == scale_action:
+            self._edit_channel_scale(channel_index, label)
+        elif action == axis_action:
             new_axis = 2 if current_axis == 1 else 1
             if new_axis == 1:
                 self.channel_axes.pop(channel_index, None)
@@ -1807,7 +1863,7 @@ class SerialDataView(QtWidgets.QWidget):
                 self, 'Rename Channel', f'Channel {channel_index} name:', text=current)
             if ok and new_name.strip():
                 self.channel_names[channel_index] = new_name.strip()
-                label.setText(new_name.strip())
+                label.setText(self._channel_display(channel_index))
                 self._rebuild_channel_toggles()
                 self._save_settings()
         elif action == color_action:
@@ -1828,6 +1884,10 @@ class SerialDataView(QtWidgets.QWidget):
             self.channel_names.pop(channel_index, None)
             self.channel_colors.pop(channel_index, None)
             self.channel_axes.pop(channel_index, None)
+            self.channel_scale.pop(channel_index, None)
+            self.channel_offset.pop(channel_index, None)
+            self.channel_units.pop(channel_index, None)
+            self._invalidate_scale_cache()
             if was_y2:
                 # Axis changed, need full rebuild
                 self._on_channels_changed()
@@ -1840,6 +1900,53 @@ class SerialDataView(QtWidgets.QWidget):
                 sample.update()
                 self._rebuild_channel_toggles()
                 self._save_settings()
+
+    def _edit_channel_scale(self, channel_index, label):
+        """Prompt for per-channel gain, offset, and unit; apply to the plot."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f'Channel {channel_index}: Scale / Offset / Units')
+        form = QtWidgets.QFormLayout(dlg)
+        scale_edit = QtWidgets.QLineEdit(str(self.channel_scale.get(channel_index, 1.0)))
+        offset_edit = QtWidgets.QLineEdit(str(self.channel_offset.get(channel_index, 0.0)))
+        unit_edit = QtWidgets.QLineEdit(self.channel_units.get(channel_index, ''))
+        unit_edit.setPlaceholderText('e.g. V, °C, rpm')
+        hint = QtWidgets.QLabel('Plotted value = raw x scale + offset')
+        hint.setStyleSheet('color: #888;')
+        form.addRow('Scale (gain):', scale_edit)
+        form.addRow('Offset:', offset_edit)
+        form.addRow('Unit:', unit_edit)
+        form.addRow(hint)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        try:
+            scale = float(scale_edit.text())
+            offset = float(offset_edit.text())
+        except ValueError:
+            self.window().statusText.setText('Scale/offset must be numbers')
+            return
+        unit = unit_edit.text().strip()
+        # Store only non-defaults so settings stay clean
+        if scale == 1.0:
+            self.channel_scale.pop(channel_index, None)
+        else:
+            self.channel_scale[channel_index] = scale
+        if offset == 0.0:
+            self.channel_offset.pop(channel_index, None)
+        else:
+            self.channel_offset[channel_index] = offset
+        if unit:
+            self.channel_units[channel_index] = unit
+        else:
+            self.channel_units.pop(channel_index, None)
+        self._invalidate_scale_cache()
+        label.setText(self._channel_display(channel_index))
+        self._rebuild_channel_toggles()
+        self._save_settings()
 
     def _fft_state_changed(self):
         """Create or destroy the FFT widget when the checkbox toggles."""
@@ -2129,9 +2236,17 @@ class SerialDataView(QtWidgets.QWidget):
         batch = parts[0] if len(parts) == 1 else np.vstack(parts)
 
         k = len(batch)
+        # Measure sample rate for the time axis (count every sample, even the
+        # ones a too-full flush is about to drop).
+        self._update_sample_rate(k)
         if k > n_points:
             batch = batch[-n_points:]  # one flush delivered more than the window
             k = n_points
+
+        # Apply per-channel scale/offset (vectorized): plotted = raw*scale+offset
+        scale, offset = self._build_scale_vectors(nch)
+        if scale is not None:
+            batch = batch * scale + offset
 
         # inf would collapse Y auto-range; render non-finite values as gaps.
         # Runs on the size-capped batch (<= n_points rows), so it stays cheap.
@@ -2155,6 +2270,56 @@ class SerialDataView(QtWidgets.QWidget):
             if self._fft_update_counter >= 3:  # ~10 Hz is plenty for a spectrum
                 self._fft_update_counter = 0
                 self._update_fft()
+        if self._x_time_mode:
+            self._update_x_axis_scale_value()
+
+    def _update_sample_rate(self, k):
+        """Track an average sample rate (samples/sec) from wall-clock time."""
+        if k <= 0:
+            return
+        now = time.monotonic()
+        if self._x_start_time is None:
+            self._x_start_time = now
+            self._x_sample_total = 0
+        self._x_sample_total += k
+        elapsed = now - self._x_start_time
+        if elapsed > 0.2:  # ignore the first noisy fraction of a second
+            self._x_rate = self._x_sample_total / elapsed
+
+    def _reset_sample_rate(self):
+        self._x_sample_total = 0
+        self._x_start_time = None
+        self._x_rate = 0.0
+
+    def _apply_x_axis_scale(self):
+        """Set the bottom axis label + scale for the current X mode.
+
+        Only the axis tick scale/label changes; plotted data stays in index
+        space, so the crosshair and ranges keep working unchanged. Call on
+        mode toggle / plot creation; flush_plot uses the lighter scale-only
+        update below.
+        """
+        if self.graphWidget is None:
+            return
+        axis = self.graphWidget.plotItem.getAxis('bottom')
+        if self._x_time_mode:
+            axis.setLabel('Time', units='s')
+            axis.setScale(1.0 / self._x_rate if self._x_rate > 0 else 1.0)
+        else:
+            axis.setLabel('Sample')
+            axis.setScale(1.0)
+
+    def _update_x_axis_scale_value(self):
+        """Live per-flush update of just the time-axis tick scale (no relabel)."""
+        if self.graphWidget is None or not self._x_time_mode or self._x_rate <= 0:
+            return
+        self.graphWidget.plotItem.getAxis('bottom').setScale(1.0 / self._x_rate)
+
+    def set_x_time_mode(self, enabled):
+        """Toggle the time-based X axis."""
+        self._x_time_mode = bool(enabled)
+        self._apply_x_axis_scale()
+        self._save_settings()
 
     def _get_delimiter(self):
         """Return the active delimiter string, or None for auto-detect."""
@@ -2191,13 +2356,23 @@ class SerialDataView(QtWidgets.QWidget):
         for field in fields:
             field = field.strip()
             if not field:
+                # An empty field between delimiters is still a column: keep the
+                # position so later values stay on their own channels.
+                values.append(float('nan'))
                 continue
             if ':' in field:
                 field = field.split(':', 1)[1].strip()
             try:
                 values.append(float(field))
             except ValueError:
-                continue
+                # Non-numeric column (e.g. a label, a sensor error token):
+                # emit a gap rather than dropping it, which would shift every
+                # following value into the wrong channel.
+                values.append(float('nan'))
+        # Drop trailing NaNs so a line-ending delimiter (e.g. "1,2,3,")
+        # doesn't add a phantom empty channel.
+        while values and values[-1] != values[-1]:  # NaN check
+            values.pop()
         return values
 
     def translate_data(self):
@@ -2402,7 +2577,11 @@ class SerialDataView(QtWidgets.QWidget):
             'channel_names': {str(k): v for k, v in self.channel_names.items()},
             'channel_colors': {str(k): v for k, v in self.channel_colors.items()},
             'channel_axes': {str(k): v for k, v in self.channel_axes.items()},
+            'channel_scale': {str(k): v for k, v in self.channel_scale.items()},
+            'channel_offset': {str(k): v for k, v in self.channel_offset.items()},
+            'channel_units': {str(k): v for k, v in self.channel_units.items()},
             'hidden_channels': sorted(self.hidden_channels),
+            'x_time_mode': self._x_time_mode,
             'y_auto_scale': self._y_auto_scale,
             'y_min': self._y_min,
             'y_max': self._y_max,
@@ -2463,7 +2642,16 @@ class SerialDataView(QtWidgets.QWidget):
             self.channel_colors = {int(k): v for k, v in saved_colors.items()}
             saved_axes = s.get('channel_axes', {})
             self.channel_axes = {int(k): v for k, v in saved_axes.items()}
+            self.channel_scale = {int(k): float(v) for k, v in s.get('channel_scale', {}).items()}
+            self.channel_offset = {int(k): float(v) for k, v in s.get('channel_offset', {}).items()}
+            self.channel_units = {int(k): v for k, v in s.get('channel_units', {}).items()}
+            self._invalidate_scale_cache()
             self.hidden_channels = set(s.get('hidden_channels', []))
+
+            self._x_time_mode = bool(s.get('x_time_mode', False))
+            self._time_axis_check.blockSignals(True)
+            self._time_axis_check.setChecked(self._x_time_mode)
+            self._time_axis_check.blockSignals(False)
 
             self._y_auto_scale = s.get('y_auto_scale', True)
             self._y_min = s.get('y_min', -1.0)
