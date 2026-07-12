@@ -258,6 +258,47 @@ def test_settings_round_trip_preserves_channel_config():
     win.close(); win2.close()
 
 
+def test_math_expr_cannot_mutate_channel_buffer():
+    win, dv = _new_view(nch=2, pts=10)
+    dv.plot_data[0][:] = np.arange(10, 0, -1)  # 10..1 descending
+    before = dv.plot_data[0].copy()
+    # In-place mutators must fail (channels are bound as read-only views) rather
+    # than silently corrupt the live plot buffer.
+    assert dv._eval_math_expression('ch0.sort()') is None
+    assert np.array_equal(dv.plot_data[0], before)
+    # A normal read-only expression still evaluates correctly.
+    out = dv._eval_math_expression('ch0 * 2')
+    assert np.allclose(out, before * 2)
+    # A pass-through expression returns a usable (copied, writable) array.
+    out2 = dv._eval_math_expression('ch0')
+    assert np.array_equal(out2, before)
+    win.close()
+
+
+def test_ascii_parse_keeps_explicit_trailing_nan():
+    win, dv = _new_view(mode='ASCII', nch=3)
+    vals = dv._parse_plot_values('1,2,nan')       # explicit nan in last column
+    assert len(vals) == 3 and vals[0] == 1.0 and vals[1] == 2.0
+    assert vals[2] != vals[2]                       # kept as NaN, not stripped
+    vals2 = dv._parse_plot_values('1,2,err')      # non-numeric token, last column
+    assert len(vals2) == 3 and vals2[2] != vals2[2]
+    assert dv._parse_plot_values('1,2,3,') == [1.0, 2.0, 3.0]  # empty field still dropped
+    win.close()
+
+
+def test_fft_dc_amplitude_not_doubled():
+    win, dv = _new_view(nch=1, pts=64)
+    dv._fft_check.setChecked(True)  # create the FFT widget + lines
+    dv.plot_data[0][:] = 3.0
+    dv._plot_fill = 64
+    dv._update_fft()
+    mag = dv._fft_lines[0].yData
+    # DC bin must reflect the true amplitude (~3.0), not the 2x single-sided
+    # factor that only applies to non-DC bins (~6.0).
+    assert abs(mag[0] - 3.0) < 0.2
+    win.close()
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith('test_') and callable(v)]
     failed = 0

@@ -465,6 +465,9 @@ class SerialMonitor(QtWidgets.QMainWindow):
     def _reset_stream_state(self):
         """Drop buffered/partial stream state so a new connection starts clean."""
         self._rx_buffer.clear()
+        # Drop any partial RX line held for the log so it isn't merged with
+        # post-reconnect data into one garbled line.
+        self._rx_log_pending = ''
         self.serialDataView.reset_stream_state()
 
     def readFromPort(self):
@@ -584,6 +587,13 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._rx_bytes = 0
         self._tx_bytes = 0
 
+        # Periodic log flush (writes are buffered on the RX hot path).
+        if self._recording and self._log_file is not None:
+            try:
+                self._log_file.flush()
+            except (OSError, ValueError):
+                pass
+
         if self.port.isOpen():
             baud = self.toolBar.baudRate()
             self.statsLabel.setText(
@@ -691,7 +701,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
             for line in text.splitlines():
                 if line:
                     self._log_file.write(f'[{ts}] {direction}: {line}\n')
-            self._log_file.flush()
+            # Flushing here on every readyRead would issue many fsync-adjacent
+            # syscalls per second on the GUI thread at high baud. Timestamps are
+            # already captured above; the actual flush is piggybacked on the 1s
+            # stats timer (and forced on stop/close).
         except (OSError, ValueError):
             # Disk full / file gone: stop recording instead of crashing the RX path
             try:
@@ -728,7 +741,8 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self.statusText.setText('Recording stopped')
         else:
             # Start recording
-            ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            now = datetime.now()
+            ts = now.strftime('%Y-%m-%d_%H-%M-%S_') + f'{now.microsecond // 1000:03d}'
             filename = f'AxxTerm_log_{ts}.txt'
             filepath = os.path.join(SCRIPT_DIR, filename)
             try:
@@ -748,6 +762,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         """Flush pending state and close the log file when the application exits."""
         self._save_timer.stop()
+        # Stop the remaining timers so nothing fires against half-torn-down widgets.
+        self._stats_timer.stop()
+        self._display_timer.stop()
+        self._reconnect_timer.stop()
         self.save_all_settings()  # also captures final window/splitter geometry
         if self._log_file is not None:
             try:
@@ -781,11 +799,20 @@ class SerialMonitor(QtWidgets.QMainWindow):
             },
             'macros': self.serialSendView._get_macros_list(),
         }
+        target = path or SETTINGS_FILE
+        # Write to a temp file in the same directory, then atomically replace the
+        # target. A crash / full disk mid-write leaves the old settings intact
+        # instead of truncating them to an unparseable file.
+        tmp = target + '.tmp'
         try:
-            with open(path or SETTINGS_FILE, 'w') as f:
+            with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, indent=2)
+            os.replace(tmp, target)
         except OSError:
-            pass
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     def load_all_settings(self, path=None):
         """Load all settings from one JSON file."""
@@ -902,10 +929,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 for arr in dv._math_data:
                     values.append(str(arr[row]) if row < len(arr) else '')
                 lines.append(','.join(values))
-            with open(path, 'w') as f:
+            with open(path, 'w', encoding='utf-8', newline='') as f:
                 f.write('\n'.join(lines) + '\n')
             self.statusText.setText(f'CSV exported to {os.path.basename(path)}')
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             self.statusText.setText(f'Export failed: {e}')
 
     def _menu_export_png(self):
@@ -963,6 +990,9 @@ class SerialDataView(QtWidgets.QWidget):
         self._fft_widget = None
         self._fft_lines = []
         self._fft_update_counter = 0
+        self._fft_window = None
+        self._fft_window_n = 0
+        self._fft_scale = 1.0
 
         # Math/computed channels
         self._math_channels = []   # list of {'name': str, 'expression': str}
@@ -1584,9 +1614,9 @@ class SerialDataView(QtWidgets.QWidget):
         else:
             # Destroy FFT widget first if it exists
             self._destroy_fft_widget()
-            # Clean up Y2 axis before destroying graph
-            self._y2_plot_lines = {}
-            self._y2_viewbox = None
+            # Clean up Y2 axis before destroying graph (disconnects sigResized
+            # and removes the ViewBox from the scene while graphWidget is valid)
+            self._remove_y2_axis()
             self.graphWidget.removeEventFilter(self)
             self._channel_toggle_bar = None
             self._graph_container.setParent(None)
@@ -1784,8 +1814,8 @@ class SerialDataView(QtWidgets.QWidget):
                 val = arr[x_idx]
                 val_str = f'{val:.4f}' if math.isfinite(val) else '—'
                 parts.append(f'<span style="color:{color}"><b>{name}</b>: {val_str}</span>')
-        html = '<br>'.join(parts)
-        self._cursor_label.setHtml(f'<div style="background:rgba(255,255,255,200);padding:2px">{html}</div>')
+        label_html = '<br>'.join(parts)
+        self._cursor_label.setHtml(f'<div style="background:rgba(255,255,255,200);padding:2px">{label_html}</div>')
         self._cursor_label.setPos(x, mouse_point.y())
         self._cursor_label.setVisible(True)
 
@@ -2008,9 +2038,13 @@ class SerialDataView(QtWidgets.QWidget):
         n = min(self._plot_fill, n_total)
         if n < 8:
             return
-        # Hann window + amplitude normalization; skip the NaN-prefilled head
-        window = np.hanning(n)
-        scale = 2.0 / window.sum()
+        # Hann window + single-sided amplitude normalization; skip the NaN head.
+        # Window/scale are cached because n is constant once the buffer fills.
+        if self._fft_window is None or self._fft_window_n != n:
+            self._fft_window = np.hanning(n)
+            self._fft_window_n = n
+            self._fft_scale = 2.0 / self._fft_window.sum()
+        window, scale = self._fft_window, self._fft_scale
         for i, arr in enumerate(self.plot_data):
             if i >= len(self._fft_lines):
                 break
@@ -2018,6 +2052,11 @@ class SerialDataView(QtWidgets.QWidget):
                 continue
             data = np.nan_to_num(arr[n_total - n:])
             fft_mag = np.abs(np.fft.rfft(data * window)) * scale
+            # The 2x single-sided factor doesn't apply to DC (and Nyquist when
+            # n is even), which have no mirror-image negative-frequency twin.
+            fft_mag[0] *= 0.5
+            if n % 2 == 0:
+                fft_mag[-1] *= 0.5
             self._fft_lines[i].setData(fft_mag)
 
     # --- Math / Computed Channels ---
@@ -2116,14 +2155,24 @@ class SerialDataView(QtWidgets.QWidget):
         self._math_expr_cache[expression] = code
         return code
 
-    def _eval_math_expression(self, expression):
+    def _build_math_namespace(self):
+        """Namespace for math eval: channels bound as read-only views so an
+        expression like ``ch0.sort()`` raises instead of corrupting the live
+        plot buffer. Built once per flush and reused across all expressions."""
+        namespace = {'np': np, 'numpy': np}
+        for i, arr in enumerate(self.plot_data):
+            view = arr.view()
+            view.flags.writeable = False
+            namespace[f'ch{i}'] = view
+        return namespace
+
+    def _eval_math_expression(self, expression, namespace=None):
         """Evaluate a math expression safely and return the result array."""
         code = self._compile_math_expression(expression)
         if code is None:
             return None
-        namespace = {'np': np, 'numpy': np}
-        for i, arr in enumerate(self.plot_data):
-            namespace[f'ch{i}'] = arr
+        if namespace is None:
+            namespace = self._build_math_namespace()
         try:
             result = eval(code, {"__builtins__": {}}, namespace)
             # Ensure result is a numpy array of the right length
@@ -2132,6 +2181,10 @@ class SerialDataView(QtWidgets.QWidget):
             result = np.asarray(result, dtype=float)
             if result.shape != self.plot_data[0].shape:
                 return None
+            # A pass-through expression (e.g. "ch0") returns the read-only
+            # channel view; copy so the gap-fill below can write to it.
+            if not result.flags.writeable:
+                result = result.copy()
             # inf wrecks Y auto-range; render as a gap instead
             result[~np.isfinite(result)] = np.nan
             return result
@@ -2142,10 +2195,11 @@ class SerialDataView(QtWidgets.QWidget):
         """Evaluate all math expressions and update their plot lines."""
         if not self._math_channels or not self._math_lines or not self.plot_data:
             return
+        namespace = self._build_math_namespace()
         for i, mch in enumerate(self._math_channels):
             if i >= len(self._math_lines):
                 break
-            result = self._eval_math_expression(mch['expression'])
+            result = self._eval_math_expression(mch['expression'], namespace)
             if result is not None:
                 self._math_data[i][:] = result
                 self._math_lines[i].setData(self._math_data[i])
@@ -2250,8 +2304,9 @@ class SerialDataView(QtWidgets.QWidget):
 
         # inf would collapse Y auto-range; render non-finite values as gaps.
         # Runs on the size-capped batch (<= n_points rows), so it stays cheap.
-        if not np.isfinite(batch).all():
-            batch = np.where(np.isfinite(batch), batch, np.nan)
+        finite = np.isfinite(batch)
+        if not finite.all():
+            batch = np.where(finite, batch, np.nan)
 
         for i, arr in enumerate(self.plot_data):
             if k >= n_points:
@@ -2353,12 +2408,14 @@ class SerialDataView(QtWidgets.QWidget):
         else:
             fields = line.split(delim)
         values = []
+        was_empty = []  # parallel flag: value came from an empty field
         for field in fields:
             field = field.strip()
             if not field:
                 # An empty field between delimiters is still a column: keep the
                 # position so later values stay on their own channels.
                 values.append(float('nan'))
+                was_empty.append(True)
                 continue
             if ':' in field:
                 field = field.split(':', 1)[1].strip()
@@ -2369,10 +2426,13 @@ class SerialDataView(QtWidgets.QWidget):
                 # emit a gap rather than dropping it, which would shift every
                 # following value into the wrong channel.
                 values.append(float('nan'))
-        # Drop trailing NaNs so a line-ending delimiter (e.g. "1,2,3,")
-        # doesn't add a phantom empty channel.
-        while values and values[-1] != values[-1]:  # NaN check
+            was_empty.append(False)
+        # Drop trailing NaNs that came from a line-ending delimiter (e.g.
+        # "1,2,3,"), but keep an explicit nan/error token in the last column so
+        # that channel isn't silently dropped.
+        while values and was_empty[-1]:
             values.pop()
+            was_empty.pop()
         return values
 
     def translate_data(self):
@@ -3480,7 +3540,25 @@ class ToolBar(QtWidgets.QToolBar):
         return self._flowControl.currentIndex()
 
 
+def _install_excepthook():
+    """Keep the app alive if an unhandled exception escapes a Qt slot.
+
+    Under PyQt5 an exception propagating out of a slot (e.g. the RX/flush/decode
+    path) aborts the whole process. Log it to stderr and carry on instead.
+    """
+    import traceback
+
+    def hook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = hook
+
+
 if __name__ == '__main__':
+    _install_excepthook()
     app = QtWidgets.QApplication(sys.argv)
     app.setWindowIcon(QIcon(create_connector_pixmap('#22bb22')))
     window = SerialMonitor()
