@@ -1,6 +1,6 @@
 # AxxTerm
 
-A professional serial terminal with dual ASCII/HEX view, real-time plotting, binary/frame decoding, data converter, and configurable macro buttons. Built with Python and PyQt5.
+A professional serial terminal with dual ASCII/HEX view, real-time plotting, binary/frame decoding, data converter, configurable macro buttons, and a CAN bus monitor mode (Kvaser/Ixxat). Built with Python and PyQt5.
 
 ![AxxTerm GUI](AxxTerm_GUI.PNG)
 
@@ -93,6 +93,39 @@ Frame structure: `[Start Byte(s)] [Optional Size Field] [Payload] [Optional Chec
 | Endianness | Little Endian, Big Endian |
 | Checksum | Optional 8-bit sum validation |
 
+### CAN Bus Mode
+
+Switch the toolbar mode combo from **Serial** to **CAN** for a CANKing-style
+bus monitor. Requires `python-can` (`pip install python-can`) plus the vendor
+driver for your hardware.
+
+- Supported hardware: **Kvaser** (CANlib drivers) and **Ixxat** (VCI drivers),
+  plus a **Virtual** bus for testing without hardware
+- Channel 0-7 and bitrate 10 kbit/s to 1 Mbit/s selectable in the toolbar
+- Two view modes, switchable live without losing per-ID timing state:
+
+| View | Behavior |
+|------|----------|
+| Scrolling | Every frame appends a line (ring-buffered at 10,000 rows) |
+| Fixed | One line per CAN ID, overwritten in place (like CANKing fixed positions) |
+
+- Columns, everything in hex: relative time, **Δt since the previous frame
+  with the same ID**, per-ID frame count, direction (TX rows in blue),
+  STD/EXT (plus RTR/ERR flags), ID, **J1939 PGN** (derived from 29-bit IDs,
+  PDU1 destination byte cleared), DLC, and data bytes
+- RX runs on a background thread and the table is a batched
+  `QAbstractTableModel` updated at ~30 fps, so a saturated bus stays smooth
+- Send frames from the send row: ID (hex) + data bytes (hex, max 8) +
+  extended-ID checkbox; Enter or Send transmits
+- **Macro buttons send CAN frames in CAN mode**: right-click a macro to give
+  it a CAN ID and standard/extended flag; its hex payload becomes the frame
+  data. In serial mode the same macro still sends its raw bytes.
+- The Record button (Ctrl+R) logs CAN traffic to the same timestamped log
+  file format as serial data, e.g.
+  `[2026-07-17 14:03:12.481] RX: CAN 18FEF100 EXT PGN 0FEF1 DLC 8 DATA 01 02 03 04 05 06 07 08`
+
+Classic CAN only (max 8 data bytes); CAN FD is not supported yet.
+
 ### Data Converter
 - Real-time conversion between HEX, ASCII, Decimal, and Binary
 - 12 conversion combinations
@@ -125,6 +158,7 @@ Frame structure: `[Start Byte(s)] [Optional Size Field] [Payload] [Optional Chec
 - PyQt5 >= 5.15
 - pyqtgraph >= 0.13
 - NumPy >= 1.24
+- python-can >= 4.0 (for CAN mode; the serial side works without it)
 
 ## Installation
 
@@ -179,7 +213,9 @@ $env:QT_QPA_PLATFORM = "offscreen"; python tests/test_axxterm.py
 
 They cover the binary/frame/ASCII decoders (including chunk boundaries and
 resync), the hex formatter, the math-expression sandbox, per-channel
-scale/offset, the time-axis sample-rate measurement, and a settings round-trip.
+scale/offset, the time-axis sample-rate measurement, a settings round-trip,
+and the CAN mode (J1939 PGN extraction, frame/log formatting, both table view
+modes, macro round-trip, and an end-to-end send/receive over a virtual bus).
 
 ## Settings File Format
 
@@ -189,6 +225,8 @@ scale/offset, the time-axis sample-rate measurement, and a settings round-trip.
 {
   "dark_mode": false,
   "auto_reconnect": true,
+  "ui_mode": "Serial",
+  "can": { "interface": "Kvaser", "channel": 0, "bitrate": "500 kbit/s", "view_mode": "Scrolling" },
   "window": { "geometry": "<hex>", "splitter": [300, 400] },
   "plot": {
     "mode": "ASCII",
@@ -218,7 +256,7 @@ scale/offset, the time-axis sample-rate measurement, and a settings round-trip.
     "flow_control": 0
   },
   "macros": [
-    { "label": "0x7F", "hex": "7F" }
+    { "label": "0x7F", "hex": "7F", "can_id": "18FEF100", "can_ext": true }
   ]
 }
 ```

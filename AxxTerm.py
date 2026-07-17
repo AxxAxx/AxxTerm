@@ -7,7 +7,15 @@ import struct
 import os
 import json
 import time
+from collections import deque
 from datetime import datetime
+
+# python-can provides the Kvaser (CANlib) and Ixxat (VCI) backends for CAN
+# mode. Imported lazily-guarded so the serial side keeps working without it.
+try:
+    import can as pycan
+except ImportError:
+    pycan = None
 from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 from PyQt5.QtSerialPort import QSerialPort, QSerialPortInfo
@@ -59,6 +67,53 @@ NUMPY_DTYPES = {
     'float32':  np.float32,
     'double64': np.float64,
 }
+
+# --- CAN mode constants ---
+
+# Display name -> python-can interface (backend) name
+CAN_INTERFACES = {
+    'Kvaser': 'kvaser',
+    'Ixxat': 'ixxat',
+    'Virtual': 'virtual',
+}
+CAN_BITRATES = ['10', '20', '50', '100', '125', '250', '500', '800', '1000']  # kbit/s
+CAN_MAX_SCROLL_ROWS = 10000  # scrolling trace ring-buffer cap
+
+
+def j1939_pgn(can_id):
+    """Extract the J1939 PGN from a 29-bit CAN ID.
+
+    PDU1 (PF < 0xF0): the PS byte is a destination address, not part of the
+    PGN, so it is cleared. PDU2 (PF >= 0xF0): PS is group extension and stays.
+    Includes the Data Page / Extended Data Page bits.
+    """
+    pf = (can_id >> 16) & 0xFF
+    if pf < 0xF0:
+        return (can_id >> 8) & 0x3FF00
+    return (can_id >> 8) & 0x3FFFF
+
+
+def format_can_id(can_id, extended):
+    """CAN ID as fixed-width uppercase hex (8 digits ext, 3 digits std)."""
+    return f'{can_id:08X}' if extended else f'{can_id:03X}'
+
+
+def format_can_log_line(msg):
+    """One log-file line for a CAN message: ID, type, PGN, DLC, data, all hex."""
+    can_id = getattr(msg, 'arbitration_id', 0)
+    ext = bool(getattr(msg, 'is_extended_id', False))
+    data = bytes(getattr(msg, 'data', b'') or b'')
+    parts = ['CAN', format_can_id(can_id, ext), 'EXT' if ext else 'STD']
+    if ext:
+        parts.append(f'PGN {j1939_pgn(can_id):05X}')
+    if getattr(msg, 'is_remote_frame', False):
+        parts.append('RTR')
+    if getattr(msg, 'is_error_frame', False):
+        parts.append('ERR')
+    parts.append(f'DLC {getattr(msg, "dlc", len(data))}')
+    parts.append('DATA ' + (' '.join(f'{b:02X}' for b in data) if data else '-'))
+    return ' '.join(parts)
+
 
 DEFAULT_MACROS = [
     {"label": "0x7F",           "hex": "7F"},
@@ -574,18 +629,323 @@ def create_connector_pixmap(color, width=71, height=30):
     return pixmap
 
 
+class CanReaderThread(QtCore.QThread):
+    """Blocking-recv reader for a python-can bus.
+
+    Appends ('RX', msg) tuples to a deque (thread-safe append) that the GUI
+    drains on its ~30 fps display timer -- same batching pattern as the serial
+    RX path, so a saturated bus never floods the event loop.
+    """
+
+    errorOccurred = QtCore.pyqtSignal(str)
+
+    def __init__(self, bus, queue, parent=None):
+        super().__init__(parent)
+        self._bus = bus
+        self._queue = queue
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        while not self._stop:
+            try:
+                msg = self._bus.recv(timeout=0.2)
+            except Exception as e:
+                # Backend exceptions vary per driver (Kvaser/Ixxat DLLs);
+                # anything raised here means the bus is gone.
+                if not self._stop:
+                    self.errorOccurred.emit(str(e))
+                return
+            if msg is not None:
+                self._queue.append(('RX', msg))
+
+
+class CanFrameModel(QtCore.QAbstractTableModel):
+    """Table model for CAN traffic with two display modes (like CANKing).
+
+    Scrolling: every frame appends a row (ring-buffered at
+    CAN_MAX_SCROLL_ROWS). Fixed: one row per (direction, ID); the row is
+    overwritten in place and Count increments.
+
+    Rows are stored as pre-formatted string tuples so data() is a plain list
+    lookup -- no per-cell formatting while the view repaints under load.
+    Delta-time and count bookkeeping is shared between modes, so switching
+    view mode never loses the per-ID timing state.
+    """
+
+    COLUMNS = ['Time [s]', 'Δt [s]', 'Count', 'Dir', 'Type', 'ID [hex]',
+               'PGN', 'DLC', 'Data [hex]']
+    _RIGHT_ALIGNED = {0, 1, 2, 7}   # Time, dt, Count, DLC
+    _CENTERED = {3, 4}              # Dir, Type
+
+    TX_COLOR = QtGui.QColor('#2a82da')  # readable on light and dark themes
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rows = []           # list of (9 display strings,) tuples
+        self._row_is_tx = []     # parallel: True for TX rows (foreground color)
+        self.fixed_mode = False
+        self._fixed_index = {}   # {key: row} in fixed mode
+        self._last_ts = {}       # {key: last timestamp} for delta-time
+        self._counts = {}        # {key: frames seen}
+        self._t0 = None          # timestamp of the first frame (relative time base)
+
+    # --- Qt model interface ---
+
+    def rowCount(self, parent=QtCore.QModelIndex()):
+        return 0 if parent.isValid() else len(self.rows)
+
+    def columnCount(self, parent=QtCore.QModelIndex()):
+        return 0 if parent.isValid() else len(self.COLUMNS)
+
+    def data(self, index, role=QtCore.Qt.DisplayRole):
+        if role == QtCore.Qt.DisplayRole:
+            return self.rows[index.row()][index.column()]
+        if role == QtCore.Qt.ForegroundRole and self._row_is_tx[index.row()]:
+            return self.TX_COLOR
+        if role == QtCore.Qt.TextAlignmentRole:
+            col = index.column()
+            if col in self._RIGHT_ALIGNED:
+                return QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
+            if col in self._CENTERED:
+                return QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter
+            return QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter
+        return None
+
+    def headerData(self, section, orientation, role=QtCore.Qt.DisplayRole):
+        if role == QtCore.Qt.DisplayRole and orientation == QtCore.Qt.Horizontal:
+            return self.COLUMNS[section]
+        return None
+
+    # --- ingest ---
+
+    def _make_row(self, direction, msg):
+        """Format one message into (key, display tuple, is_tx)."""
+        ts = getattr(msg, 'timestamp', None)
+        if ts is None:
+            ts = time.time()
+        if self._t0 is None:
+            self._t0 = ts
+        can_id = getattr(msg, 'arbitration_id', 0)
+        ext = bool(getattr(msg, 'is_extended_id', False))
+        key = (direction, ext, can_id)
+
+        prev = self._last_ts.get(key)
+        self._last_ts[key] = ts
+        count = self._counts.get(key, 0) + 1
+        self._counts[key] = count
+
+        data = bytes(getattr(msg, 'data', b'') or b'')
+        type_str = 'EXT' if ext else 'STD'
+        if getattr(msg, 'is_remote_frame', False):
+            type_str += ' RTR'
+        if getattr(msg, 'is_error_frame', False):
+            type_str += ' ERR'
+        row = (
+            f'{ts - self._t0:.4f}',
+            f'{ts - prev:.4f}' if prev is not None else '',
+            str(count),
+            direction,
+            type_str,
+            format_can_id(can_id, ext),
+            f'{j1939_pgn(can_id):05X}' if ext else '',
+            str(getattr(msg, 'dlc', len(data))),
+            ' '.join(f'{b:02X}' for b in data),
+        )
+        return key, row, direction == 'TX'
+
+    def add_frames(self, batch):
+        """Ingest a batch of (direction, msg) tuples (called on the GUI thread)."""
+        if not batch:
+            return
+        if self.fixed_mode:
+            self._add_fixed(batch)
+        else:
+            self._add_scrolling(batch)
+
+    def _add_scrolling(self, batch):
+        made = [self._make_row(d, m) for d, m in batch]
+        start = len(self.rows)
+        self.beginInsertRows(QtCore.QModelIndex(), start, start + len(made) - 1)
+        for _key, row, is_tx in made:
+            self.rows.append(row)
+            self._row_is_tx.append(is_tx)
+        self.endInsertRows()
+        excess = len(self.rows) - CAN_MAX_SCROLL_ROWS
+        if excess > 0:
+            self.beginRemoveRows(QtCore.QModelIndex(), 0, excess - 1)
+            del self.rows[:excess]
+            del self._row_is_tx[:excess]
+            self.endRemoveRows()
+
+    def _add_fixed(self, batch):
+        changed_min = None
+        changed_max = None
+        pending = []  # rows for IDs not seen before, appended at the end
+        for direction, msg in batch:
+            key, row, is_tx = self._make_row(direction, msg)
+            r = self._fixed_index.get(key)
+            if r is not None:
+                if r < len(self.rows):
+                    self.rows[r] = row
+                    changed_min = r if changed_min is None else min(changed_min, r)
+                    changed_max = r if changed_max is None else max(changed_max, r)
+                else:
+                    # Row is still in this batch's pending block
+                    pending[r - len(self.rows)] = (row, is_tx)
+            else:
+                self._fixed_index[key] = len(self.rows) + len(pending)
+                pending.append((row, is_tx))
+        if pending:
+            start = len(self.rows)
+            self.beginInsertRows(QtCore.QModelIndex(), start, start + len(pending) - 1)
+            for row, is_tx in pending:
+                self.rows.append(row)
+                self._row_is_tx.append(is_tx)
+            self.endInsertRows()
+        if changed_min is not None:
+            self.dataChanged.emit(
+                self.index(changed_min, 0),
+                self.index(changed_max, len(self.COLUMNS) - 1))
+
+    # --- control ---
+
+    def set_fixed_mode(self, fixed):
+        """Switch view mode. Rows restart, but per-ID timing/count state stays."""
+        if fixed == self.fixed_mode:
+            return
+        self.beginResetModel()
+        self.fixed_mode = fixed
+        self.rows = []
+        self._row_is_tx = []
+        self._fixed_index = {}
+        self.endResetModel()
+
+    def clear(self):
+        self.beginResetModel()
+        self.rows = []
+        self._row_is_tx = []
+        self._fixed_index = {}
+        self._last_ts = {}
+        self._counts = {}
+        self._t0 = None
+        self.endResetModel()
+
+
+class CanView(QtWidgets.QWidget):
+    """CAN traffic panel: view-mode selector plus the frame table."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.model = CanFrameModel(self)
+
+        view_font = QtGui.QFont('Segoe UI', 10)
+
+        self.view_mode_combo = QtWidgets.QComboBox()
+        self.view_mode_combo.addItems(['Scrolling', 'Fixed'])
+        self.view_mode_combo.setFont(view_font)
+        self.view_mode_combo.setFixedHeight(30)
+        self.view_mode_combo.setToolTip(
+            'Scrolling: every frame is a new line\n'
+            'Fixed: one line per CAN ID, overwritten in place')
+        self.view_mode_combo.currentTextChanged.connect(self._on_view_mode_changed)
+
+        self.clear_button = QtWidgets.QPushButton('Clear')
+        self.clear_button.setFont(view_font)
+        self.clear_button.setFixedHeight(30)
+        self.clear_button.clicked.connect(self.model.clear)
+
+        label = QtWidgets.QLabel('CAN frames')
+        label.setObjectName('sectionLabel')
+        label.setFont(view_font)
+        label.setIndent(5)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(4)
+        controls.addWidget(label)
+        controls.addWidget(self.view_mode_combo)
+        controls.addStretch()
+        controls.addWidget(self.clear_button)
+
+        self.table = QtWidgets.QTableView(self)
+        self.table.setModel(self.model)
+        self.table.setFont(QtGui.QFont('Consolas', 10))
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(True)
+        vh = self.table.verticalHeader()
+        vh.setVisible(False)
+        vh.setSectionResizeMode(QtWidgets.QHeaderView.Fixed)
+        vh.setDefaultSectionSize(20)
+        hh = self.table.horizontalHeader()
+        hh.setStretchLastSection(True)
+        hh.setHighlightSections(False)
+        for col, width in enumerate([90, 90, 60, 44, 70, 90, 60, 44, 260]):
+            self.table.setColumnWidth(col, width)
+
+        # Connection indicator, same DB-9 icon as the serial view
+        self.indicator = QtWidgets.QLabel(self)
+        self.indicator.setPixmap(create_connector_pixmap(DISCONNECTED_COLOR))
+
+        bottom = QtWidgets.QHBoxLayout()
+        bottom.setContentsMargins(0, 0, 0, 0)
+        bottom.addWidget(self.indicator)
+        bottom.addStretch()
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.addLayout(controls)
+        layout.addWidget(self.table, stretch=1)
+        layout.addLayout(bottom)
+
+    def _on_view_mode_changed(self, text):
+        self.model.set_fixed_mode(text == 'Fixed')
+        monitor = self.window()
+        if hasattr(monitor, 'schedule_save'):
+            monitor.schedule_save()
+
+    def ingest(self, batch):
+        """Add a batch of (direction, msg) tuples; keep autoscroll at bottom."""
+        sb = self.table.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 4
+        self.model.add_frames(batch)
+        if not self.model.fixed_mode and at_bottom:
+            self.table.scrollToBottom()
+
+    def set_connected(self, connected):
+        self.indicator.setPixmap(create_connector_pixmap(
+            CONNECTED_COLOR if connected else DISCONNECTED_COLOR))
+
+
 class SerialMonitor(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.port = QSerialPort()
         self.serialDataView = SerialDataView(self)
+        self.canView = CanView(self)
+        self.canView.setVisible(False)
         self.serialSendView = SerialSendView(self)
 
         self.setCentralWidget(QtWidgets.QWidget(self))
         self.layout = QtWidgets.QVBoxLayout(self.centralWidget())
         self.layout.addWidget(self.serialDataView)
+        self.layout.addWidget(self.canView)
         self.layout.addWidget(self.serialSendView)
         self.layout.setContentsMargins(3, 3, 3, 3)
+
+        ### CAN bus state ###
+        self._ui_mode = 'Serial'
+        self._can_bus = None
+        self._can_reader = None
+        self._can_rx_queue = deque()  # ('RX'|'TX', can.Message), thread-safe append
+        self._can_rx_frames = 0       # frames this second (stats)
+        self._can_tx_frames = 0
+        self._can_rx_total = 0
+        self._can_tx_total = 0
 
         self.setWindowTitle('AxxTerm')
         self.setWindowIcon(QIcon(create_connector_pixmap(CONNECTED_COLOR)))
@@ -698,8 +1058,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
         ### Signal Connect ###
         self.toolBar.portOpenButton.clicked.connect(self.portOpen)
         self.serialSendView.serialSendSignal.connect(self.sendFromPort)
+        self.serialSendView.canSendSignal.connect(self.sendCanFrame)
         self.port.readyRead.connect(self.readFromPort)
         self.port.errorOccurred.connect(self._on_port_error)
+        self.toolBar.modeCombo.currentTextChanged.connect(self._on_ui_mode_changed)
 
         # Save when serial port settings change (debounced)
         self.toolBar.baudRates.currentIndexChanged.connect(lambda: self.schedule_save())
@@ -707,6 +1069,9 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.toolBar._parity.currentIndexChanged.connect(lambda: self.schedule_save())
         self.toolBar.stopBits.currentIndexChanged.connect(lambda: self.schedule_save())
         self.toolBar._flowControl.currentIndexChanged.connect(lambda: self.schedule_save())
+        self.toolBar.canInterfaces.currentIndexChanged.connect(lambda: self.schedule_save())
+        self.toolBar.canChannels.currentIndexChanged.connect(lambda: self.schedule_save())
+        self.toolBar.canBitrates.currentIndexChanged.connect(lambda: self.schedule_save())
 
         ### Apply default (light) theme, then load all settings ###
         # (load_all_settings switches to the dark palette if the user saved it,
@@ -718,6 +1083,13 @@ class SerialMonitor(QtWidgets.QMainWindow):
         # Manual open/close always cancels any pending auto-reconnect
         self._reconnect_timer.stop()
         self._reconnect_port_name = ''
+
+        if self._ui_mode == 'CAN':
+            if flag:
+                self._open_can_bus()
+            else:
+                self._close_can_bus()
+            return
 
         if flag:
             self.port.setBaudRate(self.toolBar.baudRate())
@@ -746,6 +1118,140 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self.statusText.setText('Port closed')
             self.toolBar.serialControlEnable(True)
             self.serialDataView.label.setPixmap(create_connector_pixmap(DISCONNECTED_COLOR))
+
+    # --- CAN mode -----------------------------------------------------------
+
+    def _on_ui_mode_changed(self, mode):
+        """Switch between Serial and CAN mode (toolbar combo)."""
+        # Close whichever connection is open before switching. The serial port
+        # is closed directly (not via portOpen, which dispatches on the mode),
+        # and any pending auto-reconnect is cancelled so it can't reopen the
+        # port behind the CAN UI.
+        self._reconnect_timer.stop()
+        self._reconnect_port_name = ''
+        if self.port.isOpen():
+            self.port.close()
+            self.statusText.setText('Port closed')
+            self.serialDataView.label.setPixmap(create_connector_pixmap(DISCONNECTED_COLOR))
+        if self._can_bus is not None:
+            self._close_can_bus()
+        self.toolBar.serialControlEnable(True)
+        self.toolBar.portOpenButton.setChecked(False)
+
+        self._ui_mode = mode
+        is_can = (mode == 'CAN')
+        self.toolBar.set_can_mode(is_can)
+        self.serialDataView.setVisible(not is_can)
+        self.canView.setVisible(is_can)
+        self.serialSendView.set_can_mode(is_can)
+        self.schedule_save()
+
+    def _open_can_bus(self):
+        if pycan is None:
+            self.statusText.setText(
+                'python-can is not installed - run: pip install python-can')
+            self.toolBar.portOpenButton.setChecked(False)
+            return
+        iface_name = self.toolBar.canInterfaces.currentText()
+        iface = CAN_INTERFACES.get(iface_name, 'virtual')
+        channel = self.toolBar.canChannel()
+        bitrate = self.toolBar.canBitrate()
+        try:
+            bus = pycan.Bus(interface=iface, channel=channel, bitrate=bitrate)
+        except Exception as e:
+            # Backend exceptions vary per driver (missing DLL, no device,
+            # channel in use); show the message instead of crashing.
+            self.statusText.setText(f'CAN open error: {e}')
+            self.toolBar.portOpenButton.setChecked(False)
+            return
+        self._can_bus = bus
+        self._can_rx_queue.clear()
+        self._can_rx_frames = 0
+        self._can_tx_frames = 0
+        self._can_rx_total = 0
+        self._can_tx_total = 0
+        self._can_reader = CanReaderThread(bus, self._can_rx_queue, self)
+        self._can_reader.errorOccurred.connect(self._on_can_error)
+        self._can_reader.start()
+        self.toolBar.serialControlEnable(False)
+        self.canView.set_connected(True)
+        self.statusText.setText(
+            f'CAN open: {iface_name} ch {channel} @ {bitrate // 1000} kbit/s')
+
+    def _close_can_bus(self):
+        if self._can_reader is not None:
+            self._can_reader.stop()
+            self._can_reader.wait(1000)
+            self._can_reader = None
+        if self._can_bus is not None:
+            try:
+                self._can_bus.shutdown()
+            except Exception:
+                pass
+            self._can_bus = None
+        self.toolBar.serialControlEnable(True)
+        self.canView.set_connected(False)
+        self.statusText.setText('CAN closed')
+
+    def _on_can_error(self, message):
+        """Bus died under the reader thread (device unplugged, driver error)."""
+        self._close_can_bus()
+        self.toolBar.portOpenButton.setChecked(False)
+        self.statusText.setText(f'CAN bus error: {message}')
+
+    def sendCanFrame(self, id_text, extended, data_text):
+        """Send one CAN frame (from the send row or a macro button)."""
+        if self._can_bus is None:
+            self.statusText.setText('CAN bus is not open')
+            return
+        try:
+            can_id = int(id_text, 16)
+        except (TypeError, ValueError):
+            self.statusText.setText(f'Invalid CAN ID (hex): {id_text!r}')
+            return
+        max_id = 0x1FFFFFFF if extended else 0x7FF
+        if not 0 <= can_id <= max_id:
+            self.statusText.setText(
+                f'CAN ID {can_id:X} out of range (max {max_id:X} for '
+                f'{"extended" if extended else "standard"})')
+            return
+        try:
+            data = bytes.fromhex(data_text.replace(' ', ''))
+        except ValueError:
+            self.statusText.setText('CAN data is not a valid HEX string')
+            return
+        if len(data) > 8:
+            self.statusText.setText(f'CAN data is max 8 bytes (got {len(data)})')
+            return
+        msg = pycan.Message(arbitration_id=can_id, is_extended_id=extended,
+                            data=data, timestamp=time.time())
+        try:
+            self._can_bus.send(msg)
+        except Exception as e:
+            self.statusText.setText(f'CAN send failed: {e}')
+            return
+        self.statusText.setText('')
+        # Show the sent frame in the table via the same drain path as RX
+        self._can_rx_queue.append(('TX', msg))
+
+    def _flush_can_queue(self):
+        """Drain buffered CAN frames into the table (and the log)."""
+        q = self._can_rx_queue
+        if not q:
+            return
+        batch = []
+        while q:
+            batch.append(q.popleft())
+        for direction, msg in batch:
+            if direction == 'TX':
+                self._can_tx_frames += 1
+                self._can_tx_total += 1
+            else:
+                self._can_rx_frames += 1
+                self._can_rx_total += 1
+            if self._recording and self._log_file is not None:
+                self._log_data(direction, format_can_log_line(msg))
+        self.canView.ingest(batch)
 
     def _reset_stream_state(self):
         """Drop buffered/partial stream state so a new connection starts clean."""
@@ -786,6 +1292,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self.serialDataView.handleReceivedData(data)
         # Push any pending plot samples to the curves (one setData per channel)
         self.serialDataView.flush_plot()
+        self._flush_can_queue()
 
     def sendFromPort(self, text):
         if not self.port.isOpen():
@@ -879,7 +1386,16 @@ class SerialMonitor(QtWidgets.QMainWindow):
             except (OSError, ValueError):
                 pass
 
-        if self.port.isOpen():
+        if self._can_bus is not None:
+            can_rx = self._can_rx_frames
+            can_tx = self._can_tx_frames
+            self._can_rx_frames = 0
+            self._can_tx_frames = 0
+            self.statsLabel.setText(
+                f'RX: {can_rx} msg/s  TX: {can_tx} msg/s  |  '
+                f'RX total: {self._can_rx_total}  TX total: {self._can_tx_total}  |  '
+                f'{self.toolBar.canBitrate() // 1000} kbit/s')
+        elif self.port.isOpen():
             baud = self.toolBar.baudRate()
             self.statsLabel.setText(
                 f'RX: {fmt(rx_rate)}/s  TX: {fmt(tx_rate)}/s  |  '
@@ -953,6 +1469,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
 
     def _try_reconnect(self):
         """Poll available ports for the previously connected port name."""
+        if self._ui_mode != 'Serial':  # never reopen serial behind the CAN UI
+            self._reconnect_timer.stop()
+            self._reconnect_port_name = ''
+            return
         available = [p.portName() for p in QSerialPortInfo.availablePorts()]
         if self._reconnect_port_name not in available:
             return
@@ -1011,7 +1531,9 @@ class SerialMonitor(QtWidgets.QMainWindow):
     def _toggle_recording(self):
         """Start or stop recording serial data to a log file."""
         if self._recording:
-            # Stop recording: flush any partial RX line first
+            # Stop recording: flush queued CAN frames and any partial RX line
+            # first so nothing buffered in the last display tick is lost
+            self._flush_can_queue()
             if self._rx_log_pending:
                 pending, self._rx_log_pending = self._rx_log_pending, ''
                 self._log_data('RX', pending)
@@ -1051,6 +1573,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._stats_timer.stop()
         self._display_timer.stop()
         self._reconnect_timer.stop()
+        if self._can_bus is not None:
+            self._close_can_bus()
+        # Reader is stopped now; log whatever it queued during the last tick
+        self._flush_can_queue()
         self.save_all_settings()  # also captures final window/splitter geometry
         if self._log_file is not None:
             try:
@@ -1070,6 +1596,13 @@ class SerialMonitor(QtWidgets.QMainWindow):
         settings = {
             'dark_mode': self._dark_mode,
             'auto_reconnect': self._auto_reconnect,
+            'ui_mode': self._ui_mode,
+            'can': {
+                'interface': self.toolBar.canInterfaces.currentText(),
+                'channel': self.toolBar.canChannels.currentIndex(),
+                'bitrate': self.toolBar.canBitrates.currentText(),
+                'view_mode': self.canView.view_mode_combo.currentText(),
+            },
             'window': {
                 'geometry': bytes(self.saveGeometry().toHex()).decode('ascii'),
                 'splitter': self.serialDataView.splitter.sizes(),
@@ -1156,6 +1689,34 @@ class SerialMonitor(QtWidgets.QMainWindow):
             for w in [self.toolBar.baudRates, self.toolBar.dataBits,
                       self.toolBar._parity, self.toolBar.stopBits, self.toolBar._flowControl]:
                 w.blockSignals(False)
+
+        # CAN settings
+        can_cfg = s.get('can', {})
+        if isinstance(can_cfg, dict) and can_cfg:
+            for w in [self.toolBar.canInterfaces, self.toolBar.canChannels,
+                      self.toolBar.canBitrates]:
+                w.blockSignals(True)
+            self.toolBar.canInterfaces.setCurrentText(can_cfg.get('interface', 'Kvaser'))
+            try:
+                self.toolBar.canChannels.setCurrentIndex(int(can_cfg.get('channel', 0)))
+            except (TypeError, ValueError):
+                pass
+            self.toolBar.canBitrates.setCurrentText(
+                str(can_cfg.get('bitrate', '500 kbit/s')))
+            for w in [self.toolBar.canInterfaces, self.toolBar.canChannels,
+                      self.toolBar.canBitrates]:
+                w.blockSignals(False)
+            view_mode = can_cfg.get('view_mode', 'Scrolling')
+            if view_mode in ('Scrolling', 'Fixed'):
+                self.canView.view_mode_combo.setCurrentText(view_mode)
+
+        # UI mode last, so switching applies over the loaded CAN settings
+        ui_mode = s.get('ui_mode', 'Serial')
+        if ui_mode in ('Serial', 'CAN'):
+            # setCurrentText triggers _on_ui_mode_changed, which updates all
+            # visibility; setting it to the current value triggers nothing,
+            # which is fine since 'Serial' is the initial state.
+            self.toolBar.modeCombo.setCurrentText(ui_mode)
 
         # Macros
         macros = s.get('macros', None)
@@ -3401,7 +3962,7 @@ class MathChannelDialog(QtWidgets.QDialog):
 class MacroEditDialog(QtWidgets.QDialog):
     """Dialog for editing a macro button's label and hex payload."""
 
-    def __init__(self, label, hex_data, parent=None):
+    def __init__(self, label, hex_data, parent=None, can_id='', can_ext=False):
         super().__init__(parent)
         self.setWindowTitle("Edit Macro Button")
         self.setMinimumWidth(450)
@@ -3450,6 +4011,15 @@ class MacroEditDialog(QtWidgets.QDialog):
         self.bin_edit.textChanged.connect(lambda: self._sync_from('bin'))
         self._update_preview()
 
+        # CAN mode fields: the same payload is sent as a CAN frame with this ID
+        self.can_id_edit = QtWidgets.QLineEdit(can_id)
+        self.can_id_edit.setFont(QtGui.QFont('Segoe UI', 11))
+        self.can_id_edit.setPlaceholderText("e.g. 123 or 18FEF100 (used in CAN mode)")
+
+        self.can_ext_check = QtWidgets.QCheckBox("Extended (29-bit) ID")
+        self.can_ext_check.setFont(QtGui.QFont('Segoe UI', 10))
+        self.can_ext_check.setChecked(bool(can_ext))
+
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
@@ -3460,6 +4030,8 @@ class MacroEditDialog(QtWidgets.QDialog):
         layout.addRow("Input Mode:", self.input_mode)
         layout.addRow("Data:", self.input_stack)
         layout.addRow("Preview:", self.preview_label)
+        layout.addRow("CAN ID (hex):", self.can_id_edit)
+        layout.addRow("", self.can_ext_check)
         layout.addRow(buttons)
 
         # Initialize ASCII and Decimal fields from the hex data
@@ -3474,6 +4046,21 @@ class MacroEditDialog(QtWidgets.QDialog):
                 self, 'Invalid Macro',
                 'The hex payload is not valid. Fix it or cancel.')
             return
+        can_id_text = self.can_id_edit.text().strip()
+        if can_id_text:
+            try:
+                can_id = int(can_id_text, 16)
+            except ValueError:
+                QtWidgets.QMessageBox.warning(
+                    self, 'Invalid Macro', 'The CAN ID is not valid hex.')
+                return
+            max_id = 0x1FFFFFFF if self.can_ext_check.isChecked() else 0x7FF
+            if not 0 <= can_id <= max_id:
+                QtWidgets.QMessageBox.warning(
+                    self, 'Invalid Macro',
+                    f'CAN ID {can_id:X} is out of range (max {max_id:X} for '
+                    f'{"an extended" if self.can_ext_check.isChecked() else "a standard"} ID).')
+                return
         super().accept()
 
     def _mode_changed(self, index):
@@ -3521,13 +4108,21 @@ class MacroEditDialog(QtWidgets.QDialog):
 
 
 class MacroButton(QtWidgets.QPushButton):
-    """A macro button that sends hex data on click. Right-click to edit."""
+    """A macro button that sends hex data on click. Right-click to edit.
+
+    In CAN mode the payload is sent as a CAN frame using the macro's CAN ID
+    (and extended flag) instead of raw serial bytes.
+    """
 
     macroChanged = QtCore.pyqtSignal()
 
-    def __init__(self, label, hex_data, send_callback, parent=None):
+    def __init__(self, label, hex_data, send_callback, parent=None,
+                 can_id='', can_ext=False):
         super().__init__(label, parent)
         self.hex_data = hex_data
+        self.can_id = can_id
+        self.can_ext = can_ext
+        self._can_mode = False
         self.send_callback = send_callback
         self.setFont(QtGui.QFont('Segoe UI', 9))
         self.setFixedHeight(28)
@@ -3537,13 +4132,25 @@ class MacroButton(QtWidgets.QPushButton):
         self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
-        self.clicked.connect(lambda: self.send_callback(self.hex_data))
+        self.clicked.connect(lambda: self.send_callback(self))
+        self.refresh_tooltip()
+
+    def set_can_mode(self, is_can):
+        self._can_mode = is_can
         self.refresh_tooltip()
 
     def refresh_tooltip(self):
         """Show the payload and hint that the button is editable."""
         payload = self.hex_data.strip() or '(empty)'
-        self.setToolTip(f'Send: {payload}\nRight-click to edit')
+        if self._can_mode:
+            if self.can_id.strip():
+                ext = ' EXT' if self.can_ext else ''
+                self.setToolTip(f'Send CAN frame: ID {self.can_id}{ext}, '
+                                f'data {payload}\nRight-click to edit')
+            else:
+                self.setToolTip('No CAN ID set for this macro\nRight-click to edit')
+        else:
+            self.setToolTip(f'Send: {payload}\nRight-click to edit')
 
     def paintEvent(self, event):
         """Draw the label elided so long macro names never clip mid-glyph."""
@@ -3563,10 +4170,13 @@ class MacroButton(QtWidgets.QPushButton):
             self._edit_macro()
 
     def _edit_macro(self):
-        dialog = MacroEditDialog(self.text(), self.hex_data, self)
+        dialog = MacroEditDialog(self.text(), self.hex_data, self,
+                                 can_id=self.can_id, can_ext=self.can_ext)
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             self.setText(dialog.label_edit.text())
             self.hex_data = dialog.hex_edit.text()
+            self.can_id = dialog.can_id_edit.text().strip()
+            self.can_ext = dialog.can_ext_check.isChecked()
             self.refresh_tooltip()
             self.macroChanged.emit()
 
@@ -3574,14 +4184,30 @@ class MacroButton(QtWidgets.QPushButton):
 class SerialSendView(QtWidgets.QWidget):
 
     serialSendSignal = QtCore.pyqtSignal(str)
+    canSendSignal = QtCore.pyqtSignal(str, bool, str)  # id_hex, extended, data_hex
 
     def __init__(self, parent):
         super().__init__(parent)
 
         self.history = []
         self.history_index = 0
+        self._can_mode = False
 
         send_font = QtGui.QFont('Segoe UI', 10)
+
+        # CAN mode widgets (swap in for charMode / lineEnding)
+        self.canIdEdit = QtWidgets.QLineEdit(self)
+        self.canIdEdit.setPlaceholderText('ID (hex)')
+        self.canIdEdit.setToolTip('CAN arbitration ID as hex, e.g. 123 or 18FEF100')
+        self.canIdEdit.setFont(send_font)
+        self.canIdEdit.setMinimumHeight(30)
+        self.canIdEdit.setVisible(False)
+
+        self.canExtCheck = QtWidgets.QCheckBox('Ext (29-bit)', self)
+        self.canExtCheck.setToolTip('Send with an extended 29-bit identifier')
+        self.canExtCheck.setFont(send_font)
+        self.canExtCheck.setMinimumHeight(30)
+        self.canExtCheck.setVisible(False)
 
         self.charMode = QtWidgets.QComboBox(self)
         self.charMode.addItems(['ASCII', 'HEX', 'BINARY'])
@@ -3622,7 +4248,10 @@ class SerialSendView(QtWidgets.QWidget):
         macros = self._load_macros()
         self.macro_buttons = []
         for macro in macros:
-            btn = MacroButton(macro["label"], macro["hex"], self.sendRaw, self)
+            btn = MacroButton(macro.get("label", ""), macro.get("hex", ""),
+                              self._macro_clicked, self,
+                              can_id=macro.get("can_id", ""),
+                              can_ext=bool(macro.get("can_ext", False)))
             btn.macroChanged.connect(self._save_macros)
             self.macro_buttons.append(btn)
 
@@ -3631,9 +4260,13 @@ class SerialSendView(QtWidgets.QWidget):
         self.layout().addWidget(HLine(),       0, 0, 1, NUM_MACRO_BUTTONS)
         for i, btn in enumerate(self.macro_buttons):
             self.layout().addWidget(btn,       2, i, 1, 1)
+        # charMode/canIdEdit and lineEnding/canExtCheck share grid cells;
+        # only one of each pair is visible at a time (Serial vs CAN mode).
         self.layout().addWidget(self.charMode, 1, 0, 1, 1)
+        self.layout().addWidget(self.canIdEdit,         1, 0, 1, 1)
         self.layout().addWidget(self.sendData,          1, 1, 1, 5)
         self.layout().addWidget(self.lineEnding,        1, 6, 1, 1)
+        self.layout().addWidget(self.canExtCheck,       1, 6, 1, 1)
         self.layout().addWidget(self.sendButton,        1, 7, 1, 1)
         self.layout().setHorizontalSpacing(6)
         self.layout().setVerticalSpacing(6)
@@ -3651,10 +4284,7 @@ class SerialSendView(QtWidgets.QWidget):
     def eventFilter(self, obj, event):
         if event.type() == QtCore.QEvent.KeyPress and obj is self.sendData:
             if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter) and self.sendData.hasFocus():
-                self.serialSendSignal.emit(self.sendData.toPlainText())
-                self._record_history(self.sendData.toPlainText())
-                self.sendData.clear()
-                self.history_index = 0
+                self._emit_send()
                 return True
             elif event.key() == QtCore.Qt.Key_Up and self.sendData.hasFocus():
                 if self.history and self.history_index < len(self.history):
@@ -3677,6 +4307,19 @@ class SerialSendView(QtWidgets.QWidget):
                 return True
         return super().eventFilter(obj, event)
 
+    def set_can_mode(self, is_can):
+        """Swap the send row between serial (mode + line ending) and CAN
+        (ID + extended flag) layouts. The data field and macros are shared."""
+        self._can_mode = is_can
+        self.charMode.setVisible(not is_can)
+        self.lineEnding.setVisible(not is_can)
+        self.canIdEdit.setVisible(is_can)
+        self.canExtCheck.setVisible(is_can)
+        self.sendData.setPlaceholderText(
+            'Data bytes as hex, e.g. 01 A2 FF (max 8)' if is_can else '')
+        for btn in self.macro_buttons:
+            btn.set_can_mode(is_can)
+
     def sendRaw(self, raw_hex_data):
         oldmode = self.charMode.currentIndex()
         oldending = self.lineEnding.currentIndex()
@@ -3686,6 +4329,19 @@ class SerialSendView(QtWidgets.QWidget):
         self.charMode.setCurrentIndex(oldmode)
         self.lineEnding.setCurrentIndex(oldending)
 
+    def _macro_clicked(self, btn):
+        """Send a macro: serial hex payload, or a CAN frame in CAN mode."""
+        if self._can_mode:
+            if not btn.can_id.strip():
+                monitor = self.window()
+                if hasattr(monitor, 'statusText'):
+                    monitor.statusText.setText(
+                        f'Macro "{btn.text()}" has no CAN ID (right-click to edit)')
+                return
+            self.canSendSignal.emit(btn.can_id, btn.can_ext, btn.hex_data)
+        else:
+            self.sendRaw(btn.hex_data)
+
     def _record_history(self, text):
         """Add a sent command to history, skipping blanks and repeats."""
         if text and (not self.history or self.history[-1] != text):
@@ -3693,15 +4349,25 @@ class SerialSendView(QtWidgets.QWidget):
             if len(self.history) > 200:
                 del self.history[:-200]
 
-    def sendButtonClicked(self):
-        self.serialSendSignal.emit(self.sendData.toPlainText())
-        self._record_history(self.sendData.toPlainText())
+    def _emit_send(self):
+        text = self.sendData.toPlainText()
+        if self._can_mode:
+            self.canSendSignal.emit(
+                self.canIdEdit.text().strip(), self.canExtCheck.isChecked(), text)
+        else:
+            self.serialSendSignal.emit(text)
+        self._record_history(text)
         self.sendData.clear()
         self.history_index = 0
 
+    def sendButtonClicked(self):
+        self._emit_send()
+
     def _get_macros_list(self):
         """Return current macro definitions as a list of dicts."""
-        return [{"label": btn.text(), "hex": btn.hex_data} for btn in self.macro_buttons]
+        return [{"label": btn.text(), "hex": btn.hex_data,
+                 "can_id": btn.can_id, "can_ext": btn.can_ext}
+                for btn in self.macro_buttons]
 
     def _load_macros_from_list(self, macros):
         """Restore macro buttons from a list of dicts."""
@@ -3710,6 +4376,8 @@ class SerialSendView(QtWidgets.QWidget):
         for btn, macro in zip(self.macro_buttons, macros):
             btn.setText(macro.get("label", ""))
             btn.hex_data = macro.get("hex", "")
+            btn.can_id = macro.get("can_id", "")
+            btn.can_ext = bool(macro.get("can_ext", False))
             btn.refresh_tooltip()
 
     def _load_macros(self):
@@ -3738,9 +4406,16 @@ class ToolBar(QtWidgets.QToolBar):
 
         toolbar_font = QtGui.QFont('Segoe UI', 10)
 
+        self.modeCombo = QtWidgets.QComboBox(self)
+        self.modeCombo.addItems(['Serial', 'CAN'])
+        self.modeCombo.setMinimumHeight(30)
+        self.modeCombo.setFont(toolbar_font)
+        self.modeCombo.setToolTip('Switch between serial terminal and CAN bus mode')
+        self.addWidget(self.modeCombo)
+
         serial_label = QtWidgets.QLabel(' Serial Port: ')
         serial_label.setFont(QtGui.QFont('Segoe UI', 10))
-        self.addWidget(serial_label)
+        self._serial_label_action = self.addWidget(serial_label)
 
         self.portOpenButton = QtWidgets.QPushButton('Open')
         self.portOpenButton.setObjectName('primaryButton')
@@ -3793,14 +4468,62 @@ class ToolBar(QtWidgets.QToolBar):
         self._flowControl.setFont(toolbar_font)
         self._flowControl.setMinimumHeight(30)
 
+        # CAN mode widgets (hidden until CAN mode is selected)
+        can_label = QtWidgets.QLabel(' CAN: ')
+        can_label.setFont(toolbar_font)
+
+        self.canInterfaces = QtWidgets.QComboBox(self)
+        self.canInterfaces.addItems(list(CAN_INTERFACES.keys()))
+        self.canInterfaces.setMinimumHeight(30)
+        self.canInterfaces.setFont(toolbar_font)
+        self.canInterfaces.setToolTip(
+            'CAN hardware backend (Kvaser CANlib / Ixxat VCI drivers must be installed)')
+
+        self.canChannels = QtWidgets.QComboBox(self)
+        self.canChannels.addItems([f'Channel {i}' for i in range(8)])
+        self.canChannels.setMinimumHeight(30)
+        self.canChannels.setFont(toolbar_font)
+
+        self.canBitrates = QtWidgets.QComboBox(self)
+        self.canBitrates.addItems([f'{b} kbit/s' for b in CAN_BITRATES])
+        self.canBitrates.setCurrentText('500 kbit/s')
+        self.canBitrates.setMinimumHeight(30)
+        self.canBitrates.setFont(toolbar_font)
+
         self.addWidget(self.portOpenButton)
-        self.addWidget(self.portNames)
-        self.addWidget(self.portScanButton)
-        self.addWidget(self.baudRates)
-        self.addWidget(self.dataBits)
-        self.addWidget(self._parity)
-        self.addWidget(self.stopBits)
-        self.addWidget(self._flowControl)
+        # addWidget returns a QAction; keep them so the two widget groups can
+        # be shown/hidden when the mode combo changes.
+        self._serial_actions = [
+            self._serial_label_action,
+            self.addWidget(self.portNames),
+            self.addWidget(self.portScanButton),
+            self.addWidget(self.baudRates),
+            self.addWidget(self.dataBits),
+            self.addWidget(self._parity),
+            self.addWidget(self.stopBits),
+            self.addWidget(self._flowControl),
+        ]
+        self._can_actions = [
+            self.addWidget(can_label),
+            self.addWidget(self.canInterfaces),
+            self.addWidget(self.canChannels),
+            self.addWidget(self.canBitrates),
+        ]
+        for action in self._can_actions:
+            action.setVisible(False)
+
+    def set_can_mode(self, is_can):
+        """Show the CAN widget group instead of the serial one (or back)."""
+        for action in self._serial_actions:
+            action.setVisible(not is_can)
+        for action in self._can_actions:
+            action.setVisible(is_can)
+
+    def canChannel(self):
+        return self.canChannels.currentIndex()
+
+    def canBitrate(self):
+        return int(self.canBitrates.currentText().split()[0]) * 1000
 
     def _populate_ports(self):
         previous = self.portNames.currentData()
@@ -3826,6 +4549,7 @@ class ToolBar(QtWidgets.QToolBar):
         self._populate_ports()
 
     def serialControlEnable(self, flag):
+        self.modeCombo.setEnabled(flag)
         self.portNames.setEnabled(flag)
         self.portScanButton.setEnabled(flag)
         self.baudRates.setEnabled(flag)
@@ -3833,6 +4557,9 @@ class ToolBar(QtWidgets.QToolBar):
         self._parity.setEnabled(flag)
         self.stopBits.setEnabled(flag)
         self._flowControl.setEnabled(flag)
+        self.canInterfaces.setEnabled(flag)
+        self.canChannels.setEnabled(flag)
+        self.canBitrates.setEnabled(flag)
 
     def baudRate(self):
         return int(self.baudRates.currentText())
