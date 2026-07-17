@@ -71,6 +71,256 @@ DEFAULT_MACROS = [
     {"label": "__OTA__",        "hex": "5F5F4F54415F5F0A"},
 ]
 
+# --- Application stylesheet (light theme) ---
+# One coherent design: neutral grays/whites with a single muted-blue accent
+# (#3574b3) reserved for primary actions (Open / Send). QComboBox is styled
+# with explicit ::drop-down sub-control; QSpinBox is intentionally left
+# native so its up/down buttons keep rendering correctly on Windows.
+ACCENT = '#3574b3'
+
+# Connection-status colors for the DB-9 connector indicator (and window icon).
+# Muted green/red picked to sit next to the neutral gray theme rather than
+# the former traffic-light #22bb22 / #cc2222.
+CONNECTED_COLOR = '#3d9950'
+DISCONNECTED_COLOR = '#c0453d'
+
+LIGHT_QSS = """
+QToolTip {
+    color: #24292e; background-color: #f9fafb;
+    border: 1px solid #b7bcc2; padding: 3px 6px;
+}
+
+QToolBar {
+    background: #f4f5f6;
+    border-bottom: 1px solid #d5d8db;
+    spacing: 4px;
+    padding: 3px 4px;
+}
+
+QMenuBar { background: #f4f5f6; }
+QMenuBar::item { background: transparent; padding: 4px 10px; }
+QMenuBar::item:selected { background: #e2e8ee; border-radius: 3px; }
+QMenu { background: #ffffff; border: 1px solid #c3c8cd; }
+QMenu::item { padding: 4px 24px; }
+QMenu::item:selected { background: #dce8f5; color: #24292e; }
+
+QStatusBar { background: #f4f5f6; border-top: 1px solid #d5d8db; }
+QStatusBar::item { border: none; }
+
+/* Secondary buttons: neutral, subtle border, clear hover/pressed states */
+QPushButton {
+    background-color: #fbfbfc;
+    border: 1px solid #c3c8cd;
+    border-radius: 3px;
+    padding: 3px 12px;
+    color: #24292e;
+}
+QPushButton:hover { background-color: #f0f4f8; border-color: #a8b3bd; }
+QPushButton:pressed { background-color: #e2e8ee; }
+QPushButton:checked { background-color: #e2e8ee; border-color: #a8b3bd; }
+QPushButton:focus { border-color: #3574b3; }
+QPushButton:disabled {
+    color: #9aa0a6; background-color: #f4f5f6; border-color: #dcdfe2;
+}
+
+/* Primary actions (Open / Send): the one accent color, used sparingly */
+QPushButton#primaryButton {
+    background-color: #3574b3;
+    border: 1px solid #2c619b;
+    color: #ffffff;
+    font-weight: 600;
+}
+QPushButton#primaryButton:hover { background-color: #3f81c4; border-color: #2c619b; }
+QPushButton#primaryButton:pressed { background-color: #2a5c92; }
+QPushButton#primaryButton:checked { background-color: #2a5c92; border-color: #234e7c; }
+QPushButton#primaryButton:focus { border-color: #1d4570; }
+QPushButton#primaryButton:disabled {
+    background-color: #9db8d2; border-color: #8fa9c2; color: #f0f4f8;
+}
+
+/* Record button lives in the status bar: keep it compact. While recording
+   (button is checkable) it turns the same muted red as the disconnected
+   connector icon, instead of an ad-hoc inline style. */
+QPushButton#recordButton { padding: 1px 12px; }
+QPushButton#recordButton:checked {
+    background-color: #c0453d;
+    border-color: #a93b34;
+    color: #ffffff;
+    font-weight: 600;
+}
+QPushButton#recordButton:checked:hover { background-color: #cb524a; }
+QPushButton#recordButton:checked:focus { border-color: #8f312b; }
+
+QComboBox {
+    background-color: #ffffff;
+    border: 1px solid #c3c8cd;
+    border-radius: 3px;
+    padding: 2px 6px 2px 8px;
+    color: #24292e;
+}
+QComboBox:hover { border-color: #a8b3bd; }
+QComboBox:focus { border-color: #3574b3; }
+QComboBox:disabled { color: #9aa0a6; background-color: #f4f5f6; }
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 20px;
+    border: none;
+}
+QComboBox::down-arrow {
+    image: url(%COMBO_ARROW%);
+    width: 10px;
+    height: 10px;
+}
+QComboBox QAbstractItemView {
+    background: #ffffff;
+    border: 1px solid #c3c8cd;
+    selection-background-color: #dce8f5;
+    selection-color: #24292e;
+    outline: none;
+}
+
+QLineEdit, QTextEdit {
+    background-color: #ffffff;
+    border: 1px solid #c9cdd2;
+    border-radius: 3px;
+    selection-background-color: #b8d4f0;
+    selection-color: #1a1d20;
+}
+QLineEdit:focus, QTextEdit:focus { border: 1px solid #3574b3; }
+QLineEdit:disabled, QTextEdit:disabled { background-color: #f4f5f6; color: #9aa0a6; }
+
+/* Section headers: "Data: ASCII", "Data: HEX", "Converter" */
+QLabel#sectionLabel { color: #5a6570; font-weight: 600; }
+"""
+
+# Dark-mode counterpart. Note: before this stylesheet existed, the native
+# Windows style ignored the dark palette for buttons/combos (white boxes with
+# white text); these rules make dark mode actually readable.
+DARK_QSS = """
+QToolTip { color: #ffffff; background-color: #2a2a2a; border: 1px solid #666666; padding: 3px 6px; }
+
+QToolBar { background: #2f2f2f; border-bottom: 1px solid #1f1f1f; spacing: 4px; padding: 3px 4px; }
+QStatusBar { background: #2f2f2f; border-top: 1px solid #1f1f1f; }
+QStatusBar::item { border: none; }
+
+QMenuBar { background: #2f2f2f; color: #e8e8e8; }
+QMenuBar::item { background: transparent; padding: 4px 10px; }
+QMenuBar::item:selected { background: #44484b; border-radius: 3px; }
+QMenu { background: #2b2b2b; color: #e8e8e8; border: 1px solid #555555; }
+QMenu::item { padding: 4px 24px; }
+QMenu::item:selected { background: #3574b3; color: #ffffff; }
+
+QPushButton {
+    background-color: #3c3f41;
+    border: 1px solid #5a5d5f;
+    border-radius: 3px;
+    padding: 3px 12px;
+    color: #e8e8e8;
+}
+QPushButton:hover { background-color: #46494b; border-color: #6f7375; }
+QPushButton:pressed { background-color: #2f3234; }
+QPushButton:checked { background-color: #2f3234; border-color: #6f7375; }
+QPushButton:focus { border-color: #2a82da; }
+QPushButton:disabled { color: #7d8184; background-color: #333537; border-color: #4a4d4f; }
+
+QPushButton#primaryButton {
+    background-color: #3574b3;
+    border: 1px solid #2c619b;
+    color: #ffffff;
+    font-weight: 600;
+}
+QPushButton#primaryButton:hover { background-color: #3f81c4; border-color: #2c619b; }
+QPushButton#primaryButton:pressed { background-color: #2a5c92; }
+QPushButton#primaryButton:checked { background-color: #2a5c92; border-color: #234e7c; }
+QPushButton#primaryButton:disabled {
+    background-color: #3e4c5c; border-color: #37424f; color: #8d99a5;
+}
+
+QPushButton#recordButton { padding: 1px 12px; }
+QPushButton#recordButton:checked {
+    background-color: #c0453d;
+    border-color: #a93b34;
+    color: #ffffff;
+    font-weight: 600;
+}
+QPushButton#recordButton:checked:hover { background-color: #cb524a; }
+QPushButton#recordButton:checked:focus { border-color: #8f312b; }
+
+QComboBox {
+    background-color: #2f3234;
+    border: 1px solid #5a5d5f;
+    border-radius: 3px;
+    padding: 2px 6px 2px 8px;
+    color: #e8e8e8;
+}
+QComboBox:hover { border-color: #6f7375; }
+QComboBox:focus { border-color: #2a82da; }
+QComboBox:disabled { color: #7d8184; background-color: #333537; }
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 20px;
+    border: none;
+}
+QComboBox::down-arrow {
+    image: url(%COMBO_ARROW%);
+    width: 10px;
+    height: 10px;
+}
+QComboBox QAbstractItemView {
+    background: #2b2b2b;
+    color: #e8e8e8;
+    border: 1px solid #555555;
+    selection-background-color: #3574b3;
+    selection-color: #ffffff;
+    outline: none;
+}
+
+QLineEdit, QTextEdit {
+    background-color: #232323;
+    border: 1px solid #4a4d4f;
+    border-radius: 3px;
+    color: #e8e8e8;
+    selection-background-color: #2a5c92;
+    selection-color: #ffffff;
+}
+QLineEdit:focus, QTextEdit:focus { border: 1px solid #2a82da; }
+QLineEdit:disabled, QTextEdit:disabled { background-color: #2c2e30; color: #7d8184; }
+
+/* Spin boxes: the native style paints them white-on-white in dark mode */
+QSpinBox {
+    background-color: #232323;
+    border: 1px solid #4a4d4f;
+    border-radius: 3px;
+    color: #e8e8e8;
+}
+QSpinBox:focus { border-color: #2a82da; }
+QSpinBox::up-button {
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 16px;
+    background: #3c3f41;
+    border-left: 1px solid #4a4d4f;
+    border-bottom: 1px solid #4a4d4f;
+    border-top-right-radius: 3px;
+}
+QSpinBox::down-button {
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: 16px;
+    background: #3c3f41;
+    border-left: 1px solid #4a4d4f;
+    border-bottom-right-radius: 3px;
+}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #46494b; }
+QSpinBox::up-button:pressed, QSpinBox::down-button:pressed { background: #2f3234; }
+QSpinBox::up-arrow { image: url(%ARROW_UP%); width: 10px; height: 10px; }
+QSpinBox::down-arrow { image: url(%ARROW_DOWN%); width: 10px; height: 10px; }
+
+QLabel#sectionLabel { color: #9aa5b0; font-weight: 600; }
+"""
+
 CONVERTERS = {
     'HEX --> ASCII': lambda v: bytes.fromhex(v).decode('ISO-8859-1'),
     'HEX --> DECIMAL': lambda v: str(int(v.replace(' ', ''), 16)),
@@ -228,25 +478,61 @@ class FrameReader:
         return results
 
 
+_ARROW_ICON_PATHS = {}
+
+
+def arrow_icon_url(color='#5a6570', direction='down'):
+    """Render a small arrow PNG once per (color, direction) -- QSS needs an
+    image once QComboBox/QSpinBox are styled -- and return its path in QSS
+    url() form (forward slashes)."""
+    key = (color, direction)
+    if key not in _ARROW_ICON_PATHS:
+        import tempfile
+        pixmap = QPixmap(10, 10)
+        pixmap.fill(QtCore.Qt.transparent)
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QColor(color))
+        if direction == 'down':
+            points = [(2.0, 3.5), (8.0, 3.5), (5.0, 7.0)]
+        else:
+            points = [(2.0, 6.5), (8.0, 6.5), (5.0, 3.0)]
+        p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in points]))
+        p.end()
+        path = os.path.join(
+            tempfile.gettempdir(),
+            f'axxterm_arrow_{direction}_{color.lstrip("#")}.png')
+        pixmap.save(path, 'PNG')
+        _ARROW_ICON_PATHS[key] = path.replace('\\', '/')
+    return _ARROW_ICON_PATHS[key]
+
+
 def create_connector_pixmap(color, width=71, height=30):
-    """Draw a DB-9 connector icon programmatically (no external PNG needed)."""
+    """Draw a DB-9 connector icon programmatically (no external PNG needed).
+
+    Flat, antialiased rendering in the app's neutral grays; only the D-shell
+    face carries the status color (green = connected, red = disconnected).
+    """
     pixmap = QPixmap(width, height)
     pixmap.fill(QtCore.Qt.transparent)
     p = QPainter(pixmap)
     p.setRenderHint(QPainter.Antialiasing)
 
     cy = height / 2.0
+    status = QColor(color)
+    status_edge = status.darker(120)
 
-    # 1. Outer white rounded rectangle (metal shell)
-    p.setPen(QtGui.QPen(QColor('#333333'), 1.5))
-    p.setBrush(QColor('#FFFFFF'))
-    p.drawRoundedRect(QtCore.QRectF(0.75, 0.75, width - 1.5, height - 1.5), 4, 4)
+    # 1. Outer rounded rectangle (metal shell): soft gray, subtle border
+    p.setPen(QtGui.QPen(QColor('#a8b3bd'), 1.0))
+    p.setBrush(QColor('#eef0f2'))
+    p.drawRoundedRect(QtCore.QRectF(0.5, 0.5, width - 1.0, height - 1.0), 5, 5)
 
     # 2. Inner D-shaped colored area (trapezoid: wider at top, narrower at bottom)
     d_left = 15.0
     d_right = width - 15.0
-    d_top = 4.0
-    d_bot = height - 4.0
+    d_top = 4.5
+    d_bot = height - 4.5
     taper = 1.5
     cr = 3.0
     d_path = QtGui.QPainterPath()
@@ -260,30 +546,25 @@ def create_connector_pixmap(color, width=71, height=30):
     d_path.lineTo(d_left, d_top + cr)
     d_path.quadTo(d_left, d_top, d_left + cr, d_top)
     d_path.closeSubpath()
-    p.setPen(QtGui.QPen(QColor('#333333'), 1.0))
-    p.setBrush(QColor(color))
+    p.setPen(QtGui.QPen(status_edge, 1.0))
+    p.setBrush(status)
     p.drawPath(d_path)
 
-    # 3. Mounting screws with Phillips cross-head
-    screw_r = 5.0
+    # 3. Mounting screws: small flat circles (no cross-head clutter)
+    screw_r = 3.5
     screw_lx = 8.0
     screw_rx = width - 8.0
-    p.setPen(QtGui.QPen(QColor('#666666'), 1.0))
-    p.setBrush(QColor('#DDDDDD'))
+    p.setPen(QtGui.QPen(QColor('#a8b3bd'), 1.0))
+    p.setBrush(QColor('#dcdfe2'))
     p.drawEllipse(QtCore.QPointF(screw_lx, cy), screw_r, screw_r)
     p.drawEllipse(QtCore.QPointF(screw_rx, cy), screw_r, screw_r)
-    cross = 3.0
-    p.setPen(QtGui.QPen(QColor('#888888'), 1.0))
-    for sx in [screw_lx, screw_rx]:
-        p.drawLine(QtCore.QPointF(sx - cross, cy), QtCore.QPointF(sx + cross, cy))
-        p.drawLine(QtCore.QPointF(sx, cy - cross), QtCore.QPointF(sx, cy + cross))
 
-    # 4. Pin holes: 5 top row, 4 bottom row
+    # 4. Pin holes: 5 top row, 4 bottom row, soft white on the status color
     d_cx = (d_left + d_right) / 2.0
-    pin_r = 1.7
+    pin_r = 1.5
     pin_spacing = 7.0
     p.setPen(QtCore.Qt.NoPen)
-    p.setBrush(QColor('#111111'))
+    p.setBrush(QColor(255, 255, 255, 225))
     for i in range(5):
         p.drawEllipse(QtCore.QPointF(d_cx + (i - 2) * pin_spacing, cy - 3.5), pin_r, pin_r)
     for i in range(4):
@@ -307,7 +588,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.layout.setContentsMargins(3, 3, 3, 3)
 
         self.setWindowTitle('AxxTerm')
-        self.setWindowIcon(QIcon(create_connector_pixmap('#22bb22')))
+        self.setWindowIcon(QIcon(create_connector_pixmap(CONNECTED_COLOR)))
 
         ### Menu Bar ###
         menubar = self.menuBar()
@@ -368,6 +649,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
         ### Status Bar ###
         self.setStatusBar(QtWidgets.QStatusBar(self))
         self._record_btn = QtWidgets.QPushButton('Record', self)
+        self._record_btn.setObjectName('recordButton')
         self._record_btn.setCheckable(True)
         self._record_btn.setFixedHeight(22)
         self._record_btn.clicked.connect(self._toggle_recording)
@@ -426,7 +708,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.toolBar.stopBits.currentIndexChanged.connect(lambda: self.schedule_save())
         self.toolBar._flowControl.currentIndexChanged.connect(lambda: self.schedule_save())
 
-        ### Load all settings ###
+        ### Apply default (light) theme, then load all settings ###
+        # (load_all_settings switches to the dark palette if the user saved it,
+        # but returns early when no settings file exists yet)
+        self._apply_light_palette()
         self.load_all_settings()
 
     def portOpen(self, flag):
@@ -455,12 +740,12 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self._tx_total = 0
                 self._reset_stream_state()
                 self.toolBar.serialControlEnable(False)
-                self.serialDataView.label.setPixmap(create_connector_pixmap('#22bb22'))
+                self.serialDataView.label.setPixmap(create_connector_pixmap(CONNECTED_COLOR))
         else:
             self.port.close()
             self.statusText.setText('Port closed')
             self.toolBar.serialControlEnable(True)
-            self.serialDataView.label.setPixmap(create_connector_pixmap('#cc2222'))
+            self.serialDataView.label.setPixmap(create_connector_pixmap(DISCONNECTED_COLOR))
 
     def _reset_stream_state(self):
         """Drop buffered/partial stream state so a new connection starts clean."""
@@ -620,12 +905,16 @@ class SerialMonitor(QtWidgets.QMainWindow):
         palette.setColor(QtGui.QPalette.HighlightedText, QColor(35, 35, 35))
         QtWidgets.QApplication.instance().setPalette(palette)
         QtWidgets.QApplication.instance().setStyleSheet(
-            "QToolTip { color: #ffffff; background-color: #2a2a2a; border: 1px solid white; }")
+            DARK_QSS
+            .replace('%COMBO_ARROW%', arrow_icon_url('#b8bfc6', 'down'))
+            .replace('%ARROW_UP%', arrow_icon_url('#b8bfc6', 'up'))
+            .replace('%ARROW_DOWN%', arrow_icon_url('#b8bfc6', 'down')))
 
     def _apply_light_palette(self):
         QtWidgets.QApplication.instance().setPalette(
             QtWidgets.QApplication.style().standardPalette())
-        QtWidgets.QApplication.instance().setStyleSheet("")
+        QtWidgets.QApplication.instance().setStyleSheet(
+            LIGHT_QSS.replace('%COMBO_ARROW%', arrow_icon_url('#5a6570', 'down')))
 
     def _toggle_dark_mode(self):
         self._dark_mode = self._dark_mode_action.isChecked()
@@ -653,7 +942,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self.port.close()
             self.toolBar.portOpenButton.setChecked(False)
             self.toolBar.serialControlEnable(True)
-            self.serialDataView.label.setPixmap(create_connector_pixmap('#cc2222'))
+            self.serialDataView.label.setPixmap(create_connector_pixmap(DISCONNECTED_COLOR))
             if self._auto_reconnect:
                 self.statusText.setText(
                     f'Port disconnected - reconnecting to {self._reconnect_port_name}...')
@@ -679,7 +968,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self._reconnect_port_name = ''
             self.toolBar.portOpenButton.setChecked(True)
             self.toolBar.serialControlEnable(False)
-            self.serialDataView.label.setPixmap(create_connector_pixmap('#22bb22'))
+            self.serialDataView.label.setPixmap(create_connector_pixmap(CONNECTED_COLOR))
             self._rx_bytes = 0
             self._tx_bytes = 0
             self._rx_total = 0
@@ -716,7 +1005,6 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self._rx_log_pending = ''
             self._record_btn.setChecked(False)
             self._record_btn.setText('Record')
-            self._record_btn.setStyleSheet('')
             self._record_action.setText('Start Recording')
             self.statusText.setText('Recording stopped: log file write failed')
 
@@ -736,7 +1024,6 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self._recording = False
             self._record_btn.setChecked(False)
             self._record_btn.setText('Record')
-            self._record_btn.setStyleSheet('')
             self._record_action.setText('Start Recording')
             self.statusText.setText('Recording stopped')
         else:
@@ -754,8 +1041,6 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self._recording = True
             self._record_btn.setChecked(True)
             self._record_btn.setText('Recording...')
-            self._record_btn.setStyleSheet(
-                'QPushButton { background-color: #cc2222; color: white; font-weight: bold; }')
             self._record_action.setText('Stop Recording')
             self.statusText.setText(f'Recording to {filename}')
 
@@ -1036,10 +1321,12 @@ class SerialDataView(QtWidgets.QWidget):
         self.serialDataHex.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
         self.label_data_flow = QtWidgets.QLabel('Data: HEX')
+        self.label_data_flow.setObjectName('sectionLabel')
         self.label_data_flow.setFont(QtGui.QFont('Segoe UI', 10))
         self.label_data_flow.setIndent(5)
 
         self.label_sent_data = QtWidgets.QLabel('Data: ASCII')
+        self.label_sent_data.setObjectName('sectionLabel')
         self.label_sent_data.setFont(QtGui.QFont('Segoe UI', 10))
         self.label_sent_data.setIndent(5)
 
@@ -1081,9 +1368,10 @@ class SerialDataView(QtWidgets.QWidget):
         self.clear_button.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred)
 
         self.label = QLabel(self)
-        self.label.setPixmap(create_connector_pixmap('#cc2222'))
+        self.label.setPixmap(create_connector_pixmap(DISCONNECTED_COLOR))
 
         self.converter_label = QtWidgets.QLabel('Converter')
+        self.converter_label.setObjectName('sectionLabel')
         self.converter_label.setFont(QtGui.QFont('Segoe UI', 10))
         self.converter_label.setIndent(5)
 
@@ -1135,7 +1423,7 @@ class SerialDataView(QtWidgets.QWidget):
         # Endianness (binary/frame)
         self.endian_combo = QtWidgets.QComboBox()
         self.endian_combo.addItems(['Little Endian', 'Big Endian'])
-        self.endian_combo.setMinimumWidth(70)
+        self.endian_combo.setMinimumWidth(110)
         self.endian_combo.currentTextChanged.connect(self._on_setting_changed)
 
         # Binary-only: sync button
@@ -3241,12 +3529,31 @@ class MacroButton(QtWidgets.QPushButton):
         super().__init__(label, parent)
         self.hex_data = hex_data
         self.send_callback = send_callback
-        self.setFont(QtGui.QFont('Segoe UI', 10))
-        self.setStyleSheet('color: white; background-color: #006600')
-        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
+        self.setFont(QtGui.QFont('Segoe UI', 9))
+        self.setFixedHeight(28)
+        self.setMinimumWidth(40)
+        # Ignored horizontally: long labels must not inflate the layout --
+        # the 8 buttons share the row evenly and the label elides instead.
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
         self.clicked.connect(lambda: self.send_callback(self.hex_data))
+        self.refresh_tooltip()
+
+    def refresh_tooltip(self):
+        """Show the payload and hint that the button is editable."""
+        payload = self.hex_data.strip() or '(empty)'
+        self.setToolTip(f'Send: {payload}\nRight-click to edit')
+
+    def paintEvent(self, event):
+        """Draw the label elided so long macro names never clip mid-glyph."""
+        painter = QtWidgets.QStylePainter(self)
+        option = QtWidgets.QStyleOptionButton()
+        self.initStyleOption(option)
+        metrics = option.fontMetrics
+        option.text = metrics.elidedText(
+            self.text(), QtCore.Qt.ElideRight, max(self.width() - 14, 10))
+        painter.drawControl(QtWidgets.QStyle.CE_PushButton, option)
 
     def _show_context_menu(self, pos):
         menu = QtWidgets.QMenu(self)
@@ -3260,6 +3567,7 @@ class MacroButton(QtWidgets.QPushButton):
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             self.setText(dialog.label_edit.text())
             self.hex_data = dialog.hex_edit.text()
+            self.refresh_tooltip()
             self.macroChanged.emit()
 
 
@@ -3303,8 +3611,11 @@ class SerialSendView(QtWidgets.QWidget):
         self.sendData.setFont(send_font)
 
         self.sendButton = QtWidgets.QPushButton('Send')
+        self.sendButton.setObjectName('primaryButton')
         self.sendButton.clicked.connect(self.sendButtonClicked)
         self.sendButton.setFont(send_font)
+        self.sendButton.setMinimumHeight(30)
+        self.sendButton.setMinimumWidth(90)
         self.sendButton.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
 
         # Macro buttons (right-click to edit)
@@ -3324,7 +3635,9 @@ class SerialSendView(QtWidgets.QWidget):
         self.layout().addWidget(self.sendData,          1, 1, 1, 5)
         self.layout().addWidget(self.lineEnding,        1, 6, 1, 1)
         self.layout().addWidget(self.sendButton,        1, 7, 1, 1)
-        self.layout().setContentsMargins(1, 1, 1, 1)
+        self.layout().setHorizontalSpacing(6)
+        self.layout().setVerticalSpacing(6)
+        self.layout().setContentsMargins(2, 1, 2, 4)
 
     def _strip_newlines(self):
         """Remove newlines from input (single-line send field)."""
@@ -3397,6 +3710,7 @@ class SerialSendView(QtWidgets.QWidget):
         for btn, macro in zip(self.macro_buttons, macros):
             btn.setText(macro.get("label", ""))
             btn.hex_data = macro.get("hex", "")
+            btn.refresh_tooltip()
 
     def _load_macros(self):
         """Load macro definitions from settings file, or use defaults."""
@@ -3429,14 +3743,16 @@ class ToolBar(QtWidgets.QToolBar):
         self.addWidget(serial_label)
 
         self.portOpenButton = QtWidgets.QPushButton('Open')
+        self.portOpenButton.setObjectName('primaryButton')
         self.portOpenButton.setCheckable(True)
-        self.portOpenButton.setMinimumHeight(32)
+        self.portOpenButton.setMinimumHeight(30)
+        self.portOpenButton.setMinimumWidth(80)
         self.portOpenButton.setFont(toolbar_font)
 
         self.portScanButton = QtWidgets.QPushButton('Scan')
         self.portScanButton.setCheckable(False)
         self.portScanButton.clicked.connect(self.scan_button_Clicked)
-        self.portScanButton.setMinimumHeight(32)
+        self.portScanButton.setMinimumHeight(30)
         self.portScanButton.setFont(toolbar_font)
 
         self.portNames = QtWidgets.QComboBox(self)
@@ -3560,7 +3876,7 @@ def _install_excepthook():
 if __name__ == '__main__':
     _install_excepthook()
     app = QtWidgets.QApplication(sys.argv)
-    app.setWindowIcon(QIcon(create_connector_pixmap('#22bb22')))
+    app.setWindowIcon(QIcon(create_connector_pixmap(CONNECTED_COLOR)))
     window = SerialMonitor()
     if not window._geometry_restored:
         screen = app.primaryScreen().availableGeometry()
