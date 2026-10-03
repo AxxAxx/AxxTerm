@@ -1,5 +1,9 @@
-# AxxTerm user config
+# AxxTerm user config (and probe/backup variants)
 AxxTerm_settings.json
+AxxTerm_settings.json.*
+
+# AxxTerm recordings (Record button: .txt log + Vector .asc in CAN mode)
+AxxTerm_log_*
 
 # Build artifacts
 build/

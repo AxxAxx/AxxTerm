@@ -18,6 +18,14 @@ w.show()
 w.portOpen(True)
 w.toolBar.portOpenButton.setChecked(True)
 
+# The bus now opens on a worker thread; wait for it before pumping frames
+import time
+deadline = time.monotonic() + 10
+while w._can_bus is None and time.monotonic() < deadline:
+    app.processEvents()
+    time.sleep(0.01)
+assert w._can_bus is not None, 'CAN bus did not open'
+
 peer = AxxTerm.pycan.Bus(interface='virtual', channel=0)
 count = [0]
 

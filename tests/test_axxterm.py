@@ -12,6 +12,7 @@ so they never touch a real AxxTerm_settings.json.
 """
 import os
 import sys
+import json
 import struct
 import tempfile
 import importlib.util
@@ -419,14 +420,360 @@ def test_can_send_validation():
     win.close()
 
 
+def test_custom_baud_rate_entry():
+    win = _fresh_monitor()
+    win.toolBar.baudRates.setCurrentText('250000')  # not in the preset list
+    assert win.toolBar.baudRate() == 250000
+    win.toolBar.baudRates.setCurrentText('')
+    assert win.toolBar.baudRate() == 115200  # safe fallback, no crash
+    win.close()
+
+
+def test_display_timestamps_prefix_each_line():
+    win = _fresh_monitor()
+    dv = win.serialDataView
+    dv.show_timestamps = True
+    dv.appendSerialText('one\ntwo', 'read')      # 'two' has no newline yet
+    dv.appendSerialText(' more\nthree\n', 'read')  # continuation, then new line
+    text = dv.serialData.toPlainText()
+    lines = text.split('\n')
+    assert lines[0].startswith('[') and lines[0].endswith('one')
+    assert lines[1].startswith('[') and lines[1].endswith('two more')
+    # continuation chunk must NOT get a second stamp mid-line
+    assert lines[1].count('[') == 1
+    assert lines[2].startswith('[') and lines[2].endswith('three')
+    win.close()
+
+
+def test_repeat_send_reemits_payload():
+    win = _fresh_monitor()
+    sv = win.serialSendView
+    sent = []
+    sv.serialSendSignal.connect(lambda t: sent.append(t))
+    sv.repeatCheck.setChecked(True)
+    sv.repeatSpin.setValue(50)
+    sv.sendData.setPlainText('ping')
+    sv._emit_send()
+    assert sent == ['ping']
+    assert sv._repeat_timer.isActive()
+    assert sv.sendData.toPlainText() == 'ping'  # stays visible while repeating
+    sv._repeat_fire()
+    sv._repeat_fire()
+    assert sent == ['ping', 'ping', 'ping']
+    sv.repeatCheck.setChecked(False)  # uncheck stops the repeat
+    assert not sv._repeat_timer.isActive() and sv._repeat_payload is None
+    win.close()
+
+
+def test_stop_repeat_on_disconnect_and_mode_switch():
+    win = _fresh_monitor()
+    sv = win.serialSendView
+    sv.repeatCheck.setChecked(True)
+    sv.sendData.setPlainText('x')
+    sv._emit_send()
+    assert sv._repeat_timer.isActive()
+    win.toolBar.modeCombo.setCurrentText('CAN')  # mode switch kills the repeat
+    assert not sv._repeat_timer.isActive()
+    assert not sv.repeatCheck.isChecked()
+    win.close()
+
+
+def test_can_view_id_filter():
+    win = _fresh_monitor()
+    cv = win.canView
+
+    class _M:
+        def __init__(self, cid):
+            self.arbitration_id = cid
+
+    cv.filter_edit.setText('123, 18FEF100')
+    assert cv._frame_passes(_M(0x123)) and cv._frame_passes(_M(0x18FEF100))
+    assert not cv._frame_passes(_M(0x456))
+    cv.filter_edit.setText('!456')
+    assert cv._frame_passes(_M(0x123)) and not cv._frame_passes(_M(0x456))
+    cv.filter_edit.setText('')
+    assert cv._frame_passes(_M(0x456))
+    win.close()
+
+
+def test_freeze_buffers_display_and_resumes():
+    win = _fresh_monitor()
+    win.serialDataView.freeze_btn.setChecked(True)
+    win._rx_buffer.extend(b'hello\n')
+    win._flush_display()
+    assert win._rx_buffer  # frozen: nothing consumed
+    assert 'hello' not in win.serialDataView.serialData.toPlainText()
+    win.serialDataView.freeze_btn.setChecked(False)
+    win._flush_display()
+    assert not win._rx_buffer
+    assert 'hello' in win.serialDataView.serialData.toPlainText()
+    win.close()
+
+
+def test_trigger_level_compares_scaled_values():
+    win, dv = _new_view(mode='ASCII', nch=1)
+    dv.channel_scale = {0: 10.0}
+    dv._invalidate_scale_cache()
+    dv._trigger_enabled = True
+    dv._trigger_armed = True
+    dv._trigger_channel = 0
+    dv._trigger_level = 5.0   # displayed units (raw * 10)
+    dv._trigger_edge = 'rising'
+    dv._ingest_row([0.4])    # scaled 4.0 - below level
+    dv._ingest_row([0.6])    # scaled 6.0 - crosses level: must fire
+    assert dv._trigger_countdown > 0, 'trigger did not fire in scaled units'
+    win.close()
+
+
+def test_settings_restore_survives_bad_values():
+    _isolate_settings()
+    bad = {
+        'plot': {
+            'num_points': 500,
+            'channel_scale': {'0': 'not-a-number'},  # malformed entry
+            'show_plot': False,
+        },
+    }
+    with open(axx.SETTINGS_FILE, 'w') as f:
+        json.dump(bad, f)
+    win = axx.SerialMonitor()
+    # the malformed scale is skipped; everything else still restores
+    assert win.serialDataView.plot_length_spin.value() == 500
+    assert win.serialDataView.channel_scale == {}
+    _isolate_settings()
+    win.close()
+
+
+def test_load_settings_returns_false_on_garbage():
+    win = _fresh_monitor()
+    garbage = os.path.join(_TMPDIR, 'garbage.json')
+    with open(garbage, 'w') as f:
+        f.write('this is not json')
+    assert win.load_all_settings(garbage) is False
+    lst = os.path.join(_TMPDIR, 'list.json')
+    with open(lst, 'w') as f:
+        json.dump([1, 2, 3], f)
+    assert win.load_all_settings(lst) is False
+    win.close()
+
+
+def test_invalid_sync_word_warns_and_keeps_old():
+    win = _fresh_monitor()
+    dv = win.serialDataView
+    dv.data_mode.setCurrentText('Custom Frame')
+    old_sync = dv._frame_reader.sync_word
+    dv.sync_word_edit.setText('XYZ')  # not hex
+    dv._apply_reader_settings()
+    assert dv._frame_reader.sync_word == old_sync
+    assert 'Invalid start byte' in win.statusText.text()
+    win.close()
+
+
+def test_can_fixed_view_capped_against_id_churn():
+    model = axx.CanFrameModel()
+    model.set_fixed_mode(True)
+    old_cap = axx.CAN_MAX_SCROLL_ROWS
+    axx.CAN_MAX_SCROLL_ROWS = 5
+    try:
+        class _M:
+            def __init__(self, cid):
+                self.arbitration_id = cid
+                self.is_extended_id = False
+                self.data = b'\x01'
+                self.dlc = 1
+                self.timestamp = 1.0
+        model.add_frames([('RX', _M(i)) for i in range(20)])
+        assert model.rowCount() == 5
+    finally:
+        axx.CAN_MAX_SCROLL_ROWS = old_cap
+
+
+def _pycan_available():
+    try:
+        axx._ensure_pycan()
+        return True
+    except ImportError:
+        return False  # python-can not installed; CAN tests skip
+
+
+def _wait_for(cond, timeout=5.0):
+    """Pump the event loop until cond() is true (bus open/close is async)."""
+    deadline = axx.time.monotonic() + timeout
+    while axx.time.monotonic() < deadline:
+        _app.processEvents()
+        if cond():
+            return True
+        axx.time.sleep(0.01)
+    return cond()
+
+
+def test_heavy_modules_import_lazily():
+    """Importing AxxTerm must not import python-can or pyqtgraph (together
+    they cost ~6 s on a cold start); they load on first CAN open / plot use."""
+    import subprocess
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('axxterm', {os.path.abspath(_SRC)!r})\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['axxterm'] = m\n"
+        "spec.loader.exec_module(m)\n"
+        "assert 'pyqtgraph' not in sys.modules, 'pyqtgraph imported eagerly'\n"
+        "assert 'can' not in sys.modules, 'python-can imported eagerly'\n"
+    )
+    r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_can_open_does_not_block_gui():
+    """portOpen(True) must return immediately; the bus opens on a worker
+    thread (real Kvaser/Ixxat drivers block for seconds during open)."""
+    if not _pycan_available():
+        return
+    win = _fresh_monitor()
+    win.toolBar.modeCombo.setCurrentText('CAN')
+    win.toolBar.canInterfaces.setCurrentText('Virtual')
+    orig = axx._create_can_bus
+
+    def slow_create(interface, channel, bitrate):
+        axx.time.sleep(0.5)
+        return orig(interface, channel, bitrate)
+
+    axx._create_can_bus = slow_create
+    try:
+        t = axx.time.monotonic()
+        win.portOpen(True)
+        elapsed = axx.time.monotonic() - t
+        assert elapsed < 0.2, f'portOpen blocked the GUI thread for {elapsed:.2f}s'
+        assert win._can_bus is None  # not open yet
+        assert _wait_for(lambda: win._can_bus is not None)
+    finally:
+        axx._create_can_bus = orig
+        win.portOpen(False)
+        _wait_for(lambda: not win._can_closers or
+                  not any(c.isRunning() for c in win._can_closers))
+        win.close()
+
+
+def test_can_open_cancelled_while_opening():
+    """Closing (or switching mode) while the bus is still opening must not
+    leave a stray open bus behind."""
+    if not _pycan_available():
+        return
+    win = _fresh_monitor()
+    win.toolBar.modeCombo.setCurrentText('CAN')
+    win.toolBar.canInterfaces.setCurrentText('Virtual')
+    orig = axx._create_can_bus
+
+    def slow_create(interface, channel, bitrate):
+        axx.time.sleep(0.3)
+        return orig(interface, channel, bitrate)
+
+    axx._create_can_bus = slow_create
+    try:
+        win.portOpen(True)
+        win.portOpen(False)  # cancel while the opener is still running
+        assert _wait_for(lambda: win._can_opener is None)
+        assert win._can_bus is None
+        # the cancelled bus is shut down by a closer thread
+        assert _wait_for(lambda: not any(c.isRunning() for c in win._can_closers))
+    finally:
+        axx._create_can_bus = orig
+        win.close()
+
+
+def test_can_reopen_while_cancelled_open_in_flight():
+    """Open -> close -> open again while the first (cancelled) open is still
+    resolving must end with an open bus, not a silently dropped click."""
+    if not _pycan_available():
+        return
+    win = _fresh_monitor()
+    win.toolBar.modeCombo.setCurrentText('CAN')
+    win.toolBar.canInterfaces.setCurrentText('Virtual')
+    orig = axx._create_can_bus
+
+    def slow_create(interface, channel, bitrate):
+        axx.time.sleep(0.3)
+        return orig(interface, channel, bitrate)
+
+    axx._create_can_bus = slow_create
+    try:
+        win.portOpen(True)
+        win.portOpen(False)   # cancel while opening
+        win.portOpen(True)    # reopen before the cancelled opener resolves
+        assert _wait_for(lambda: win._can_bus is not None)
+    finally:
+        axx._create_can_bus = orig
+        win.portOpen(False)
+        _wait_for(lambda: not any(c.isRunning() for c in win._can_closers))
+        win.close()
+
+
+def test_can_open_failure_after_cancel_leaves_ui_alone():
+    """A cancelled open that then fails must not reset button/status state
+    the user may have since repurposed (e.g. for a serial session)."""
+    if not _pycan_available():
+        return
+    win = _fresh_monitor()
+    win.toolBar.modeCombo.setCurrentText('CAN')
+    win.toolBar.canInterfaces.setCurrentText('Virtual')
+
+    def failing_create(interface, channel, bitrate):
+        axx.time.sleep(0.2)
+        raise RuntimeError('no device')
+
+    orig, axx._create_can_bus = axx._create_can_bus, failing_create
+    try:
+        win.portOpen(True)
+        win.portOpen(False)  # cancel while opening; UI reset here
+        win.statusText.setText('sentinel')
+        win.toolBar.portOpenButton.setChecked(True)  # user moved on
+        assert _wait_for(lambda: win._can_opener is None)
+        _app.processEvents()
+        assert win.statusText.text() == 'sentinel'
+        assert win.toolBar.portOpenButton.isChecked()
+    finally:
+        axx._create_can_bus = orig
+        win.toolBar.portOpenButton.setChecked(False)
+        win.close()
+
+
+def test_kvaser_open_rejects_virtual_channels():
+    """Kvaser opens must pass accept_virtual=False: the Kvaser driver always
+    installs virtual channels, so without it Open 'succeeds' on a virtual
+    channel even with no hardware attached."""
+    captured = {}
+
+    class _DummyPycan:
+        @staticmethod
+        def Bus(**kwargs):
+            captured.update(kwargs)
+            raise RuntimeError('capture only')
+
+    orig, axx.pycan = axx.pycan, _DummyPycan()
+    try:
+        for iface, expect_flag in [('kvaser', True), ('virtual', False),
+                                   ('ixxat', False)]:
+            captured.clear()
+            try:
+                axx._create_can_bus(iface, 0, 500000)
+            except RuntimeError:
+                pass
+            if expect_flag:
+                assert captured.get('accept_virtual') is False, iface
+            else:
+                assert 'accept_virtual' not in captured, iface
+    finally:
+        axx.pycan = orig
+
+
 def test_can_send_and_receive_virtual_bus():
-    if axx.pycan is None:
-        return  # python-can not installed; skip
+    if not _pycan_available():
+        return
     win = _fresh_monitor()
     win.toolBar.modeCombo.setCurrentText('CAN')
     win.toolBar.canInterfaces.setCurrentText('Virtual')
     win.portOpen(True)
-    assert win._can_bus is not None
+    assert _wait_for(lambda: win._can_bus is not None)
 
     # A peer on the same virtual channel sees our TX and can answer
     peer = axx.pycan.Bus(interface='virtual', channel=win.toolBar.canChannel())
@@ -461,25 +808,33 @@ def test_can_send_and_receive_virtual_bus():
 
 
 def test_can_recording_logs_frames(tmp_path=None):
-    if axx.pycan is None:
+    if not _pycan_available():
         return
     win = _fresh_monitor()
     win.toolBar.modeCombo.setCurrentText('CAN')
     win.toolBar.canInterfaces.setCurrentText('Virtual')
     win.portOpen(True)
+    assert _wait_for(lambda: win._can_bus is not None)
     win._toggle_recording()
     assert win._recording
+    assert win._asc_writer is not None  # CAN recording mirrors to Vector .asc
     log_path = win._log_file.name
+    asc_path = log_path[:-4] + '.asc'
     try:
         win.sendCanFrame('7F', False, 'AA')
         win._flush_display()
     finally:
         win._toggle_recording()
         win.portOpen(False)
+    assert win._asc_writer is None  # stopped with recording
     with open(log_path, encoding='utf-8') as f:
         content = f.read()
     os.remove(log_path)
     assert 'TX: CAN 07F STD DLC 1 DATA AA' in content
+    with open(asc_path, encoding='utf-8') as f:
+        asc = f.read()
+    os.remove(asc_path)
+    assert '7f' in asc.lower() and 'aa' in asc.lower()
     win.close()
 
 

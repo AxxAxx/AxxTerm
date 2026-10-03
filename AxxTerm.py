@@ -10,18 +10,51 @@ import time
 from collections import deque
 from datetime import datetime
 
-# python-can provides the Kvaser (CANlib) and Ixxat (VCI) backends for CAN
-# mode. Imported lazily-guarded so the serial side keeps working without it.
-try:
-    import can as pycan
-except ImportError:
-    pycan = None
 from PyQt5 import QtWidgets, QtCore, QtGui
-import pyqtgraph as pg
 from PyQt5.QtSerialPort import QSerialPort, QSerialPortInfo
 from PyQt5.QtGui import QPixmap, QTextCursor, QIcon, QPainter, QColor
 from PyQt5.QtWidgets import *
 import numpy as np
+
+# python-can (Kvaser/Ixxat/virtual backends) and pyqtgraph are imported on
+# first use instead of at startup: cold imports cost ~4 s and ~2 s
+# respectively, which made the window take several seconds to appear even in
+# modes that never touch them. The module globals stay so existing
+# `pycan.X` / `pg.X` call sites work unchanged once loaded.
+pycan = None
+pg = None
+
+
+def _ensure_pycan():
+    """Import python-can on first use. Raises ImportError if not installed."""
+    global pycan
+    if pycan is None:
+        import can
+        pycan = can
+    return pycan
+
+
+def _ensure_pg():
+    """Import pyqtgraph on first use (plot or FFT view creation)."""
+    global pg
+    if pg is None:
+        import pyqtgraph
+        pg = pyqtgraph
+    return pg
+
+
+def _create_can_bus(interface, channel, bitrate):
+    """Open a python-can bus. Runs on a worker thread: bus creation loads
+    driver DLLs and talks to hardware, which can block for seconds."""
+    kwargs = {}
+    if interface == 'kvaser':
+        # The Kvaser driver always installs virtual channels, and python-can
+        # defaults accept_virtual=True - so with no hardware attached, Open
+        # would "succeed" on a virtual channel and silently monitor nothing.
+        # The app has its own explicit Virtual interface for that use case.
+        kwargs['accept_virtual'] = False
+    return _ensure_pycan().Bus(interface=interface, channel=channel,
+                               bitrate=bitrate, **kwargs)
 
 # --- Constants ---
 
@@ -195,13 +228,14 @@ QPushButton#primaryButton:disabled {
 
 /* Record button lives in the status bar: keep it compact. While recording
    (button is checkable) it turns the same muted red as the disconnected
-   connector icon, instead of an ad-hoc inline style. */
+   connector icon, instead of an ad-hoc inline style. No font-weight change:
+   Qt sizes the button from its QFont, so QSS-only bold renders wider than
+   the computed width and clips the text. */
 QPushButton#recordButton { padding: 1px 12px; }
 QPushButton#recordButton:checked {
     background-color: #c0453d;
     border-color: #a93b34;
     color: #ffffff;
-    font-weight: 600;
 }
 QPushButton#recordButton:checked:hover { background-color: #cb524a; }
 QPushButton#recordButton:checked:focus { border-color: #8f312b; }
@@ -297,7 +331,6 @@ QPushButton#recordButton:checked {
     background-color: #c0453d;
     border-color: #a93b34;
     color: #ffffff;
-    font-weight: 600;
 }
 QPushButton#recordButton:checked:hover { background-color: #cb524a; }
 QPushButton#recordButton:checked:focus { border-color: #8f312b; }
@@ -374,6 +407,23 @@ QSpinBox::up-arrow { image: url(%ARROW_UP%); width: 10px; height: 10px; }
 QSpinBox::down-arrow { image: url(%ARROW_DOWN%); width: 10px; height: 10px; }
 
 QLabel#sectionLabel { color: #9aa5b0; font-weight: 600; }
+
+/* Table headers: the native header stays white in dark mode, which made the
+   CAN column titles white-on-white (invisible) */
+QHeaderView::section {
+    background-color: #2f3234;
+    color: #e8e8e8;
+    border: none;
+    border-right: 1px solid #4a4d4f;
+    border-bottom: 1px solid #4a4d4f;
+    padding: 2px 6px;
+}
+QTableView {
+    background-color: #232323;
+    gridline-color: #4a4d4f;
+    border: 1px solid #4a4d4f;
+}
+QTableCornerButton::section { background-color: #2f3234; border: none; }
 """
 
 CONVERTERS = {
@@ -662,6 +712,88 @@ class CanReaderThread(QtCore.QThread):
                 self._queue.append(('RX', msg))
 
 
+# Threads abandoned to a hung driver call at window close. Detaching them from
+# the window (plus keeping a reference here) prevents Qt from destroying a
+# running QThread during window teardown, which aborts the process.
+_ORPHANED_THREADS = []
+
+
+def _orphan_thread(t):
+    try:
+        t.setParent(None)
+    except RuntimeError:
+        return  # C++ object already gone
+    _ORPHANED_THREADS.append(t)
+
+
+class CanBusOpener(QtCore.QThread):
+    """Opens a python-can bus off the GUI thread.
+
+    Bus creation imports python-can (~4 s cold), loads driver DLLs and talks
+    to hardware (Kvaser/Ixxat), any of which can block for seconds. Joins the
+    given closer threads first so reopening a channel never races its own
+    shutdown.
+    """
+
+    succeeded = QtCore.pyqtSignal(object)  # the opened bus
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, interface, channel, bitrate, wait_for=(), parent=None):
+        super().__init__(parent)
+        self._interface = interface
+        self._channel = channel
+        self._bitrate = bitrate
+        self._wait_for = list(wait_for)
+        self.bus = None  # read directly at app exit, when the queued
+        #                  succeeded signal can no longer be delivered
+
+    def run(self):
+        for closer in self._wait_for:
+            if not closer.wait(8000):
+                # A hung driver shutdown would otherwise wedge this open
+                # forever in a silent 'Opening CAN...' state.
+                self.failed.emit('previous CAN close has not finished - '
+                                 'driver may be hung; try again')
+                return
+        try:
+            bus = _create_can_bus(self._interface, self._channel, self._bitrate)
+        except ImportError:
+            self.failed.emit(
+                'python-can is not installed - run: pip install python-can')
+            return
+        except Exception as e:
+            # Backend exceptions vary per driver (missing DLL, no device,
+            # channel in use); report the message instead of crashing.
+            self.failed.emit(str(e))
+            return
+        self.bus = bus
+        self.succeeded.emit(bus)
+
+
+class CanBusCloser(QtCore.QThread):
+    """Stops a reader thread and shuts a bus down off the GUI thread, so
+    closing (or switching UI mode) never stalls the UI on driver teardown."""
+
+    def __init__(self, reader, bus, parent=None):
+        super().__init__(parent)
+        self.reader = reader
+        self._bus = bus
+
+    def run(self):
+        if self.reader is not None:
+            self.reader.stop()
+            self.reader.wait(1000)
+        if self._bus is not None:
+            try:
+                self._bus.shutdown()
+            except Exception:
+                pass
+        # shutdown() often unblocks a reader stuck in recv(); one last chance
+        # to join it so it isn't left running when the window is destroyed
+        if self.reader is not None:
+            self.reader.wait(2000)
+
+
 class CanFrameModel(QtCore.QAbstractTableModel):
     """Table model for CAN traffic with two display modes (like CANKing).
 
@@ -736,6 +868,12 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         self._last_ts[key] = ts
         count = self._counts.get(key, 0) + 1
         self._counts[key] = count
+        # Pathological ID churn (random 29-bit IDs / fuzzing) would grow these
+        # dicts without bound over hours of monitoring. Losing Δt/Count state
+        # in that regime is fine - it was meaningless churn anyway.
+        if len(self._last_ts) > 50000:
+            self._last_ts.clear()
+            self._counts.clear()
 
         data = bytes(getattr(msg, 'data', b'') or b'')
         type_str = 'EXT' if ext else 'STD'
@@ -796,6 +934,8 @@ class CanFrameModel(QtCore.QAbstractTableModel):
                     # Row is still in this batch's pending block
                     pending[r - len(self.rows)] = (row, is_tx)
             else:
+                if len(self.rows) + len(pending) >= CAN_MAX_SCROLL_ROWS:
+                    continue  # fixed view full (ID churn/fuzz): drop new IDs
                 self._fixed_index[key] = len(self.rows) + len(pending)
                 pending.append((row, is_tx))
         if pending:
@@ -811,6 +951,14 @@ class CanFrameModel(QtCore.QAbstractTableModel):
                 self.index(changed_max, len(self.COLUMNS) - 1))
 
     # --- control ---
+
+    def reset_timing(self):
+        """Forget per-ID timing/count state (fresh bus session): the first Δt
+        and Count of a new session must not be measured against the last
+        frames of the previous one (possibly hours old, different hardware)."""
+        self._last_ts = {}
+        self._counts = {}
+        self._t0 = None
 
     def set_fixed_mode(self, fixed):
         """Switch view mode. Rows restart, but per-ID timing/count state stays."""
@@ -862,12 +1010,27 @@ class CanView(QtWidgets.QWidget):
         label.setFont(view_font)
         label.setIndent(5)
 
+        # View-level ID filter (log recording still captures everything):
+        # pass-list IDs show only those; '!'-prefixed IDs are blocked.
+        self.filter_edit = QtWidgets.QLineEdit()
+        self.filter_edit.setFont(view_font)
+        self.filter_edit.setFixedHeight(30)
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.setPlaceholderText('Filter IDs (hex): 123, 18FEF100 or block: !0CF00400')
+        self.filter_edit.setToolTip(
+            'Show only matching CAN IDs (comma/space separated hex).\n'
+            'Prefix an ID with ! to hide it instead.\n'
+            'Affects the view only - recording still captures all frames.')
+        self.filter_edit.textChanged.connect(self._on_filter_changed)
+        self._filter_pass = set()   # arbitration IDs to show exclusively
+        self._filter_block = set()  # arbitration IDs to hide
+
         controls = QtWidgets.QHBoxLayout()
         controls.setContentsMargins(0, 0, 0, 0)
         controls.setSpacing(4)
         controls.addWidget(label)
         controls.addWidget(self.view_mode_combo)
-        controls.addStretch()
+        controls.addWidget(self.filter_edit, stretch=1)
         controls.addWidget(self.clear_button)
 
         self.table = QtWidgets.QTableView(self)
@@ -908,8 +1071,34 @@ class CanView(QtWidgets.QWidget):
         if hasattr(monitor, 'schedule_save'):
             monitor.schedule_save()
 
+    def _on_filter_changed(self, text):
+        """Parse the filter field into pass/block ID sets."""
+        passes, blocks = set(), set()
+        invalid = False
+        for token in text.replace(',', ' ').split():
+            target = blocks if token.startswith('!') else passes
+            try:
+                target.add(int(token.lstrip('!'), 16))
+            except ValueError:
+                invalid = True
+        self._filter_pass = passes
+        self._filter_block = blocks
+        # Red border = a token isn't valid hex (filter still applies the rest)
+        self.filter_edit.setStyleSheet(
+            'border: 1px solid #c0453d;' if invalid else '')
+
+    def _frame_passes(self, msg):
+        can_id = getattr(msg, 'arbitration_id', 0)
+        if can_id in self._filter_block:
+            return False
+        return not self._filter_pass or can_id in self._filter_pass
+
     def ingest(self, batch):
         """Add a batch of (direction, msg) tuples; keep autoscroll at bottom."""
+        if self._filter_pass or self._filter_block:
+            batch = [(d, m) for d, m in batch if self._frame_passes(m)]
+            if not batch:
+                return
         sb = self.table.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 4
         self.model.add_frames(batch)
@@ -941,11 +1130,19 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._ui_mode = 'Serial'
         self._can_bus = None
         self._can_reader = None
+        self._can_opener = None      # in-flight CanBusOpener, else None
+        self._can_opener_info = ('', 0, 0)  # (iface display name, channel, bitrate)
+        self._can_open_cancelled = False
+        self._can_reopen_requested = False  # open clicked while a cancelled open resolves
+        self._can_closers = []       # running CanBusCloser threads
+        self._closing = False        # window closeEvent has started
         self._can_rx_queue = deque()  # ('RX'|'TX', can.Message), thread-safe append
         self._can_rx_frames = 0       # frames this second (stats)
         self._can_tx_frames = 0
         self._can_rx_total = 0
         self._can_tx_total = 0
+        self._can_bits = 0            # wire bits this second (bus-load estimate)
+        self._can_err_total = 0       # error frames seen this session
 
         self.setWindowTitle('AxxTerm')
         self.setWindowIcon(QIcon(create_connector_pixmap(CONNECTED_COLOR)))
@@ -996,6 +1193,13 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._auto_reconnect_action.triggered.connect(self._toggle_auto_reconnect)
         self._auto_reconnect = True
 
+        self._timestamps_action = view_menu.addAction('Timestamps')
+        self._timestamps_action.setCheckable(True)
+        self._timestamps_action.setShortcut('Ctrl+T')
+        self._timestamps_action.setToolTip(
+            'Prefix each received line with the arrival time (ASCII view)')
+        self._timestamps_action.triggered.connect(self._toggle_timestamps)
+
         ### Edit Menu ###
         edit_menu = menubar.addMenu('Edit')
         find_action = edit_menu.addAction('Find')
@@ -1012,6 +1216,11 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._record_btn.setObjectName('recordButton')
         self._record_btn.setCheckable(True)
         self._record_btn.setFixedHeight(22)
+        # Fixed width that fits the longer 'Recording...' label (plus QSS
+        # padding/border), so the text never clips and the status bar does
+        # not jump when recording starts.
+        self._record_btn.setFixedWidth(
+            self._record_btn.fontMetrics().horizontalAdvance('Recording...') + 32)
         self._record_btn.clicked.connect(self._toggle_recording)
         self.statusBar().addWidget(self._record_btn)
         self.statusText = QtWidgets.QLabel(self)
@@ -1024,6 +1233,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._log_file = None
         self._recording = False
         self._rx_log_pending = ''  # partial RX line awaiting its newline
+        self._asc_writer = None    # Vector .asc CAN log (interoperable format)
 
         ### Window state restore ###
         self._geometry_restored = False
@@ -1046,6 +1256,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
 
         ### Display throttle (~30 fps) ###
         self._rx_buffer = bytearray()
+        self._rx_frozen_dropped = False
         self._display_timer = QtCore.QTimer(self)
         self._display_timer.timeout.connect(self._flush_display)
         self._display_timer.start(33)  # ~30fps
@@ -1063,8 +1274,14 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.port.errorOccurred.connect(self._on_port_error)
         self.toolBar.modeCombo.currentTextChanged.connect(self._on_ui_mode_changed)
 
-        # Save when serial port settings change (debounced)
-        self.toolBar.baudRates.currentIndexChanged.connect(lambda: self.schedule_save())
+        # Line controls (work live on the open port)
+        self.toolBar.dtrCheck.toggled.connect(self._on_dtr_toggled)
+        self.toolBar.rtsCheck.toggled.connect(self._on_rts_toggled)
+        self.toolBar.breakButton.clicked.connect(self._send_break)
+
+        # Save when serial port settings change (debounced).
+        # baudRates uses currentTextChanged so typed custom rates save too.
+        self.toolBar.baudRates.currentTextChanged.connect(lambda: self.schedule_save())
         self.toolBar.dataBits.currentIndexChanged.connect(lambda: self.schedule_save())
         self.toolBar._parity.currentIndexChanged.connect(lambda: self.schedule_save())
         self.toolBar.stopBits.currentIndexChanged.connect(lambda: self.schedule_save())
@@ -1092,6 +1309,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
             return
 
         if flag:
+            if not self.toolBar.baudRates.currentText().strip():
+                # Empty custom-baud field: show the fallback instead of
+                # silently opening at a rate the (blank) combo doesn't show
+                self.toolBar.baudRates.setCurrentText('115200')
             self.port.setBaudRate(self.toolBar.baudRate())
             self.port.setPortName(self.toolBar.portName())
             self.port.setDataBits(self.toolBar.dataBit())
@@ -1101,11 +1322,18 @@ class SerialMonitor(QtWidgets.QMainWindow):
 
             r = self.port.open(QtCore.QIODevice.ReadWrite)
             if not r:
-                self.statusText.setText('Port open error')
+                # errorString distinguishes "in use by another program" from
+                # "device not found" etc. - a bare 'Port open error' doesn't.
+                self.statusText.setText(
+                    f'Port open error: {self.port.errorString()}')
                 self.toolBar.portOpenButton.setChecked(False)
                 self.toolBar.serialControlEnable(True)
             else:
                 self.statusText.setText('Port opened')
+                # Apply the line-control checkboxes to the fresh connection
+                self.port.setDataTerminalReady(self.toolBar.dtrCheck.isChecked())
+                if self.toolBar.flowControl() != QSerialPort.HardwareControl:
+                    self.port.setRequestToSend(self.toolBar.rtsCheck.isChecked())
                 self._rx_bytes = 0
                 self._tx_bytes = 0
                 self._rx_total = 0
@@ -1115,6 +1343,8 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self.serialDataView.label.setPixmap(create_connector_pixmap(CONNECTED_COLOR))
         else:
             self.port.close()
+            self.serialSendView.stop_repeat()
+            self._flush_rx_log_pending()  # last partial line reaches the log
             self.statusText.setText('Port closed')
             self.toolBar.serialControlEnable(True)
             self.serialDataView.label.setPixmap(create_connector_pixmap(DISCONNECTED_COLOR))
@@ -1129,11 +1359,13 @@ class SerialMonitor(QtWidgets.QMainWindow):
         # port behind the CAN UI.
         self._reconnect_timer.stop()
         self._reconnect_port_name = ''
+        self.serialSendView.stop_repeat()
         if self.port.isOpen():
             self.port.close()
+            self._flush_rx_log_pending()  # same as the regular close path
             self.statusText.setText('Port closed')
             self.serialDataView.label.setPixmap(create_connector_pixmap(DISCONNECTED_COLOR))
-        if self._can_bus is not None:
+        if self._can_bus is not None or self._can_opener is not None:
             self._close_can_bus()
         self.toolBar.serialControlEnable(True)
         self.toolBar.portOpenButton.setChecked(False)
@@ -1147,48 +1379,111 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.schedule_save()
 
     def _open_can_bus(self):
-        if pycan is None:
-            self.statusText.setText(
-                'python-can is not installed - run: pip install python-can')
-            self.toolBar.portOpenButton.setChecked(False)
-            return
+        if self._can_bus is not None:
+            return  # already open
+        if self._can_opener is not None:
+            if self._can_open_cancelled:
+                # A cancelled open is still resolving; reopen (with the
+                # current toolbar settings) as soon as it does.
+                self._can_reopen_requested = True
+                self.toolBar.serialControlEnable(False)
+                self.statusText.setText('Reopening CAN...')
+            return  # an open is already in progress
         iface_name = self.toolBar.canInterfaces.currentText()
         iface = CAN_INTERFACES.get(iface_name, 'virtual')
         channel = self.toolBar.canChannel()
         bitrate = self.toolBar.canBitrate()
-        try:
-            bus = pycan.Bus(interface=iface, channel=channel, bitrate=bitrate)
-        except Exception as e:
-            # Backend exceptions vary per driver (missing DLL, no device,
-            # channel in use); show the message instead of crashing.
-            self.statusText.setText(f'CAN open error: {e}')
-            self.toolBar.portOpenButton.setChecked(False)
+        # Open on a worker thread; driver init can block for seconds and
+        # would freeze the whole UI if done here.
+        self._can_open_cancelled = False
+        self._can_closers = [c for c in self._can_closers if c.isRunning()]
+        self._can_opener = CanBusOpener(iface, channel, bitrate,
+                                        wait_for=self._can_closers, parent=self)
+        self._can_opener_info = (iface_name, channel, bitrate)
+        self._can_opener.succeeded.connect(self._on_can_opened)
+        self._can_opener.failed.connect(self._on_can_open_failed)
+        self._can_opener.start()
+        self.toolBar.serialControlEnable(False)
+        self.statusText.setText(f'Opening CAN: {iface_name} ch {channel}...')
+
+    def _maybe_reopen_can_bus(self):
+        """Start the open that was requested while a cancelled one resolved."""
+        if self._can_reopen_requested:
+            self._can_reopen_requested = False
+            if self._ui_mode == 'CAN':
+                self._open_can_bus()
+
+    def _on_can_opened(self, bus):
+        self._can_opener = None
+        if self._closing:
+            # Delivered between closeEvent and actual destruction: shut the
+            # bus down inline - a new closer thread would be created on a
+            # dying window after the teardown waits already ran.
+            try:
+                bus.shutdown()
+            except Exception:
+                pass
             return
+        if self._can_open_cancelled:
+            # User closed / switched mode while the bus was still opening:
+            # the freshly opened bus just gets shut down again.
+            closer = CanBusCloser(None, bus, self)
+            self._can_closers.append(closer)
+            closer.start()
+            self._maybe_reopen_can_bus()
+            return
+        iface_name, channel, bitrate = self._can_opener_info
         self._can_bus = bus
         self._can_rx_queue.clear()
         self._can_rx_frames = 0
         self._can_tx_frames = 0
         self._can_rx_total = 0
         self._can_tx_total = 0
+        self._can_bits = 0
+        self._can_err_total = 0
+        self.canView.model.reset_timing()  # Δt/Count restart per session
         self._can_reader = CanReaderThread(bus, self._can_rx_queue, self)
         self._can_reader.errorOccurred.connect(self._on_can_error)
         self._can_reader.start()
-        self.toolBar.serialControlEnable(False)
         self.canView.set_connected(True)
         self.statusText.setText(
             f'CAN open: {iface_name} ch {channel} @ {bitrate // 1000} kbit/s')
 
+    def _on_can_open_failed(self, message):
+        self._can_opener = None
+        if self._can_open_cancelled:
+            # The UI was already reset by _close_can_bus, and the user may
+            # have moved on (e.g. opened a serial port) - leave it alone.
+            self._maybe_reopen_can_bus()
+            return
+        self.statusText.setText(f'CAN open error: {message}')
+        self.toolBar.portOpenButton.setChecked(False)
+        self.toolBar.serialControlEnable(True)
+
     def _close_can_bus(self):
-        if self._can_reader is not None:
-            self._can_reader.stop()
-            self._can_reader.wait(1000)
-            self._can_reader = None
-        if self._can_bus is not None:
+        self.serialSendView.stop_repeat()
+        self._can_reopen_requested = False
+        if self._can_opener is not None:
+            # Still opening: flag it; _on_can_opened shuts the bus down on
+            # arrival. The opener outcome handlers restore the UI state.
+            self._can_open_cancelled = True
+        reader, self._can_reader = self._can_reader, None
+        bus, self._can_bus = self._can_bus, None
+        if reader is not None:
+            # A bus error that fired right around this close must not reach
+            # _on_can_error anymore - it would tear down the *next* session.
             try:
-                self._can_bus.shutdown()
-            except Exception:
+                reader.errorOccurred.disconnect(self._on_can_error)
+            except TypeError:
                 pass
-            self._can_bus = None
+        if reader is not None or bus is not None:
+            # Teardown (reader join + driver shutdown) runs off the GUI
+            # thread. A subsequent open waits for these closers, so the
+            # channel is never reopened while it is still closing.
+            self._can_closers = [c for c in self._can_closers if c.isRunning()]
+            closer = CanBusCloser(reader, bus, self)
+            self._can_closers.append(closer)
+            closer.start()
         self.toolBar.serialControlEnable(True)
         self.canView.set_connected(False)
         self.statusText.setText('CAN closed')
@@ -1201,38 +1496,51 @@ class SerialMonitor(QtWidgets.QMainWindow):
 
     def sendCanFrame(self, id_text, extended, data_text):
         """Send one CAN frame (from the send row or a macro button)."""
+        if self._send_can_frame(id_text, extended, data_text):
+            self.serialSendView.note_send_result(True)
+        else:
+            # Repeat must stop on persistent failure: with a non-ACKing bus
+            # every attempt blocks the GUI ~300 ms waiting for confirmation.
+            self.serialSendView.note_send_result(False)
+
+    def _send_can_frame(self, id_text, extended, data_text):
         if self._can_bus is None:
             self.statusText.setText('CAN bus is not open')
-            return
+            return False
         try:
             can_id = int(id_text, 16)
         except (TypeError, ValueError):
             self.statusText.setText(f'Invalid CAN ID (hex): {id_text!r}')
-            return
+            return False
         max_id = 0x1FFFFFFF if extended else 0x7FF
         if not 0 <= can_id <= max_id:
             self.statusText.setText(
                 f'CAN ID {can_id:X} out of range (max {max_id:X} for '
                 f'{"extended" if extended else "standard"})')
-            return
+            return False
         try:
             data = bytes.fromhex(data_text.replace(' ', ''))
         except ValueError:
             self.statusText.setText('CAN data is not a valid HEX string')
-            return
+            return False
         if len(data) > 8:
             self.statusText.setText(f'CAN data is max 8 bytes (got {len(data)})')
-            return
+            return False
         msg = pycan.Message(arbitration_id=can_id, is_extended_id=extended,
                             data=data, timestamp=time.time())
         try:
-            self._can_bus.send(msg)
+            # A timeout makes the Kvaser backend wait for on-wire transmit
+            # confirmation (canWriteSync) and raise on failure. Without it,
+            # send() only queues in the driver: with a wrong bitrate or no
+            # ACKing node, frames were shown/logged as TX but never sent.
+            self._can_bus.send(msg, timeout=0.3)
         except Exception as e:
             self.statusText.setText(f'CAN send failed: {e}')
-            return
+            return False
         self.statusText.setText('')
         # Show the sent frame in the table via the same drain path as RX
         self._can_rx_queue.append(('TX', msg))
+        return True
 
     def _flush_can_queue(self):
         """Drain buffered CAN frames into the table (and the log)."""
@@ -1249,16 +1557,34 @@ class SerialMonitor(QtWidgets.QMainWindow):
             else:
                 self._can_rx_frames += 1
                 self._can_rx_total += 1
+            # Bus-load estimate: frame overhead (47 bits std / 67 ext incl.
+            # interframe space) + data, before bit stuffing (~+10% applied
+            # in the stats display). The same approach PCAN-View uses.
+            data_len = len(getattr(msg, 'data', b'') or b'')
+            self._can_bits += (67 if getattr(msg, 'is_extended_id', False)
+                               else 47) + 8 * data_len
+            if getattr(msg, 'is_error_frame', False):
+                self._can_err_total += 1
             if self._recording and self._log_file is not None:
-                self._log_data(direction, format_can_log_line(msg))
+                self._log_data(direction, format_can_log_line(msg),
+                               when=getattr(msg, 'timestamp', None))
+            if self._asc_writer is not None:
+                self._write_asc(direction, msg)
         self.canView.ingest(batch)
+
+    def _flush_rx_log_pending(self):
+        """Log the held partial RX line now, instead of dropping it or letting
+        it surface out of order at recording stop."""
+        if self._rx_log_pending:
+            pending, self._rx_log_pending = self._rx_log_pending, ''
+            self._log_data('RX', pending)
 
     def _reset_stream_state(self):
         """Drop buffered/partial stream state so a new connection starts clean."""
         self._rx_buffer.clear()
-        # Drop any partial RX line held for the log so it isn't merged with
-        # post-reconnect data into one garbled line.
-        self._rx_log_pending = ''
+        # Flush (not drop) any partial RX line held for the log, so it isn't
+        # lost - and isn't merged with post-reconnect data into one line.
+        self._flush_rx_log_pending()
         self.serialDataView.reset_stream_state()
 
     def readFromPort(self):
@@ -1284,19 +1610,54 @@ class SerialMonitor(QtWidgets.QMainWindow):
             # Buffer for throttled display update
             self._rx_buffer.extend(raw_bytes)
 
+    # Backlog cap while the display is frozen: logging keeps the full stream
+    # (readFromPort logs immediately); this only bounds what re-renders later.
+    FROZEN_BUFFER_CAP = 4 * 1024 * 1024
+    # Max bytes rendered per tick: a frozen multi-MB backlog drains over a few
+    # ticks instead of one seconds-long QTextEdit insert that stalls the UI.
+    FLUSH_CHUNK = 128 * 1024
+
     def _flush_display(self):
         """Process buffered RX data and update the display (~30 fps)."""
+        if self.serialDataView.freeze_btn.isChecked():
+            if len(self._rx_buffer) > self.FROZEN_BUFFER_CAP:
+                del self._rx_buffer[:len(self._rx_buffer) - self.FROZEN_BUFFER_CAP]
+                self._rx_frozen_dropped = True
+            self._flush_can_queue()  # CAN table is a separate view; keep it live
+            return
+        if self._rx_frozen_dropped:
+            self._rx_frozen_dropped = False
+            self.serialDataView._insert_colored_text(
+                self.serialDataView.serialData,
+                '\n[... oldest data not shown (frozen too long) - the log file has everything ...]\n',
+                QtGui.QColor(128, 128, 128))
         if self._rx_buffer:
-            data = bytes(self._rx_buffer)
-            self._rx_buffer.clear()
+            data = bytes(self._rx_buffer[:self.FLUSH_CHUNK])
+            del self._rx_buffer[:self.FLUSH_CHUNK]
             self.serialDataView.handleReceivedData(data)
         # Push any pending plot samples to the curves (one setData per channel)
         self.serialDataView.flush_plot()
         self._flush_can_queue()
 
+    def _write_serial(self, tx):
+        """Write bytes to the open port, counting only accepted bytes.
+
+        QSerialPort.write returns -1 on immediate error (previously ignored,
+        so failed TX was counted, logged, and echoed as if it had been sent).
+        """
+        n = self.port.write(tx)
+        if n != len(tx):
+            self.statusText.setText(f'Write failed: {self.port.errorString()}')
+            return False
+        self._tx_bytes += n
+        self._tx_total += n
+        self.statusText.setText('')
+        return True
+
     def sendFromPort(self, text):
         if not self.port.isOpen():
             self.statusText.setText('Port is not open')
+            self.serialSendView.note_send_result(False)
             return
         sent = False
         if self.serialSendView.charMode.currentText() == 'HEX':
@@ -1308,11 +1669,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 text = text + '0D0A'
             try:
                 tx = bytes.fromhex(text)
-                self.port.write(tx)
-                self._tx_bytes += len(tx)
-                self._tx_total += len(tx)
-                self.statusText.setText('')
-                sent = True
+                sent = self._write_serial(tx)
             except ValueError:
                 self.statusText.setText('Not a valid HEX string')
 
@@ -1330,11 +1687,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
                     tx = text.encode('ISO-8859-1')
                 except UnicodeEncodeError:
                     tx = text.encode('utf-8')
-                self.port.write(tx)
-                self._tx_bytes += len(tx)
-                self._tx_total += len(tx)
-                self.statusText.setText('')
-                sent = True
+                sent = self._write_serial(tx)
             except (UnicodeEncodeError, ValueError):
                 self.statusText.setText('Not a valid ASCII string')
 
@@ -1347,14 +1700,11 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 tx = value.to_bytes(num_bytes, byteorder='big')
                 ending = [b'', b'\n', b'\r', b'\r\n'][self.serialSendView.lineEnding.currentIndex()]
                 tx += ending
-                self.port.write(tx)
-                self._tx_bytes += len(tx)
-                self._tx_total += len(tx)
-                self.statusText.setText('')
-                sent = True
+                sent = self._write_serial(tx)
             except (ValueError, OverflowError):
                 self.statusText.setText('Not a valid BINARY string')
 
+        self.serialSendView.note_send_result(sent)
         if sent:
             mode = self.serialSendView.charMode.currentText()
             if mode == 'HEX':
@@ -1391,10 +1741,15 @@ class SerialMonitor(QtWidgets.QMainWindow):
             can_tx = self._can_tx_frames
             self._can_rx_frames = 0
             self._can_tx_frames = 0
+            bits, self._can_bits = self._can_bits, 0
+            bitrate = max(1, self.toolBar.canBitrate())
+            load = min(100.0, bits * 1.1 / bitrate * 100)  # ~10% stuff bits
+            err = f'  Err: {self._can_err_total}' if self._can_err_total else ''
             self.statsLabel.setText(
+                f'Load: {load:.1f}%{err}  |  '
                 f'RX: {can_rx} msg/s  TX: {can_tx} msg/s  |  '
                 f'RX total: {self._can_rx_total}  TX total: {self._can_tx_total}  |  '
-                f'{self.toolBar.canBitrate() // 1000} kbit/s')
+                f'{bitrate // 1000} kbit/s')
         elif self.port.isOpen():
             baud = self.toolBar.baudRate()
             self.statsLabel.setText(
@@ -1450,12 +1805,51 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self.statusText.setText('Auto-reconnect disabled')
         self.save_all_settings()
 
+    def _toggle_timestamps(self):
+        self.serialDataView.show_timestamps = self._timestamps_action.isChecked()
+        self.schedule_save()
+
+    # --- Serial line controls (DTR / RTS / Break) ---------------------------
+
+    def _on_dtr_toggled(self, checked):
+        if self.port.isOpen():
+            self.port.setDataTerminalReady(checked)
+
+    def _on_rts_toggled(self, checked):
+        if not self.port.isOpen():
+            return
+        if self.port.flowControl() == QSerialPort.HardwareControl:
+            self.statusText.setText('RTS is managed by hardware flow control')
+            return
+        self.port.setRequestToSend(checked)
+
+    def _send_break(self):
+        if not self.port.isOpen():
+            self.statusText.setText('Port is not open')
+            return
+        self.port.setBreakEnabled(True)
+        QtCore.QTimer.singleShot(300, self._end_break)
+        self.statusText.setText('Break sent (300 ms)')
+
+    def _end_break(self):
+        if self.port.isOpen():
+            self.port.setBreakEnabled(False)
+
     def _on_port_error(self, error):
-        """Handle serial port errors. On ResourceError (device unplugged), close
+        """Surface serial port errors. On ResourceError (device unplugged), close
         gracefully and optionally start scanning for reconnection."""
+        if error == QSerialPort.NoError:
+            return
+        if error != QSerialPort.ResourceError:
+            # WriteError, ReadError, PermissionError, ... were previously
+            # swallowed entirely: failed I/O looked like success and a dead
+            # RX path kept showing "connected". Show the driver's reason.
+            self.statusText.setText(f'Serial error: {self.port.errorString()}')
+            return
         if error == QSerialPort.ResourceError and self.port.isOpen():
             self._reconnect_port_name = self.port.portName()
             self.port.close()
+            self.serialSendView.stop_repeat()
             self.toolBar.portOpenButton.setChecked(False)
             self.toolBar.serialControlEnable(True)
             self.serialDataView.label.setPixmap(create_connector_pixmap(DISCONNECTED_COLOR))
@@ -1500,11 +1894,20 @@ class SerialMonitor(QtWidgets.QMainWindow):
 
     # --- Recording / Logging ---------------------------------------------------
 
-    def _log_data(self, direction, text):
-        """Write a timestamped line to the log file if recording is active."""
+    def _log_data(self, direction, text, when=None):
+        """Write a timestamped line to the log file if recording is active.
+
+        when: optional epoch timestamp for the event (e.g. the CAN frame's
+        hardware timestamp); defaults to now. CAN frames are drained on the
+        ~30 fps display timer, so stamping at drain time would collapse every
+        frame of a tick onto one wall-clock time up to 33 ms late.
+        """
         if not self._recording or self._log_file is None:
             return
-        now = datetime.now()
+        try:
+            now = datetime.fromtimestamp(when) if when else datetime.now()
+        except (OverflowError, OSError, ValueError):
+            now = datetime.now()
         ts = now.strftime('%Y-%m-%d %H:%M:%S.') + f'{now.microsecond // 1000:03d}'
         try:
             for line in text.splitlines():
@@ -1528,12 +1931,34 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self._record_action.setText('Start Recording')
             self.statusText.setText('Recording stopped: log file write failed')
 
+    def _write_asc(self, direction, msg):
+        """Mirror one CAN frame into the .asc log (standard Vector format
+        readable by CANalyzer/SavvyCAN/asammdf, unlike the .txt log)."""
+        try:
+            try:
+                msg.is_rx = (direction != 'TX')  # .asc direction column
+            except AttributeError:
+                pass  # python-can < 4.0 Message has no is_rx; log without it
+            self._asc_writer(msg)
+        except Exception:
+            self._stop_asc_writer()
+            self.statusText.setText('.asc log write failed - .asc recording stopped')
+
+    def _stop_asc_writer(self):
+        if self._asc_writer is not None:
+            try:
+                self._asc_writer.stop()
+            except Exception:
+                pass
+            self._asc_writer = None
+
     def _toggle_recording(self):
         """Start or stop recording serial data to a log file."""
         if self._recording:
             # Stop recording: flush queued CAN frames and any partial RX line
             # first so nothing buffered in the last display tick is lost
             self._flush_can_queue()
+            self._stop_asc_writer()
             if self._rx_log_pending:
                 pending, self._rx_log_pending = self._rx_log_pending, ''
                 self._log_data('RX', pending)
@@ -1560,23 +1985,55 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self.statusText.setText(f'Cannot create log file: {e}')
                 self._record_btn.setChecked(False)
                 return
+            # In CAN mode, additionally record a Vector .asc file: the .txt
+            # log is human-readable but a dead end for tooling, while .asc
+            # loads into CANalyzer/SavvyCAN/asammdf for real analysis.
+            extra = ''
+            if self._ui_mode == 'CAN' and pycan is not None:
+                try:
+                    self._asc_writer = pycan.ASCWriter(filepath[:-4] + '.asc')
+                    extra = ' (+.asc)'
+                except Exception:
+                    self._asc_writer = None
             self._recording = True
             self._record_btn.setChecked(True)
             self._record_btn.setText('Recording...')
             self._record_action.setText('Stop Recording')
-            self.statusText.setText(f'Recording to {filename}')
+            self.statusText.setText(f'Recording to {filename}{extra}')
 
     def closeEvent(self, event):
         """Flush pending state and close the log file when the application exits."""
+        self._closing = True
         self._save_timer.stop()
         # Stop the remaining timers so nothing fires against half-torn-down widgets.
         self._stats_timer.stop()
         self._display_timer.stop()
         self._reconnect_timer.stop()
-        if self._can_bus is not None:
+        if self._can_bus is not None or self._can_opener is not None:
             self._close_can_bus()
-        # Reader is stopped now; log whatever it queued during the last tick
+        # Give the teardown threads a bounded window to finish. A thread that
+        # does not finish (hung driver call) is detached from the window:
+        # destroying a running QThread aborts the process.
+        if self._can_opener is not None:
+            if self._can_opener.wait(5000):
+                # The queued succeeded signal can't be delivered anymore, so
+                # shut down a bus that finished opening during exit directly.
+                bus = self._can_opener.bus
+                if bus is not None:
+                    try:
+                        bus.shutdown()
+                    except Exception:
+                        pass
+            else:
+                _orphan_thread(self._can_opener)
+        for closer in self._can_closers:
+            if not closer.wait(3000):
+                _orphan_thread(closer)
+            elif closer.reader is not None and closer.reader.isRunning():
+                _orphan_thread(closer.reader)  # stuck in a driver recv()
+        # Readers are stopped now; log whatever they queued during the last tick
         self._flush_can_queue()
+        self._stop_asc_writer()
         self.save_all_settings()  # also captures final window/splitter geometry
         if self._log_file is not None:
             try:
@@ -1589,13 +2046,17 @@ class SerialMonitor(QtWidgets.QMainWindow):
 
     def schedule_save(self):
         """Request a debounced settings save (rapid changes coalesce into one write)."""
-        self._save_timer.start()
+        # Child widgets fire change signals during construction, before the
+        # timer exists; there is nothing worth saving at that point anyway.
+        if hasattr(self, '_save_timer'):
+            self._save_timer.start()
 
     def save_all_settings(self, path=None):
         """Save all settings (plot, serial port, macros) to one JSON file."""
         settings = {
             'dark_mode': self._dark_mode,
             'auto_reconnect': self._auto_reconnect,
+            'show_timestamps': self.serialDataView.show_timestamps,
             'ui_mode': self._ui_mode,
             'can': {
                 'interface': self.toolBar.canInterfaces.currentText(),
@@ -1626,21 +2087,39 @@ class SerialMonitor(QtWidgets.QMainWindow):
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, indent=2)
             os.replace(tmp, target)
-        except OSError:
+            return True
+        except OSError as e:
             try:
                 os.remove(tmp)
             except OSError:
                 pass
+            # A full disk / read-only folder previously failed silently - the
+            # user lost settings with no indication anywhere.
+            self.statusText.setText(f'Settings save failed: {e}')
+            return False
+
+    @staticmethod
+    def _restore_combo_text(combo, text):
+        """Set a combo to text only if it is an existing item (setCurrentText
+        on a non-editable combo is a silent no-op for unknown values)."""
+        idx = combo.findText(str(text))
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+            return True
+        if combo.isEditable():
+            combo.setCurrentText(str(text))
+            return True
+        return False
 
     def load_all_settings(self, path=None):
-        """Load all settings from one JSON file."""
+        """Load all settings from one JSON file. Returns False on failure."""
         try:
             with open(path or SETTINGS_FILE, 'r') as f:
                 s = json.load(f)
         except (OSError, json.JSONDecodeError, ValueError, UnicodeDecodeError):
-            return
+            return False
         if not isinstance(s, dict):
-            return
+            return False
 
         # Window geometry / splitter sizes. We restore the size/position but
         # never reopen maximized or full-screen -- the app should always start
@@ -1649,10 +2128,13 @@ class SerialMonitor(QtWidgets.QMainWindow):
         try:
             geo = win.get('geometry', '')
             if geo:
-                self.restoreGeometry(QtCore.QByteArray.fromHex(geo.encode('ascii')))
-                self.setWindowState(self.windowState() & ~(
-                    QtCore.Qt.WindowMaximized | QtCore.Qt.WindowFullScreen))
-                self._geometry_restored = True
+                ok = self.restoreGeometry(QtCore.QByteArray.fromHex(geo.encode('ascii')))
+                if ok:
+                    self.setWindowState(self.windowState() & ~(
+                        QtCore.Qt.WindowMaximized | QtCore.Qt.WindowFullScreen))
+                    # Only mark restored on success so main() still applies the
+                    # default size when the stored geometry is corrupt.
+                    self._geometry_restored = True
             sizes = win.get('splitter')
             if sizes:
                 self._splitter_sizes_to_restore = [int(x) for x in sizes]
@@ -1671,17 +2153,31 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._auto_reconnect = s.get('auto_reconnect', True)
         self._auto_reconnect_action.setChecked(self._auto_reconnect)
 
+        # Display timestamps
+        self.serialDataView.show_timestamps = bool(s.get('show_timestamps', False))
+        self._timestamps_action.setChecked(self.serialDataView.show_timestamps)
+
         # Plot/decode settings
         plot = s.get('plot', s)  # fallback: old format had plot keys at top level
         self.serialDataView._load_plot_settings(plot)
 
+        # Connection parameters are only applied while disconnected: the open
+        # port/bus keeps running with its original parameters, so rewriting
+        # the combos would make the toolbar (and stats bar) lie about the
+        # actual connection.
+        connected = self.port.isOpen() or self._can_bus is not None \
+            or self._can_opener is not None
+        if connected:
+            self.statusText.setText(
+                'Connection settings not applied while connected')
+
         # Serial port settings (block signals to avoid cascading saves)
         serial = s.get('serial', {})
-        if serial:
+        if serial and not connected:
             for w in [self.toolBar.baudRates, self.toolBar.dataBits,
                       self.toolBar._parity, self.toolBar.stopBits, self.toolBar._flowControl]:
                 w.blockSignals(True)
-            self.toolBar.baudRates.setCurrentText(serial.get('baud_rate', '115200'))
+            self._restore_combo_text(self.toolBar.baudRates, serial.get('baud_rate', '115200'))
             self.toolBar.dataBits.setCurrentIndex(serial.get('data_bits', 3))
             self.toolBar._parity.setCurrentIndex(serial.get('parity', 0))
             self.toolBar.stopBits.setCurrentIndex(serial.get('stop_bits', 0))
@@ -1692,27 +2188,32 @@ class SerialMonitor(QtWidgets.QMainWindow):
 
         # CAN settings
         can_cfg = s.get('can', {})
-        if isinstance(can_cfg, dict) and can_cfg:
+        if isinstance(can_cfg, dict) and can_cfg and not connected:
             for w in [self.toolBar.canInterfaces, self.toolBar.canChannels,
                       self.toolBar.canBitrates]:
                 w.blockSignals(True)
-            self.toolBar.canInterfaces.setCurrentText(can_cfg.get('interface', 'Kvaser'))
+            self._restore_combo_text(self.toolBar.canInterfaces,
+                                     can_cfg.get('interface', 'Kvaser'))
             try:
-                self.toolBar.canChannels.setCurrentIndex(int(can_cfg.get('channel', 0)))
+                idx = int(can_cfg.get('channel', 0))
+                idx = max(0, min(idx, self.toolBar.canChannels.count() - 1))
+                self.toolBar.canChannels.setCurrentIndex(idx)
             except (TypeError, ValueError):
                 pass
-            self.toolBar.canBitrates.setCurrentText(
-                str(can_cfg.get('bitrate', '500 kbit/s')))
+            self._restore_combo_text(self.toolBar.canBitrates,
+                                     str(can_cfg.get('bitrate', '500 kbit/s')))
             for w in [self.toolBar.canInterfaces, self.toolBar.canChannels,
                       self.toolBar.canBitrates]:
                 w.blockSignals(False)
+        if isinstance(can_cfg, dict):
             view_mode = can_cfg.get('view_mode', 'Scrolling')
             if view_mode in ('Scrolling', 'Fixed'):
                 self.canView.view_mode_combo.setCurrentText(view_mode)
 
         # UI mode last, so switching applies over the loaded CAN settings
+        # (never while connected: the switch would close the live connection)
         ui_mode = s.get('ui_mode', 'Serial')
-        if ui_mode in ('Serial', 'CAN'):
+        if ui_mode in ('Serial', 'CAN') and not connected:
             # setCurrentText triggers _on_ui_mode_changed, which updates all
             # visibility; setting it to the current value triggers nothing,
             # which is fine since 'Serial' is the initial state.
@@ -1729,20 +2230,31 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self._splitter_sizes_to_restore = None
             if len(sizes) == self.serialDataView.splitter.count():
                 self.serialDataView.splitter.setSizes(sizes)
+        return True
 
     def _menu_save_settings(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, 'Save Settings', '', 'JSON Files (*.json);;All Files (*)')
         if path:
-            self.save_all_settings(path)
-            self.statusText.setText(f'Settings saved to {os.path.basename(path)}')
+            if self.save_all_settings(path):
+                self.statusText.setText(f'Settings saved to {os.path.basename(path)}')
+            # on failure save_all_settings already shows the reason
 
     def _menu_load_settings(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, 'Load Settings', '', 'JSON Files (*.json);;All Files (*)')
-        if path:
-            self.load_all_settings(path)
-            self.statusText.setText(f'Settings loaded from {os.path.basename(path)}')
+        if not path:
+            return
+        if not self.load_all_settings(path):
+            self.statusText.setText(
+                f'Failed to load settings from {os.path.basename(path)} '
+                '(unreadable or not a settings file)')
+            return
+        note = ''
+        if self.port.isOpen() or self._can_bus is not None:
+            note = ' (connection settings skipped while connected)'
+        self.statusText.setText(
+            f'Settings loaded from {os.path.basename(path)}{note}')
 
     def _menu_export_csv(self):
         dv = self.serialDataView
@@ -1831,6 +2343,12 @@ class SerialDataView(QtWidgets.QWidget):
         # serial reads (otherwise Qt renders a blank line between messages).
         self._pending_cr = False
         self._hex_col = 0  # tracks hex pairs on current line (0..15)
+
+        # Display timestamps (View > Timestamps): prefix each received line
+        # in the ASCII view with its arrival time. _ts_at_line_start tracks
+        # line boundaries across arbitrarily-chunked reads.
+        self.show_timestamps = False
+        self._ts_at_line_start = True
 
         # FFT view state
         self._fft_widget = None
@@ -2112,6 +2630,20 @@ class SerialDataView(QtWidgets.QWidget):
         self._math_btn.clicked.connect(self._open_math_dialog)
         cl.addWidget(self._math_btn)
 
+        # Freeze display: scroll back / read / search while RX capture,
+        # logging and stats keep running (buffered data renders on resume)
+        self.freeze_btn = QtWidgets.QPushButton('Freeze')
+        self.freeze_btn.setCheckable(True)
+        self.freeze_btn.setFont(row_font)
+        self.freeze_btn.setFixedHeight(30)
+        self.freeze_btn.setToolTip(
+            'Freeze the data views to scroll back and read.\n'
+            'Capture, logging and stats keep running; buffered\n'
+            'data is shown when unfrozen (display timestamps on\n'
+            'that backlog show the unfreeze time - the log file\n'
+            'keeps the true arrival times).')
+        cl.addWidget(self.freeze_btn)
+
         # Right: plot controls
         cl.addWidget(self._pts_label)
         cl.addWidget(self.plot_length_spin)
@@ -2168,6 +2700,10 @@ class SerialDataView(QtWidgets.QWidget):
         self.layout().addWidget(self.clear_button,      4, 6, 1, 1, alignment=QtCore.Qt.AlignRight)
         self.layout().setRowStretch(2, 1)
         self.layout().setContentsMargins(2, 2, 2, 2)
+
+        # Apply initial mode visibility (first run has no settings file, so
+        # nothing else triggers it - binary/frame widgets showed in ASCII mode)
+        self._on_mode_changed()
 
     def _channel_name(self, index):
         """Return custom name for a channel, or default 'Ch N'."""
@@ -2387,6 +2923,7 @@ class SerialDataView(QtWidgets.QWidget):
 
     def graph_state_changed(self):
         if self.graph_mode.isChecked():
+            _ensure_pg()
             self.graphWidget = pg.PlotWidget()
             self.graphWidget.setBackground('#FFFFFFFF')
             self.graphWidget.setMinimumHeight(150)
@@ -2514,9 +3051,11 @@ class SerialDataView(QtWidgets.QWidget):
         dark = getattr(self.window(), '_dark_mode', False)
         if self._plot_paused:
             self._pause_btn.setText('Resume')
+            # No font-weight here: adjustSize() uses the QFont, so QSS-only
+            # bold text would render wider than the button and clip.
             self._pause_btn.setStyleSheet(
                 'background-color: #cc6600; color: #ffffff; border: 1px solid #995500; '
-                'padding: 2px 8px; font-weight: bold;')
+                'padding: 2px 8px;')
         else:
             self._pause_btn.setText('Pause')
             if dark:
@@ -2837,6 +3376,7 @@ class SerialDataView(QtWidgets.QWidget):
 
     def _create_fft_widget(self):
         """Create the FFT PlotWidget and add it to the splitter below the main graph."""
+        _ensure_pg()
         dark = getattr(self.window(), '_dark_mode', False)
         self._fft_widget = pg.PlotWidget()
         self._fft_widget.setBackground('#2b2b2b' if dark else '#FFFFFF')
@@ -3078,6 +3618,13 @@ class SerialDataView(QtWidgets.QWidget):
                     and self._trigger_channel < len(values)):
                 value = values[self._trigger_channel]
                 if value is not None and math.isfinite(value):
+                    # Compare in displayed units: the plot shows
+                    # raw*scale+offset, so the level the user types must be
+                    # matched against the same transform (raw units before
+                    # made the trigger fire at the wrong level).
+                    ch = self._trigger_channel
+                    value = (value * self.channel_scale.get(ch, 1.0)
+                             + self.channel_offset.get(ch, 0.0))
                     prev = self._trigger_prev_value
                     self._trigger_prev_value = value
                     if prev is not None:
@@ -3445,12 +3992,17 @@ class SerialDataView(QtWidgets.QWidget):
         self._frame_reader.frame_size = self.frame_size_spin.value()
         self._frame_reader.checksum_enabled = self.checksum_check.isChecked()
 
+        # An invalid or empty sync word keeps the previous one, but must say
+        # so - silently decoding against a sync word different from what the
+        # field shows is a debugging trap. (Warning emitted at the end so the
+        # frame-size warning below can't overwrite it.)
+        sync_text = self.sync_word_edit.text().replace(' ', '')
         try:
-            sw = bytes.fromhex(self.sync_word_edit.text().replace(' ', ''))
-            if len(sw) > 0:
-                self._frame_reader.sync_word = sw
+            sw = bytes.fromhex(sync_text)
         except ValueError:
-            pass
+            sw = b''
+        if sw:
+            self._frame_reader.sync_word = sw
 
         # Settings changed: leftover bytes from the old layout would misalign
         self._binary_reader.sync()
@@ -3472,6 +4024,13 @@ class SerialDataView(QtWidgets.QWidget):
                     monitor.statusText.setText(
                         f'Warning: frame size {frame_size} is not a multiple of {detail} - '
                         f'trailing bytes are ignored')
+
+        if not sw and self.data_mode.currentText() == 'Custom Frame':
+            monitor = self.window()
+            if hasattr(monitor, 'statusText'):
+                monitor.statusText.setText(
+                    f'Invalid start byte {self.sync_word_edit.text()!r} - '
+                    f'still using {self._frame_reader.sync_word.hex().upper()}')
 
     def _get_settings_dict(self):
         """Build the current settings as a dict."""
@@ -3535,37 +4094,64 @@ class SerialDataView(QtWidgets.QWidget):
         for w in widgets:
             w.blockSignals(True)
 
-        try:
-            self.data_mode.setCurrentText(s.get('mode', 'ASCII'))
-            self.graph_channels.setValue(s.get('num_channels', 4))
-            self.plot_length_spin.setValue(s.get('num_points', DEFAULT_PLOT_LENGTH))
-            self.delimiter_combo.setCurrentText(s.get('delimiter', 'Auto'))
-            self.delimiter_custom.setText(s.get('delimiter_custom', ''))
+        # Restore per key: one malformed value must only lose that key, not
+        # abort the whole restore (which then got auto-saved back over the
+        # user's good settings file).
+        if not isinstance(s, dict):
+            s = {}
+        bad_keys = []
 
-            # Load channel properties AND axis ranges BEFORE enabling the graph
-            # so that graph_state_changed() sees the correct names/colors/axes/
-            # hidden set and restores the saved manual Y range.
-            saved_names = s.get('channel_names', {})
-            self.channel_names = {int(k): v for k, v in saved_names.items()}
-            saved_colors = s.get('channel_colors', {})
-            self.channel_colors = {int(k): v for k, v in saved_colors.items()}
-            saved_axes = s.get('channel_axes', {})
-            self.channel_axes = {int(k): v for k, v in saved_axes.items()}
-            self.channel_scale = {int(k): float(v) for k, v in s.get('channel_scale', {}).items()}
-            self.channel_offset = {int(k): float(v) for k, v in s.get('channel_offset', {}).items()}
-            self.channel_units = {int(k): v for k, v in s.get('channel_units', {}).items()}
-            self._invalidate_scale_cache()
-            self.hidden_channels = set(s.get('hidden_channels', []))
+        def _try(label, fn):
+            try:
+                fn()
+            except (KeyError, TypeError, ValueError, AttributeError):
+                bad_keys.append(label)
 
+        def _int_dict(raw, coerce):
+            out = {}
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    try:
+                        out[int(k)] = coerce(v)
+                    except (TypeError, ValueError):
+                        bad_keys.append(f'channel entry {k!r}')
+            return out
+
+        _try('mode', lambda: self.data_mode.setCurrentText(str(s.get('mode', 'ASCII'))))
+        _try('num_channels', lambda: self.graph_channels.setValue(int(s.get('num_channels', 4))))
+        _try('num_points', lambda: self.plot_length_spin.setValue(int(s.get('num_points', DEFAULT_PLOT_LENGTH))))
+        _try('delimiter', lambda: self.delimiter_combo.setCurrentText(str(s.get('delimiter', 'Auto'))))
+        _try('delimiter_custom', lambda: self.delimiter_custom.setText(str(s.get('delimiter_custom', ''))))
+
+        # Load channel properties AND axis ranges BEFORE enabling the graph
+        # so that graph_state_changed() sees the correct names/colors/axes/
+        # hidden set and restores the saved manual Y range.
+        self.channel_names = _int_dict(s.get('channel_names', {}), str)
+        self.channel_colors = _int_dict(s.get('channel_colors', {}), str)
+        self.channel_axes = _int_dict(s.get('channel_axes', {}), int)
+        self.channel_scale = _int_dict(s.get('channel_scale', {}), float)
+        self.channel_offset = _int_dict(s.get('channel_offset', {}), float)
+        self.channel_units = _int_dict(s.get('channel_units', {}), str)
+        self._invalidate_scale_cache()
+
+        def _restore_hidden():
+            self.hidden_channels = {int(i) for i in s.get('hidden_channels', [])}
+        _try('hidden_channels', _restore_hidden)
+
+        def _restore_x_time():
             self._x_time_mode = bool(s.get('x_time_mode', False))
             self._time_axis_check.blockSignals(True)
             self._time_axis_check.setChecked(self._x_time_mode)
             self._time_axis_check.blockSignals(False)
+        _try('x_time_mode', _restore_x_time)
 
-            self._y_auto_scale = s.get('y_auto_scale', True)
-            self._y_min = s.get('y_min', -1.0)
-            self._y_max = s.get('y_max', 1.0)
+        def _restore_y_range():
+            self._y_auto_scale = bool(s.get('y_auto_scale', True))
+            self._y_min = float(s.get('y_min', -1.0))
+            self._y_max = float(s.get('y_max', 1.0))
+        _try('y_range', _restore_y_range)
 
+        def _restore_math():
             # Math channels must be known before the graph is created
             saved_math = s.get('math_channels', [])
             if isinstance(saved_math, list):
@@ -3574,10 +4160,12 @@ class SerialDataView(QtWidgets.QWidget):
                     for m in saved_math
                     if isinstance(m, dict) and m.get('expression', '').strip()
                 ]
+        _try('math_channels', _restore_math)
 
-            self._fft_check.setChecked(s.get('show_fft', False))
-            self.graph_mode.setChecked(s.get('show_plot', False))
+        _try('show_fft', lambda: self._fft_check.setChecked(bool(s.get('show_fft', False))))
+        _try('show_plot', lambda: self.graph_mode.setChecked(bool(s.get('show_plot', False))))
 
+        def _restore_decode():
             frame = s.get('frame', {})
             binary = s.get('binary', {})
             dtype = frame.get('data_type', binary.get('data_type', 'float32'))
@@ -3585,17 +4173,23 @@ class SerialDataView(QtWidgets.QWidget):
 
             self.type_combo.setCurrentText(dtype)
             self.endian_combo.setCurrentText('Little Endian' if endian == 'little' else 'Big Endian')
-            self.sync_word_edit.setText(frame.get('sync_word', 'AA'))
+            self.sync_word_edit.setText(str(frame.get('sync_word', 'AA')))
             sf = frame.get('size_field', 'fixed')
             sf_map = {'fixed': 'Fixed', '1-byte': '1-byte size field', '2-byte': '2-byte size field'}
             self.size_field_combo.setCurrentText(sf_map.get(sf, 'Fixed'))
-            self.frame_size_spin.setValue(frame.get('frame_size', 12))
-            self.checksum_check.setChecked(frame.get('checksum', False))
-        except (KeyError, TypeError, ValueError, AttributeError):
-            pass
+            self.frame_size_spin.setValue(int(frame.get('frame_size', 12)))
+            self.checksum_check.setChecked(bool(frame.get('checksum', False)))
+        _try('frame/binary', _restore_decode)
 
         for w in widgets:
             w.blockSignals(False)
+
+        if bad_keys:
+            monitor = self.window()
+            if hasattr(monitor, 'statusText'):
+                monitor.statusText.setText(
+                    'Some saved plot settings were invalid and skipped: '
+                    + ', '.join(bad_keys[:5]))
 
         self._apply_reader_settings()
         self.frame_size_spin.setEnabled(self.size_field_combo.currentText().startswith('Fixed'))
@@ -3610,6 +4204,11 @@ class SerialDataView(QtWidgets.QWidget):
         self._ascii_line_buffer = ''
         self._pending_rows = []
         self._pending_blocks = []
+        # New session: don't glue its first bytes onto the old partial hex row
+        self._hex_col = 0
+        # The whole-session average rate would otherwise count the idle gap
+        # (disconnect, device silent) and permanently skew the time axis
+        self._reset_sample_rate()
 
     def handleReceivedData(self, raw_bytes):
         """Route incoming serial bytes based on current data mode."""
@@ -3635,7 +4234,9 @@ class SerialDataView(QtWidgets.QWidget):
                     # Trigger needs per-sample evaluation; use the row path
                     for row in block:
                         self._ingest_row(row.tolist())
-                else:
+                elif not self._plot_paused:
+                    # The row path checks _plot_paused in _ingest_row; the
+                    # block path must too, or Pause doesn't pause binary mode
                     self._pending_blocks.append(block)
         else:
             samples = self._frame_reader.feed(raw_bytes)
@@ -3790,6 +4391,24 @@ class SerialDataView(QtWidgets.QWidget):
             lines.append('&nbsp; '.join(parts))
         self._insert_html(self.serialData, '<br>'.join(lines) + '<br>')
 
+    def _stamp_lines(self, text):
+        """Prefix each line start in text with the current time.
+
+        One timestamp is taken per chunk (a chunk is one ~33 ms display
+        flush, so per-line times would all be equal anyway)."""
+        prefix = '[' + datetime.now().strftime('%H:%M:%S.%f')[:-3] + '] '
+        segs = text.split('\n')
+        out = []
+        for i, seg in enumerate(segs):
+            if i > 0:
+                out.append('\n')
+                self._ts_at_line_start = True
+            if seg and self._ts_at_line_start:
+                out.append(prefix)
+                self._ts_at_line_start = False
+            out.append(seg)
+        return ''.join(out)
+
     def appendSerialText(self, appendText, direction, mode="ASCII"):
         is_send = direction == "send"
         color = QtGui.QColor(0, 0, 255) if is_send else QtGui.QColor(255, 0, 0)
@@ -3827,6 +4446,11 @@ class SerialDataView(QtWidgets.QWidget):
         else:
             raw = appendText.encode('ISO-8859-1', 'replace')
 
+        if not is_send and self.show_timestamps and ascii_text:
+            ascii_text = self._stamp_lines(ascii_text)
+        elif is_send and ascii_text:
+            # A send breaks/continues the current line like received text does
+            self._ts_at_line_start = ascii_text.endswith('\n')
         self._insert_colored_text(self.serialData, ascii_text, color)
         if raw:
             # One shared formatter for RX and TX keeps hex column tracking consistent
@@ -4244,6 +4868,29 @@ class SerialSendView(QtWidgets.QWidget):
         self.sendButton.setMinimumWidth(90)
         self.sendButton.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
 
+        # Periodic/repeat send: polling commands, keep-alives, CAN cyclic TX.
+        # With Repeat checked, Send (or a macro click) re-sends the same
+        # payload every N ms until unchecked / disconnect / mode switch.
+        self.repeatCheck = QtWidgets.QCheckBox('Repeat', self)
+        self.repeatCheck.setFont(send_font)
+        self.repeatCheck.setMinimumHeight(30)
+        self.repeatCheck.setToolTip(
+            'Re-send the payload periodically after pressing Send\n'
+            '(also works for macro buttons and CAN frames)')
+        self.repeatSpin = QtWidgets.QSpinBox(self)
+        self.repeatSpin.setRange(10, 60000)
+        self.repeatSpin.setValue(1000)
+        self.repeatSpin.setSuffix(' ms')
+        self.repeatSpin.setFont(send_font)
+        self.repeatSpin.setMinimumHeight(30)
+        self.repeatSpin.setToolTip('Repeat interval')
+        self._repeat_timer = QtCore.QTimer(self)
+        self._repeat_timer.timeout.connect(self._repeat_fire)
+        self._repeat_payload = None  # ('serial'|'raw', ...) or ('can', id, ext, data)
+        self._repeat_failures = 0    # consecutive failed sends while repeating
+        self.repeatCheck.toggled.connect(self._on_repeat_toggled)
+        self.repeatSpin.valueChanged.connect(self._repeat_timer.setInterval)
+
         # Macro buttons (right-click to edit)
         macros = self._load_macros()
         self.macro_buttons = []
@@ -4264,13 +4911,20 @@ class SerialSendView(QtWidgets.QWidget):
         # only one of each pair is visible at a time (Serial vs CAN mode).
         self.layout().addWidget(self.charMode, 1, 0, 1, 1)
         self.layout().addWidget(self.canIdEdit,         1, 0, 1, 1)
-        self.layout().addWidget(self.sendData,          1, 1, 1, 5)
+        self.layout().addWidget(self.sendData,          1, 1, 1, 3)
+        self.layout().addWidget(self.repeatCheck,       1, 4, 1, 1)
+        self.layout().addWidget(self.repeatSpin,        1, 5, 1, 1)
         self.layout().addWidget(self.lineEnding,        1, 6, 1, 1)
         self.layout().addWidget(self.canExtCheck,       1, 6, 1, 1)
         self.layout().addWidget(self.sendButton,        1, 7, 1, 1)
         self.layout().setHorizontalSpacing(6)
         self.layout().setVerticalSpacing(6)
         self.layout().setContentsMargins(2, 1, 2, 4)
+        # Equal stretch for all 8 columns: macro buttons share the row evenly,
+        # and the CAN ID field (col 0) no longer balloons to half the window
+        # while the macros next to it get squeezed into elided stubs.
+        for col in range(NUM_MACRO_BUTTONS):
+            self.layout().setColumnStretch(col, 1)
 
     def _strip_newlines(self):
         """Remove newlines from input (single-line send field)."""
@@ -4338,9 +4992,11 @@ class SerialSendView(QtWidgets.QWidget):
                     monitor.statusText.setText(
                         f'Macro "{btn.text()}" has no CAN ID (right-click to edit)')
                 return
-            self.canSendSignal.emit(btn.can_id, btn.can_ext, btn.hex_data)
+            payload = ('can', btn.can_id, btn.can_ext, btn.hex_data)
         else:
-            self.sendRaw(btn.hex_data)
+            payload = ('raw', btn.hex_data)
+        self._send_payload(payload)
+        self._arm_repeat(payload)
 
     def _record_history(self, text):
         """Add a sent command to history, skipping blanks and repeats."""
@@ -4349,15 +5005,72 @@ class SerialSendView(QtWidgets.QWidget):
             if len(self.history) > 200:
                 del self.history[:-200]
 
+    # --- periodic send -------------------------------------------------------
+
+    def _send_payload(self, payload):
+        if payload[0] == 'can':
+            self.canSendSignal.emit(payload[1], payload[2], payload[3])
+        elif payload[0] == 'raw':
+            self.sendRaw(payload[1])
+        else:
+            self.serialSendSignal.emit(payload[1])
+
+    def _arm_repeat(self, payload):
+        """Start periodic re-send of payload if Repeat is checked."""
+        if self.repeatCheck.isChecked():
+            self._repeat_payload = payload
+            self._repeat_failures = 0
+            self._repeat_timer.start(self.repeatSpin.value())
+
+    def _repeat_fire(self):
+        if self._repeat_payload is not None:
+            self._send_payload(self._repeat_payload)
+
+    def _on_repeat_toggled(self, checked):
+        if not checked:
+            self._repeat_timer.stop()
+            self._repeat_payload = None
+
+    def note_send_result(self, ok):
+        """Send outcome feedback from the monitor. A repeating payload that
+        keeps failing (closed port, non-ACKing CAN bus where each attempt
+        blocks 300 ms) must stop instead of hammering the connection and the
+        GUI thread forever."""
+        if not self._repeat_timer.isActive():
+            return
+        if ok:
+            self._repeat_failures = 0
+            return
+        self._repeat_failures += 1
+        if self._repeat_failures >= 3:
+            self.stop_repeat()
+            monitor = self.window()
+            if hasattr(monitor, 'statusText'):
+                monitor.statusText.setText(
+                    'Repeat stopped: sending keeps failing')
+
+    def stop_repeat(self):
+        """Stop periodic sending (disconnect, mode switch)."""
+        self._repeat_timer.stop()
+        self._repeat_payload = None
+        self._repeat_failures = 0
+        if self.repeatCheck.isChecked():
+            self.repeatCheck.setChecked(False)
+
     def _emit_send(self):
         text = self.sendData.toPlainText()
         if self._can_mode:
-            self.canSendSignal.emit(
-                self.canIdEdit.text().strip(), self.canExtCheck.isChecked(), text)
+            payload = ('can', self.canIdEdit.text().strip(),
+                       self.canExtCheck.isChecked(), text)
         else:
-            self.serialSendSignal.emit(text)
+            payload = ('serial', text)
+        self._send_payload(payload)
         self._record_history(text)
-        self.sendData.clear()
+        if self.repeatCheck.isChecked():
+            # Keep the text visible while it repeats
+            self._arm_repeat(payload)
+        else:
+            self.sendData.clear()
         self.history_index = 0
 
     def sendButtonClicked(self):
@@ -4370,10 +5083,14 @@ class SerialSendView(QtWidgets.QWidget):
                 for btn in self.macro_buttons]
 
     def _load_macros_from_list(self, macros):
-        """Restore macro buttons from a list of dicts."""
-        if not isinstance(macros, list) or len(macros) != NUM_MACRO_BUTTONS:
+        """Restore macro buttons from a list of dicts. A list from a build
+        with a different button count restores what it can (zip truncates)
+        instead of silently discarding the user's macros."""
+        if not isinstance(macros, list):
             return
         for btn, macro in zip(self.macro_buttons, macros):
+            if not isinstance(macro, dict):
+                continue
             btn.setText(macro.get("label", ""))
             btn.hex_data = macro.get("hex", "")
             btn.can_id = macro.get("can_id", "")
@@ -4383,12 +5100,22 @@ class SerialSendView(QtWidgets.QWidget):
     def _load_macros(self):
         """Load macro definitions from settings file, or use defaults."""
         try:
+            # OSError (not just FileNotFoundError): a PermissionError here
+            # used to crash the whole app during __init__. isinstance guards
+            # against a non-dict top level (AttributeError on s.get).
             with open(SETTINGS_FILE, 'r') as f:
                 s = json.load(f)
+            if isinstance(s, dict):
                 macros = s.get('macros', None)
-                if isinstance(macros, list) and len(macros) == NUM_MACRO_BUTTONS:
+                if isinstance(macros, list) and macros:
+                    # Pad/truncate to the button count so a list saved by a
+                    # build with a different count still restores
+                    macros = [m if isinstance(m, dict) else {}
+                              for m in macros[:NUM_MACRO_BUTTONS]]
+                    while len(macros) < NUM_MACRO_BUTTONS:
+                        macros.append(dict(DEFAULT_MACROS[len(macros)]))
                     return macros
-        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        except (OSError, json.JSONDecodeError, ValueError, UnicodeDecodeError):
             pass
         return [dict(m) for m in DEFAULT_MACROS]
 
@@ -4440,6 +5167,15 @@ class ToolBar(QtWidgets.QToolBar):
             '9600', '14400', '19200', '28800', '31250', '38400', '51200',
             '56000', '57600', '76800', '115200', '128000', '230400', '256000', '921600'
         ])
+        # Editable: non-standard rates (74880 ESP8266 boot, 250000 Marlin,
+        # 1M-3M high-speed logging) are daily needs the fixed list blocked
+        self.baudRates.setEditable(True)
+        self.baudRates.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.baudRates.setValidator(
+            QtGui.QIntValidator(1, 100_000_000, self.baudRates))
+        self.baudRates.setToolTip(
+            'Baud rate - pick a preset or type any custom rate\n'
+            '(e.g. 74880, 250000, 2000000)')
         self.baudRates.setCurrentText('115200')
         self.baudRates.setMinimumHeight(30)
         self.baudRates.setFont(toolbar_font)
@@ -4467,6 +5203,22 @@ class ToolBar(QtWidgets.QToolBar):
         self._flowControl.setCurrentIndex(0)
         self._flowControl.setFont(toolbar_font)
         self._flowControl.setMinimumHeight(30)
+
+        # Line controls: usable while the port is open (that is their point -
+        # DTR/RTS toggles reset ESP32/Arduino boards and drive bootstrap pins,
+        # Break interrupts U-Boot/RTOS consoles)
+        self.dtrCheck = QtWidgets.QCheckBox('DTR', self)
+        self.dtrCheck.setChecked(True)
+        self.dtrCheck.setFont(toolbar_font)
+        self.dtrCheck.setToolTip('Data Terminal Ready line (toggle to reset many dev boards)')
+        self.rtsCheck = QtWidgets.QCheckBox('RTS', self)
+        self.rtsCheck.setChecked(True)
+        self.rtsCheck.setFont(toolbar_font)
+        self.rtsCheck.setToolTip('Request To Send line (ignored under hardware flow control)')
+        self.breakButton = QtWidgets.QPushButton('Break', self)
+        self.breakButton.setMinimumHeight(30)
+        self.breakButton.setFont(toolbar_font)
+        self.breakButton.setToolTip('Hold TX in break state for 300 ms')
 
         # CAN mode widgets (hidden until CAN mode is selected)
         can_label = QtWidgets.QLabel(' CAN: ')
@@ -4502,6 +5254,9 @@ class ToolBar(QtWidgets.QToolBar):
             self.addWidget(self._parity),
             self.addWidget(self.stopBits),
             self.addWidget(self._flowControl),
+            self.addWidget(self.dtrCheck),
+            self.addWidget(self.rtsCheck),
+            self.addWidget(self.breakButton),
         ]
         self._can_actions = [
             self.addWidget(can_label),
@@ -4562,7 +5317,10 @@ class ToolBar(QtWidgets.QToolBar):
         self.canBitrates.setEnabled(flag)
 
     def baudRate(self):
-        return int(self.baudRates.currentText())
+        try:
+            return int(self.baudRates.currentText())
+        except ValueError:
+            return 115200  # empty custom-baud field
 
     def portName(self):
         return self.portNames.currentData() or self.portNames.currentText()

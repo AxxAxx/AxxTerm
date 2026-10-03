@@ -8,7 +8,13 @@ A professional serial terminal with dual ASCII/HEX view, real-time plotting, bin
 
 ### Serial Communication
 - Auto-detect serial ports with device name and VID:PID display
-- Configurable baud rate (9600 to 921600), data bits, parity, stop bits, flow control
+- Baud rate presets (9600 to 921600) plus **custom rates typed directly into
+  the editable combo** (74880 ESP8266 boot, 250000 Marlin, 2M+ USB-CDC, ...)
+- Configurable data bits, parity, stop bits, flow control
+- **DTR / RTS line toggles and a Break button** in the toolbar, usable while
+  connected (reset dev boards, drive bootstrap pins, interrupt U-Boot)
+- Failed writes and all driver errors are surfaced in the status bar; TX is
+  only counted/logged when the driver actually accepted it
 - Auto-reconnect when an unplugged USB device reappears (View > Auto-Reconnect)
 - Visual connection indicator (DB-9 connector icon: green = connected, red = disconnected)
 - Live status bar with RX/TX throughput (bytes/sec), totals, and baud rate
@@ -18,6 +24,10 @@ A professional serial terminal with dual ASCII/HEX view, real-time plotting, bin
 - ASCII and HEX views side by side, updated in real-time (batched at ~30 fps,
   so the GUI stays responsive at high baud rates)
 - Color-coded: red for received data, blue for sent data
+- **Display timestamps** (View > Timestamps, Ctrl+T): each received line is
+  prefixed with its arrival time in the ASCII view
+- **Freeze button**: freeze the views to scroll back and read while capture,
+  logging and stats keep running; buffered data renders on resume
 - Scroll position and text selection are preserved while data streams in;
   the view only auto-scrolls when already at the bottom
 - Search/highlight in scrollback (Ctrl+F)
@@ -26,6 +36,9 @@ A professional serial terminal with dual ASCII/HEX view, real-time plotting, bin
 ### Sending Data
 - Three send modes: ASCII, HEX, BINARY
 - Configurable line endings: None, LF, CR, CR+LF
+- **Repeat send**: check Repeat + interval (10 ms - 60 s) and press Send (or a
+  macro) to re-send periodically - polling commands, keep-alives, CAN cyclic
+  TX. Stops on disconnect, mode switch, or repeated send failures
 - Command history with Up/Down arrow keys
 - 8 macro buttons for quick-send (right-click to edit label and payload)
 
@@ -97,10 +110,15 @@ Frame structure: `[Start Byte(s)] [Optional Size Field] [Payload] [Optional Chec
 
 Switch the toolbar mode combo from **Serial** to **CAN** for a CANKing-style
 bus monitor. Requires `python-can` (`pip install python-can`) plus the vendor
-driver for your hardware.
+driver for your hardware. `python-can` (and `pyqtgraph`) are imported on
+first use rather than at startup, so the app window appears quickly even
+with both installed.
 
 - Supported hardware: **Kvaser** (CANlib drivers) and **Ixxat** (VCI drivers),
   plus a **Virtual** bus for testing without hardware
+- Kvaser opens require real hardware (`accept_virtual=False`): without this,
+  the Kvaser driver's built-in virtual channels would let Open "succeed" with
+  no device attached. Use the Virtual interface for hardware-free testing
 - Channel 0-7 and bitrate 10 kbit/s to 1 Mbit/s selectable in the toolbar
 - Two view modes, switchable live without losing per-ID timing state:
 
@@ -115,14 +133,27 @@ driver for your hardware.
   PDU1 destination byte cleared), DLC, and data bytes
 - RX runs on a background thread and the table is a batched
   `QAbstractTableModel` updated at ~30 fps, so a saturated bus stays smooth
+- Bus open and close also run on worker threads: driver init (Kvaser/Ixxat
+  DLL loading, hardware handshake) can take seconds, and the UI stays
+  responsive instead of freezing while it happens
+- **ID filter** above the table: show only listed IDs (`123, 18FEF100`) or
+  hide noisy ones (`!0CF00400`) - view only, recording captures everything
+- **Bus load % and error-frame count** in the status bar (estimated from
+  frame sizes vs. bitrate, the same approach PCAN-View uses)
 - Send frames from the send row: ID (hex) + data bytes (hex, max 8) +
-  extended-ID checkbox; Enter or Send transmits
+  extended-ID checkbox; Enter or Send transmits. Sends wait for transmit
+  confirmation (300 ms timeout), so a frame shown as TX actually left the
+  controller - wrong bitrate / missing ACK shows an error instead
+- **Cyclic transmit**: the Repeat checkbox works in CAN mode for keep-alive
+  frames (per-frame or per-macro)
 - **Macro buttons send CAN frames in CAN mode**: right-click a macro to give
   it a CAN ID and standard/extended flag; its hex payload becomes the frame
   data. In serial mode the same macro still sends its raw bytes.
 - The Record button (Ctrl+R) logs CAN traffic to the same timestamped log
-  file format as serial data, e.g.
+  file format as serial data (stamped with the frame's hardware timestamp), e.g.
   `[2026-07-17 14:03:12.481] RX: CAN 18FEF100 EXT PGN 0FEF1 DLC 8 DATA 01 02 03 04 05 06 07 08`
+- **Recording in CAN mode also writes a Vector `.asc` file** alongside the
+  `.txt`, so captures load directly into CANalyzer / SavvyCAN / asammdf
 
 Classic CAN only (max 8 data bytes); CAN FD is not supported yet.
 
@@ -146,6 +177,7 @@ Classic CAN only (max 8 data bytes); CAN FD is not supported yet.
 | Enter | Send data |
 | Up/Down | Navigate send history |
 | Ctrl+F | Find in scrollback |
+| Ctrl+T | Toggle display timestamps |
 | Ctrl+R | Start/stop recording to log file |
 | Ctrl+D | Toggle dark mode |
 | Ctrl+S | Save settings to file |
@@ -216,6 +248,12 @@ resync), the hex formatter, the math-expression sandbox, per-channel
 scale/offset, the time-axis sample-rate measurement, a settings round-trip,
 and the CAN mode (J1939 PGN extraction, frame/log formatting, both table view
 modes, macro round-trip, and an end-to-end send/receive over a virtual bus).
+They also pin the responsiveness behavior: heavy modules must import lazily,
+and CAN bus open/close must not block the GUI thread (including the
+cancel-while-opening and reopen-while-cancelling races). Newer tests cover
+the robustness fixes (per-key settings restore, invalid sync word warning,
+trigger in scaled units, fixed-view row cap) and the feature set (custom
+baud, display timestamps, freeze, repeat send, CAN ID filter, .asc logging).
 
 ## Settings File Format
 
@@ -225,6 +263,7 @@ modes, macro round-trip, and an end-to-end send/receive over a virtual bus).
 {
   "dark_mode": false,
   "auto_reconnect": true,
+  "show_timestamps": false,
   "ui_mode": "Serial",
   "can": { "interface": "Kvaser", "channel": 0, "bitrate": "500 kbit/s", "view_mode": "Scrolling" },
   "window": { "geometry": "<hex>", "splitter": [300, 400] },
