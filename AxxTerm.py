@@ -7,6 +7,7 @@ import struct
 import os
 import json
 import time
+import ctypes
 from collections import deque
 from datetime import datetime
 
@@ -148,6 +149,360 @@ def format_can_log_line(msg):
     return ' '.join(parts)
 
 
+# --- Kvaser controller state (direct canlib) --------------------------------
+#
+# python-can surfaces error *frames* but not the CAN controller's own state,
+# and its Kvaser backend does not implement BusABC.state. Counting error
+# frames is not the same thing: what matters is whether the controller has
+# gone error-passive or, worse, BUS-OFF - at which point it has stopped
+# taking part in traffic entirely and nothing else in the UI would say so.
+#
+# canReadStatus is a cheap, non-blocking local call against the handle the
+# backend already opened, so the 1 Hz stats tick makes it directly. canlib is
+# documented thread-safe, so sharing the handle with the reader thread's
+# blocking recv() is fine. Any failure returns None and the UI shows nothing,
+# never a guess.
+
+# canstat.h status flags (not exported by python-can's constants module)
+canSTAT_ERROR_PASSIVE = 0x00000001
+canSTAT_BUS_OFF = 0x00000002
+canSTAT_ERROR_WARNING = 0x00000004
+canSTAT_ERROR_ACTIVE = 0x00000008
+
+_canlib_dll = None  # ctypes handle, or False once a load attempt has failed
+
+
+def _get_canlib():
+    """Load canlib once. Returns the library, or None if it is unavailable."""
+    global _canlib_dll
+    if _canlib_dll is None:
+        try:
+            if os.name == 'nt':
+                lib = ctypes.windll.LoadLibrary('canlib32')
+            else:
+                lib = ctypes.cdll.LoadLibrary('libcanlib.so')
+            handle_t = ctypes.c_int
+            dword_p = ctypes.POINTER(ctypes.c_ulong)
+            lib.canRequestChipStatus.argtypes = [handle_t]
+            lib.canRequestChipStatus.restype = ctypes.c_int
+            lib.canReadStatus.argtypes = [handle_t, dword_p]
+            lib.canReadStatus.restype = ctypes.c_int
+            lib.canReadErrorCounters.argtypes = [handle_t, dword_p, dword_p, dword_p]
+            lib.canReadErrorCounters.restype = ctypes.c_int
+            _canlib_dll = lib
+        except (OSError, AttributeError):
+            # No Kvaser driver installed, or a build without these entry
+            # points: the feature simply stays off.
+            _canlib_dll = False
+    return _canlib_dll or None
+
+
+def kvaser_bus_state(bus):
+    """Controller state of an open Kvaser bus as (state, tx_err, rx_err).
+
+    Returns None for any other backend (python-can's virtual/Ixxat buses have
+    no canlib handle), when canlib cannot be loaded, or when the driver call
+    fails - the caller shows nothing in that case.
+    """
+    handle = getattr(bus, '_read_handle', None)
+    if handle is None:
+        return None
+    lib = _get_canlib()
+    if lib is None:
+        return None
+    flags = ctypes.c_ulong(0)
+    tx = ctypes.c_ulong(0)
+    rx = ctypes.c_ulong(0)
+    ov = ctypes.c_ulong(0)
+    try:
+        # canReadStatus returns the last status the device reported;
+        # canRequestChipStatus asks it for a fresh one first.
+        lib.canRequestChipStatus(handle)
+        if lib.canReadStatus(handle, ctypes.byref(flags)) != 0:
+            return None
+        lib.canReadErrorCounters(handle, ctypes.byref(tx), ctypes.byref(rx),
+                                 ctypes.byref(ov))
+    except Exception:
+        return None
+    return can_state_name(flags.value), tx.value, rx.value
+
+
+def can_state_name(flags):
+    """Controller state from canReadStatus flags, worst first."""
+    if flags & canSTAT_BUS_OFF:
+        return 'BUS-OFF'
+    if flags & canSTAT_ERROR_PASSIVE:
+        return 'PASSIVE'
+    if flags & canSTAT_ERROR_WARNING:
+        return 'WARNING'
+    return 'ACTIVE'
+
+
+# How each state is shown in the status bar. ACTIVE is the normal case and
+# stays unstyled so the bar is not permanently shouting.
+CAN_STATE_COLORS = {
+    'BUS-OFF': '#c0453d',
+    'PASSIVE': '#c0453d',
+    'WARNING': '#d08b1e',
+    'ACTIVE': '',
+}
+
+
+# --- Higher-layer protocol decoding -----------------------------------------
+#
+# Raw CAN carries no meaning: an ID is 11 or 29 bits and that is all the
+# standard says. Everything below comes from a higher-layer protocol, and the
+# same ID means different things under each - 0x7E8 is "OBD-II response from
+# ECU 1" to one decoder and "CANopen heartbeat, node 104" to another. So the
+# protocol is chosen in the UI rather than guessed from traffic; 'Auto' only
+# applies the few rules that cannot collide (see decode_auto).
+#
+# Decoders take the already-unpacked frame fields and return a short label for
+# the Decode column, or '' when the frame does not belong to that protocol.
+
+# J1939-71/73 PGNs that show up on almost every vehicle bus.
+J1939_PGN_NAMES = {
+    0x0EA00: 'Request',
+    0x0EB00: 'TP.DT',
+    0x0EC00: 'TP.CM',
+    0x0EE00: 'Address Claim',
+    0x0EF00: 'Proprietary A',
+    0x0F000: 'ERC1 Retarder',
+    0x0F001: 'EBC1 Brakes',
+    0x0F002: 'ETC1 Transmission',
+    0x0F003: 'EEC2 Engine',
+    0x0F004: 'EEC1 Engine',
+    0x0F005: 'ETC2 Transmission',
+    0x0FE6C: 'TCO1 Tachograph',
+    0x0FEBF: 'EBC2 Wheel Speed',
+    0x0FECA: 'DM1 Active DTCs',
+    0x0FECB: 'DM2 Stored DTCs',
+    0x0FECC: 'DM3 Clear DTCs',
+    0x0FEE0: 'VD Vehicle Distance',
+    0x0FEE4: 'SHUTDN Shutdown',
+    0x0FEE5: 'HOURS Engine Hours',
+    0x0FEE6: 'TD Time/Date',
+    0x0FEE9: 'LFC Fuel Consumption',
+    0x0FEEE: 'ET1 Engine Temp',
+    0x0FEEF: 'EFL/P1 Fluid Level/Press',
+    0x0FEF0: 'PTO',
+    0x0FEF1: 'CCVS Speed/Cruise',
+    0x0FEF2: 'LFE Fuel Economy',
+    0x0FEF5: 'AMB Ambient',
+    0x0FEF6: 'IC1 Inlet/Exhaust',
+    0x0FEF7: 'VEP1 Electrical Power',
+}
+
+# TP.CM control bytes (first data byte of PGN 0xEC00)
+J1939_TP_CM = {0x10: 'RTS', 0x11: 'CTS', 0x13: 'EndOfMsgAck',
+               0x20: 'BAM', 0xFF: 'Abort'}
+
+
+def decode_j1939(can_id, ext, data, rtr=False):
+    """SAE J1939: PGN name, source address, destination and priority.
+
+    J1939 is defined only over 29-bit IDs, so 11-bit frames get no label
+    rather than a guess. NMEA 2000 shares the framing: its PGNs fall through
+    to the numeric form.
+    """
+    if not ext:
+        return ''
+    prio = (can_id >> 26) & 0x7
+    pf = (can_id >> 16) & 0xFF
+    ps = (can_id >> 8) & 0xFF
+    sa = can_id & 0xFF
+    pgn = j1939_pgn(can_id)
+    name = J1939_PGN_NAMES.get(pgn)
+    if name is None:
+        name = 'Proprietary B' if 0xFF00 <= pgn <= 0xFFFF else f'PGN {pgn:05X}'
+    detail = ''
+    if pgn == 0x0EA00 and len(data) >= 3:
+        # A request carries the requested PGN as three bytes, LSB first
+        req = data[0] | (data[1] << 8) | (data[2] << 16)
+        req_name = J1939_PGN_NAMES.get(req)
+        detail = f'  {req:05X}' + (f' {req_name.split()[0]}' if req_name else '')
+    elif pgn == 0x0EC00 and data:
+        detail = '  ' + J1939_TP_CM.get(data[0], f'ctrl {data[0]:02X}')
+    elif pgn == 0x0EB00 and data:
+        detail = f'  seq {data[0]}'
+    # PDU1 (PF < 0xF0) is addressed: the PS byte is the destination address
+    route = f'  SA {sa:02X} -> {ps:02X}' if pf < 0xF0 else f'  SA {sa:02X}'
+    return f'{name}{detail}{route}  p{prio}'
+
+
+# CANopen (CiA 301). Function code is bits 7..10, node-ID the low 7 bits.
+CANOPEN_NMT_STATES = {0x00: 'Boot-up', 0x04: 'Stopped', 0x05: 'Operational',
+                      0x7F: 'Pre-operational'}
+# Phrased so the target reads on naturally: 'NMT: Reset node 3' / 'Reset all nodes'
+CANOPEN_NMT_COMMANDS = {0x01: 'Start', 0x02: 'Stop', 0x80: 'Enter pre-op',
+                        0x81: 'Reset', 0x82: 'Reset comm'}
+CANOPEN_FUNCTIONS = {
+    0x180: 'TPDO1', 0x200: 'RPDO1', 0x280: 'TPDO2', 0x300: 'RPDO2',
+    0x380: 'TPDO3', 0x400: 'RPDO3', 0x480: 'TPDO4', 0x500: 'RPDO4',
+    0x580: 'SDO tx', 0x600: 'SDO rx',
+}
+
+
+def decode_canopen(can_id, ext, data, rtr=False):
+    """CANopen (CiA 301): the standardised 'heartbeat' lives here.
+
+    Heartbeat is COB-ID 0x700 + node-ID with one data byte holding the NMT
+    state - the only CAN heartbeat that is actually standardised. Node
+    guarding reuses the same IDs as a remote frame.
+    """
+    if ext:
+        return ''  # CiA 301 predefined connection set is 11-bit only
+    node = can_id & 0x7F
+    fc = can_id & 0x780
+    if can_id == 0x000:
+        if not data:
+            return 'NMT'
+        cmd = CANOPEN_NMT_COMMANDS.get(data[0], f'cmd {data[0]:02X}')
+        if len(data) > 1:
+            target = 'all nodes' if data[1] == 0 else f'node {data[1]}'
+            return f'NMT: {cmd} {target}'
+        return f'NMT: {cmd}'
+    if can_id == 0x080:
+        return 'SYNC'
+    if can_id == 0x100:
+        return 'TIME'
+    if can_id in (0x7E4, 0x7E5):
+        return 'LSS ' + ('slave' if can_id == 0x7E4 else 'master')
+    if fc == 0x080 and node:
+        if len(data) >= 2:
+            return f'EMCY node {node}  code {data[0] | (data[1] << 8):04X}'
+        return f'EMCY node {node}'
+    if fc == 0x700 and node:
+        if rtr:
+            return f'Node guard request node {node}'
+        if data:
+            state = CANOPEN_NMT_STATES.get(data[0] & 0x7F, f'state {data[0]:02X}')
+            return f'Heartbeat node {node}: {state}'
+        return f'Heartbeat node {node}'
+    name = CANOPEN_FUNCTIONS.get(fc)
+    if name and node:
+        if fc in (0x580, 0x600) and len(data) >= 4:
+            # SDO: bytes 1-2 are the object index (LSB first), byte 3 the sub-index
+            return f'{name} node {node}  {data[1] | (data[2] << 8):04X}:{data[3]:02X}'
+        return f'{name} node {node}'
+    return ''
+
+
+# ISO-TP (ISO 15765-2) protocol control information, high nibble of byte 0
+ISOTP_FLOW_STATUS = {0: 'CTS', 1: 'WAIT', 2: 'OVFLW'}
+# OBD-II modes (ISO 15031-5) and UDS services (ISO 14229-1) share the SID byte
+UDS_SERVICES = {
+    0x01: 'OBD current data', 0x02: 'OBD freeze frame', 0x03: 'OBD show DTCs',
+    0x04: 'OBD clear DTCs', 0x06: 'OBD test results', 0x07: 'OBD pending DTCs',
+    0x09: 'OBD vehicle info', 0x0A: 'OBD permanent DTCs',
+    0x10: 'DiagnosticSessionControl', 0x11: 'ECUReset',
+    0x14: 'ClearDiagnosticInformation', 0x19: 'ReadDTCInformation',
+    0x22: 'ReadDataByIdentifier', 0x23: 'ReadMemoryByAddress',
+    0x27: 'SecurityAccess', 0x28: 'CommunicationControl',
+    0x2E: 'WriteDataByIdentifier', 0x2F: 'InputOutputControl',
+    0x31: 'RoutineControl', 0x34: 'RequestDownload', 0x35: 'RequestUpload',
+    0x36: 'TransferData', 0x37: 'RequestTransferExit', 0x3E: 'TesterPresent',
+    0x85: 'ControlDTCSetting',
+}
+UDS_NRC = {
+    0x11: 'service not supported', 0x12: 'sub-function not supported',
+    0x13: 'wrong length', 0x22: 'conditions not correct',
+    0x31: 'request out of range', 0x33: 'security access denied',
+    0x35: 'invalid key', 0x78: 'response pending',
+    0x7E: 'service not supported in session',
+}
+
+
+def _obd_address(can_id, ext):
+    """Who is talking, from the ID alone, or None if these are not OBD IDs."""
+    if ext:
+        # ISO 15765-4 29-bit addressing: 18DB33F1 functional, 18DAttss physical
+        pf = (can_id >> 16) & 0xFF
+        if pf not in (0xDA, 0xDB):
+            return None
+        dst = (can_id >> 8) & 0xFF
+        src = can_id & 0xFF
+        if pf == 0xDB:
+            return 'Functional req'
+        if src == 0xF1:
+            return f'Req -> ECU {dst:02X}'
+        if dst == 0xF1:
+            return f'Resp ECU {src:02X}'
+        return f'{src:02X} -> {dst:02X}'
+    if can_id == 0x7DF:
+        return 'Functional req (all ECUs)'
+    if 0x7E0 <= can_id <= 0x7E7:
+        return f'Req ECU{can_id - 0x7E0 + 1}'
+    if 0x7E8 <= can_id <= 0x7EF:
+        return f'Resp ECU{can_id - 0x7E8 + 1}'
+    return None
+
+
+def decode_obd2(can_id, ext, data, rtr=False):
+    """OBD-II / UDS over ISO-TP: addressing, the PCI nibble and the service."""
+    who = _obd_address(can_id, ext)
+    if who is None:
+        return ''
+    if not data:
+        return who
+    pci = data[0] >> 4
+    if pci == 2:
+        return f'{who}  CF seq {data[0] & 0x0F}'
+    if pci == 3:
+        return f'{who}  FC {ISOTP_FLOW_STATUS.get(data[0] & 0x0F, "?")}'
+    if pci == 0:
+        sid_at, tail = 1, f'SF({data[0] & 0x0F})'
+    elif pci == 1 and len(data) >= 2:
+        sid_at = 2
+        tail = f'FF(len {((data[0] & 0x0F) << 8) | data[1]})'
+    else:
+        return who
+    if len(data) <= sid_at:
+        return f'{who}  {tail}'
+    sid = data[sid_at]
+    if sid == 0x7F:  # negative response: echoed service + reason code
+        svc = (UDS_SERVICES.get(data[sid_at + 1], f'{data[sid_at + 1]:02X}')
+               if len(data) > sid_at + 1 else '?')
+        nrc = (UDS_NRC.get(data[sid_at + 2], f'NRC {data[sid_at + 2]:02X}')
+               if len(data) > sid_at + 2 else '')
+        return f'{who}  {tail}  NegResp {svc}: {nrc}'.rstrip(': ')
+    positive = sid >= 0x40 and (sid - 0x40) in UDS_SERVICES
+    base = sid - 0x40 if positive else sid
+    out = f'{who}  {tail}  ' + UDS_SERVICES.get(base, f'SID {sid:02X}')
+    if positive:
+        out += ' +'
+    if base in (0x01, 0x02) and len(data) > sid_at + 1:
+        out += f'  PID {data[sid_at + 1]:02X}'
+    elif base == 0x22 and len(data) > sid_at + 2:
+        out += f'  DID {data[sid_at + 1]:02X}{data[sid_at + 2]:02X}'
+    return out
+
+
+def decode_auto(can_id, ext, data, rtr=False):
+    """Apply only the rules that cannot collide between protocols.
+
+    29-bit: the OBD-II 18DA/18DB range first, then J1939 for everything else
+    (J1939 owns 29-bit IDs by convention). 11-bit: the OBD-II 7DF/7E0-7EF
+    range first, then CANopen, whose predefined IDs do not reach into it.
+    Anything genuinely ambiguous is better resolved by picking the protocol
+    explicitly in the combo.
+    """
+    return (decode_obd2(can_id, ext, data, rtr)
+            or (decode_j1939 if ext else decode_canopen)(can_id, ext, data, rtr))
+
+
+CAN_DECODE_MODES = ['Off', 'Auto', 'J1939', 'CANopen', 'OBD-II']
+CAN_DECODERS = {
+    'Auto': decode_auto,
+    'J1939': decode_j1939,
+    'CANopen': decode_canopen,
+    'OBD-II': decode_obd2,
+}
+
+
+# Macro buttons are per-mode: the serial set and the CAN set are stored and
+# restored independently, so switching Serial <-> CAN swaps the whole row of
+# buttons instead of showing serial byte strings with no CAN ID attached.
 DEFAULT_MACROS = [
     {"label": "0x7F",           "hex": "7F"},
     {"label": "FF",             "hex": "FF"},
@@ -157,6 +512,19 @@ DEFAULT_MACROS = [
     {"label": "__LONGPRESS__",  "hex": "5f5f4c4f4e4750524553535f5f0a"},
     {"label": "$$$",            "hex": "242424"},
     {"label": "__OTA__",        "hex": "5F5F4F54415F5F0A"},
+]
+
+DEFAULT_CAN_MACROS = [
+    {"label": "100 zeros", "hex": "0000000000000000", "can_id": "100",      "can_ext": False},
+    {"label": "100 FFs",   "hex": "FFFFFFFFFFFFFFFF", "can_id": "100",      "can_ext": False},
+    {"label": "1 byte FF", "hex": "FF",               "can_id": "100",      "can_ext": False},
+    # J1939 request (PGN 0xEA00, global destination) for EEC1: the data is
+    # the requested PGN 0x00F004 as three bytes, least significant first.
+    {"label": "Req EEC1",  "hex": "04F000",           "can_id": "18EAFFFE", "can_ext": True},
+    {"label": "Macro 5",   "hex": "",                 "can_id": "",         "can_ext": False},
+    {"label": "Macro 6",   "hex": "",                 "can_id": "",         "can_ext": False},
+    {"label": "Macro 7",   "hex": "",                 "can_id": "",         "can_ext": False},
+    {"label": "Macro 8",   "hex": "",                 "can_id": "",         "can_ext": False},
 ]
 
 # --- Application stylesheet (light theme) ---
@@ -805,14 +1173,37 @@ class CanFrameModel(QtCore.QAbstractTableModel):
     lookup -- no per-cell formatting while the view repaints under load.
     Delta-time and count bookkeeping is shared between modes, so switching
     view mode never loses the per-ID timing state.
+
+    In fixed mode a refreshed row is nothing but changed text, which is easy
+    to miss on a busy bus - so the Time cell of an updated row is tinted and
+    the tint fades out over FLASH_MS. Only that one column lights up: a whole
+    row blinking across the table is distracting to read against, while a
+    column of blips at the left edge scans like an activity strip. The fade
+    is derived in data() from a per-row monotonic stamp (no timer state per
+    row) and repainted by CanView's fade timer.
     """
 
     COLUMNS = ['Time [s]', 'Δt [s]', 'Count', 'Dir', 'Type', 'ID [hex]',
-               'PGN', 'DLC', 'Data [hex]']
-    _RIGHT_ALIGNED = {0, 1, 2, 7}   # Time, dt, Count, DLC
-    _CENTERED = {3, 4}              # Dir, Type
+               'PGN', 'DLC', 'Data [hex]', 'Decode']
+    _DECODE_COLUMN = 9
+    _RIGHT_ALIGNED = {0, 1, 2}      # Time, dt, Count
+    # DLC is centred rather than right-aligned: hard against the right edge
+    # it sat one pixel from the first data byte and read as part of it.
+    _CENTERED = {3, 4, 7}           # Dir, Type, DLC
 
     TX_COLOR = QtGui.QColor('#2a82da')  # readable on light and dark themes
+
+    FLASH_MS = 700.0        # fade-out duration of the "row just updated" tint
+    _FLASH_COLUMN = 0       # Time [s]: the only cell that lights up
+    _FLASH_STEPS = 12       # alpha is quantised to this many levels and cached
+    # Base tints (alpha is applied per step). RX reads as the accent blue, TX
+    # as a warmer tone so a frame we sent ourselves stays distinguishable.
+    _FLASH_RGB_LIGHT = {False: (53, 116, 179), True: (196, 120, 40)}
+    _FLASH_RGB_DARK = {False: (90, 160, 230), True: (230, 160, 70)}
+    # Peak alpha. Higher than a full-width band would need: one 90 px cell
+    # has to carry the signal on its own.
+    _FLASH_PEAK_LIGHT = 165
+    _FLASH_PEAK_DARK = 175
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -823,6 +1214,19 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         self._last_ts = {}       # {key: last timestamp} for delta-time
         self._counts = {}        # {key: frames seen}
         self._t0 = None          # timestamp of the first frame (relative time base)
+        # Row-update flash (fixed mode only)
+        self.flash_enabled = True
+        self._row_flash = []     # parallel: monotonic ms when the row last changed
+        self._flash_now = 0.0    # cached clock for one repaint pass
+        self._flash_active = False
+        self._dark_mode = False
+        self._flash_cache = {}   # {(is_tx, step): QColor} -- no QColor per cell
+        # Higher-layer decode. _row_src keeps the few numbers each decoder
+        # needs, so switching protocol re-labels the existing trace in place
+        # instead of throwing the capture away.
+        self.decode_mode = 'Off'
+        self._decoder = None
+        self._row_src = []       # parallel: (can_id, ext, data, rtr)
 
     # --- Qt model interface ---
 
@@ -837,6 +1241,9 @@ class CanFrameModel(QtCore.QAbstractTableModel):
             return self.rows[index.row()][index.column()]
         if role == QtCore.Qt.ForegroundRole and self._row_is_tx[index.row()]:
             return self.TX_COLOR
+        if (role == QtCore.Qt.BackgroundRole and self._flash_active
+                and index.column() == self._FLASH_COLUMN):
+            return self._flash_brush(index.row())
         if role == QtCore.Qt.TextAlignmentRole:
             col = index.column()
             if col in self._RIGHT_ALIGNED:
@@ -850,6 +1257,103 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         if role == QtCore.Qt.DisplayRole and orientation == QtCore.Qt.Horizontal:
             return self.COLUMNS[section]
         return None
+
+    # --- row-update flash ---
+
+    def _flash_brush(self, row):
+        """Translucent tint for a row updated less than FLASH_MS ago."""
+        stamp = self._row_flash[row]
+        if not stamp:
+            return None
+        age = self._flash_now - stamp
+        if age < 0 or age >= self.FLASH_MS:
+            return None
+        # Quantise the remaining fraction so repeated repaints reuse a handful
+        # of cached QColors instead of allocating one per visible cell.
+        step = int((1.0 - age / self.FLASH_MS) * self._FLASH_STEPS)
+        if step <= 0:
+            return None
+        is_tx = self._row_is_tx[row]
+        key = (is_tx, step)
+        color = self._flash_cache.get(key)
+        if color is None:
+            rgb = (self._FLASH_RGB_DARK if self._dark_mode
+                   else self._FLASH_RGB_LIGHT)[is_tx]
+            peak = (self._FLASH_PEAK_DARK if self._dark_mode
+                    else self._FLASH_PEAK_LIGHT)
+            color = QtGui.QColor(*rgb)
+            color.setAlpha(int(peak * step / self._FLASH_STEPS))
+            self._flash_cache[key] = color
+        return color
+
+    @property
+    def flash_active(self):
+        """True while at least one row is still lit (drives the fade timer)."""
+        return self._flash_active
+
+    def set_dark_mode(self, dark):
+        """Theme switch: the tint needs more lift on a dark base."""
+        dark = bool(dark)
+        if dark != self._dark_mode:
+            self._dark_mode = dark
+            self._flash_cache.clear()
+
+    def set_flash_enabled(self, enabled):
+        """Turn the row-update tint on/off (view preference)."""
+        self.flash_enabled = bool(enabled)
+        if not self.flash_enabled and self._flash_active:
+            self._flash_active = False
+            self._row_flash = [0.0] * len(self.rows)
+            self._repaint_all()
+
+    def refresh_flash(self):
+        """Advance the fade clock. Returns True while any row is still lit.
+
+        Called from CanView's fade timer; the timer stops as soon as this
+        returns False, so an idle bus costs nothing.
+        """
+        if not self._flash_active:
+            return False
+        self._flash_now = time.monotonic() * 1000.0
+        cutoff = self._flash_now - self.FLASH_MS
+        still_lit = any(st > cutoff for st in self._row_flash)
+        if not still_lit:
+            self._flash_active = False
+            self._repaint_all()  # final repaint clears the last faint tint
+        return still_lit
+
+    def _repaint_all(self):
+        if self.rows:
+            self.dataChanged.emit(
+                self.index(0, self._FLASH_COLUMN),
+                self.index(len(self.rows) - 1, self._FLASH_COLUMN),
+                [QtCore.Qt.BackgroundRole])
+
+    # --- higher-layer decode ---
+
+    def _decode(self, can_id, ext, data, rtr):
+        if self._decoder is None:
+            return ''
+        try:
+            return self._decoder(can_id, ext, data, rtr)
+        except Exception:
+            # A malformed frame must never take the table down: the decoders
+            # index into data that a real bus can truncate in any way.
+            return ''
+
+    def set_decode_mode(self, mode):
+        """Switch protocol and re-label every row already in the table."""
+        if mode == self.decode_mode:
+            return
+        self.decode_mode = mode
+        self._decoder = CAN_DECODERS.get(mode)
+        col = self._DECODE_COLUMN
+        for i, src in enumerate(self._row_src):
+            row = self.rows[i]
+            self.rows[i] = row[:col] + (self._decode(*src),) + row[col + 1:]
+        if self.rows:
+            self.dataChanged.emit(self.index(0, col),
+                                  self.index(len(self.rows) - 1, col))
 
     # --- ingest ---
 
@@ -881,6 +1385,7 @@ class CanFrameModel(QtCore.QAbstractTableModel):
             type_str += ' RTR'
         if getattr(msg, 'is_error_frame', False):
             type_str += ' ERR'
+        rtr = bool(getattr(msg, 'is_remote_frame', False))
         row = (
             f'{ts - self._t0:.4f}',
             f'{ts - prev:.4f}' if prev is not None else '',
@@ -891,8 +1396,9 @@ class CanFrameModel(QtCore.QAbstractTableModel):
             f'{j1939_pgn(can_id):05X}' if ext else '',
             str(getattr(msg, 'dlc', len(data))),
             ' '.join(f'{b:02X}' for b in data),
+            self._decode(can_id, ext, data, rtr),
         )
-        return key, row, direction == 'TX'
+        return key, row, direction == 'TX', (can_id, ext, data, rtr)
 
     def add_frames(self, batch):
         """Ingest a batch of (direction, msg) tuples (called on the GUI thread)."""
@@ -907,48 +1413,65 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         made = [self._make_row(d, m) for d, m in batch]
         start = len(self.rows)
         self.beginInsertRows(QtCore.QModelIndex(), start, start + len(made) - 1)
-        for _key, row, is_tx in made:
+        for _key, row, is_tx, src in made:
             self.rows.append(row)
             self._row_is_tx.append(is_tx)
+            self._row_src.append(src)
+            # No flash in scrolling mode: every row is new, so a tint on all
+            # of them says nothing. The stamp is still kept parallel so a
+            # mid-session mode switch finds consistent lists.
+            self._row_flash.append(0.0)
         self.endInsertRows()
         excess = len(self.rows) - CAN_MAX_SCROLL_ROWS
         if excess > 0:
             self.beginRemoveRows(QtCore.QModelIndex(), 0, excess - 1)
             del self.rows[:excess]
             del self._row_is_tx[:excess]
+            del self._row_flash[:excess]
+            del self._row_src[:excess]
             self.endRemoveRows()
 
     def _add_fixed(self, batch):
         changed_min = None
         changed_max = None
         pending = []  # rows for IDs not seen before, appended at the end
+        # One clock read per batch: every frame in it arrived within the same
+        # flush tick, so they are lit (and fade) together.
+        now = time.monotonic() * 1000.0 if self.flash_enabled else 0.0
         for direction, msg in batch:
-            key, row, is_tx = self._make_row(direction, msg)
+            key, row, is_tx, src = self._make_row(direction, msg)
             r = self._fixed_index.get(key)
             if r is not None:
                 if r < len(self.rows):
                     self.rows[r] = row
+                    self._row_src[r] = src
+                    self._row_flash[r] = now
                     changed_min = r if changed_min is None else min(changed_min, r)
                     changed_max = r if changed_max is None else max(changed_max, r)
                 else:
                     # Row is still in this batch's pending block
-                    pending[r - len(self.rows)] = (row, is_tx)
+                    pending[r - len(self.rows)] = (row, is_tx, src)
             else:
                 if len(self.rows) + len(pending) >= CAN_MAX_SCROLL_ROWS:
                     continue  # fixed view full (ID churn/fuzz): drop new IDs
                 self._fixed_index[key] = len(self.rows) + len(pending)
-                pending.append((row, is_tx))
+                pending.append((row, is_tx, src))
         if pending:
             start = len(self.rows)
             self.beginInsertRows(QtCore.QModelIndex(), start, start + len(pending) - 1)
-            for row, is_tx in pending:
+            for row, is_tx, src in pending:
                 self.rows.append(row)
                 self._row_is_tx.append(is_tx)
+                self._row_src.append(src)
+                self._row_flash.append(now)
             self.endInsertRows()
         if changed_min is not None:
             self.dataChanged.emit(
                 self.index(changed_min, 0),
                 self.index(changed_max, len(self.COLUMNS) - 1))
+        if now and (pending or changed_min is not None):
+            self._flash_now = now
+            self._flash_active = True
 
     # --- control ---
 
@@ -968,6 +1491,9 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         self.fixed_mode = fixed
         self.rows = []
         self._row_is_tx = []
+        self._row_flash = []
+        self._row_src = []
+        self._flash_active = False
         self._fixed_index = {}
         self.endResetModel()
 
@@ -975,6 +1501,9 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         self.beginResetModel()
         self.rows = []
         self._row_is_tx = []
+        self._row_flash = []
+        self._row_src = []
+        self._flash_active = False
         self._fixed_index = {}
         self._last_ts = {}
         self._counts = {}
@@ -1000,10 +1529,46 @@ class CanView(QtWidgets.QWidget):
             'Fixed: one line per CAN ID, overwritten in place')
         self.view_mode_combo.currentTextChanged.connect(self._on_view_mode_changed)
 
+        # Higher-layer protocol for the Decode column. Explicit rather than
+        # sniffed: the same 11-bit ID means different things under CANopen
+        # and OBD-II, and a confidently wrong label is worse than none.
+        self.decode_combo = QtWidgets.QComboBox()
+        self.decode_combo.addItems(CAN_DECODE_MODES)
+        self.decode_combo.setCurrentText('Auto')
+        self.decode_combo.setFont(view_font)
+        self.decode_combo.setFixedHeight(30)
+        self.decode_combo.setToolTip(
+            'Name well-known frames in the Decode column.\n'
+            'J1939: PGN name, source address, destination, priority (29-bit)\n'
+            'CANopen: heartbeat/NMT/SYNC/EMCY/PDO/SDO (11-bit)\n'
+            'OBD-II: ISO-TP addressing, PCI and UDS service\n'
+            'Auto: OBD-II ID ranges first, then J1939 for 29-bit and\n'
+            'CANopen for 11-bit. Pick a protocol if Auto mislabels your bus.')
+        self.decode_combo.currentTextChanged.connect(self._on_decode_changed)
+
+        # Highlight rows as they refresh. In fixed mode the only visible sign
+        # that a frame arrived is text changing in place, which is easy to
+        # miss - the tint makes live IDs obvious at a glance.
+        self.flash_check = QtWidgets.QCheckBox('Flash')
+        self.flash_check.setFont(view_font)
+        self.flash_check.setChecked(True)
+        self.flash_check.setFixedHeight(30)
+        self.flash_check.setToolTip(
+            'Fixed mode: light up the Time cell when a frame with that ID\n'
+            'arrives, then fade it out. Shows at a glance which IDs are live.')
+        self.flash_check.toggled.connect(self._on_flash_toggled)
+        # Only meaningful in fixed mode; the view starts in scrolling mode.
+        self.flash_check.setEnabled(False)
+
         self.clear_button = QtWidgets.QPushButton('Clear')
         self.clear_button.setFont(view_font)
         self.clear_button.setFixedHeight(30)
         self.clear_button.clicked.connect(self.model.clear)
+
+        # Repaint ticker for the fade; runs only while something is lit.
+        self._fade_timer = QtCore.QTimer(self)
+        self._fade_timer.setInterval(40)  # ~25 fps, enough for a 700 ms fade
+        self._fade_timer.timeout.connect(self._fade_tick)
 
         label = QtWidgets.QLabel('CAN frames')
         label.setObjectName('sectionLabel')
@@ -1030,6 +1595,8 @@ class CanView(QtWidgets.QWidget):
         controls.setSpacing(4)
         controls.addWidget(label)
         controls.addWidget(self.view_mode_combo)
+        controls.addWidget(self.decode_combo)
+        controls.addWidget(self.flash_check)
         controls.addWidget(self.filter_edit, stretch=1)
         controls.addWidget(self.clear_button)
 
@@ -1047,7 +1614,7 @@ class CanView(QtWidgets.QWidget):
         hh = self.table.horizontalHeader()
         hh.setStretchLastSection(True)
         hh.setHighlightSections(False)
-        for col, width in enumerate([90, 90, 60, 44, 70, 90, 60, 44, 260]):
+        for col, width in enumerate([90, 90, 60, 44, 70, 90, 60, 52, 240, 260]):
             self.table.setColumnWidth(col, width)
 
         # Connection indicator, same DB-9 icon as the serial view
@@ -1065,11 +1632,42 @@ class CanView(QtWidgets.QWidget):
         layout.addWidget(self.table, stretch=1)
         layout.addLayout(bottom)
 
+        # The combo was populated before the signal was connected, so push its
+        # starting value into the model explicitly.
+        self.model.set_decode_mode(self.decode_combo.currentText())
+
     def _on_view_mode_changed(self, text):
-        self.model.set_fixed_mode(text == 'Fixed')
+        fixed = (text == 'Fixed')
+        self.model.set_fixed_mode(fixed)
+        # Scrolling mode has nothing to flash (every row is new), so the
+        # toggle is greyed out there rather than silently doing nothing.
+        self.flash_check.setEnabled(fixed)
+        if not fixed:
+            self._fade_timer.stop()
         monitor = self.window()
         if hasattr(monitor, 'schedule_save'):
             monitor.schedule_save()
+
+    def _on_decode_changed(self, text):
+        self.model.set_decode_mode(text)
+        monitor = self.window()
+        if hasattr(monitor, 'schedule_save'):
+            monitor.schedule_save()
+
+    def _on_flash_toggled(self, checked):
+        self.model.set_flash_enabled(checked)
+        if not checked:
+            self._fade_timer.stop()
+        monitor = self.window()
+        if hasattr(monitor, 'schedule_save'):
+            monitor.schedule_save()
+
+    def _fade_tick(self):
+        """Repaint the fading rows; stop the timer once all are dark."""
+        if self.model.refresh_flash():
+            self.table.viewport().update()
+        else:
+            self._fade_timer.stop()
 
     def _on_filter_changed(self, text):
         """Parse the filter field into pass/block ID sets."""
@@ -1104,6 +1702,8 @@ class CanView(QtWidgets.QWidget):
         self.model.add_frames(batch)
         if not self.model.fixed_mode and at_bottom:
             self.table.scrollToBottom()
+        if self.model.flash_active and not self._fade_timer.isActive():
+            self._fade_timer.start()
 
     def set_connected(self, connected):
         self.indicator.setPixmap(create_connector_pixmap(
@@ -1143,6 +1743,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._can_tx_total = 0
         self._can_bits = 0            # wire bits this second (bus-load estimate)
         self._can_err_total = 0       # error frames seen this session
+        self._can_state = ''          # last controller state (Kvaser only)
 
         self.setWindowTitle('AxxTerm')
         self.setWindowIcon(QIcon(create_connector_pixmap(CONNECTED_COLOR)))
@@ -1441,6 +2042,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._can_tx_total = 0
         self._can_bits = 0
         self._can_err_total = 0
+        self._can_state = ''  # controller state is per session, like the counters
         self.canView.model.reset_timing()  # Δt/Count restart per session
         self._can_reader = CanReaderThread(bus, self._can_rx_queue, self)
         self._can_reader.errorOccurred.connect(self._on_can_error)
@@ -1745,11 +2347,36 @@ class SerialMonitor(QtWidgets.QMainWindow):
             bitrate = max(1, self.toolBar.canBitrate())
             load = min(100.0, bits * 1.1 / bitrate * 100)  # ~10% stuff bits
             err = f'  Err: {self._can_err_total}' if self._can_err_total else ''
-            self.statsLabel.setText(
-                f'Load: {load:.1f}%{err}  |  '
-                f'RX: {can_rx} msg/s  TX: {can_tx} msg/s  |  '
-                f'RX total: {self._can_rx_total}  TX total: {self._can_tx_total}  |  '
-                f'{bitrate // 1000} kbit/s')
+            text = (f'Load: {load:.1f}%{err}  |  '
+                    f'RX: {can_rx} msg/s  TX: {can_tx} msg/s  |  '
+                    f'RX total: {self._can_rx_total}  TX total: {self._can_tx_total}  |  '
+                    f'{bitrate // 1000} kbit/s')
+            # Controller state (Kvaser only; None on other backends). BUS-OFF
+            # means the controller has dropped off the bus entirely - it has
+            # to be impossible to miss, so it is coloured and carries the
+            # error counters that explain it.
+            state = kvaser_bus_state(self._can_bus)
+            if state is not None:
+                name, tx_err, rx_err = state
+                if name != self._can_state and name != 'ACTIVE':
+                    # Degrading is an event, not just a readout: say it once
+                    # in the status line so a glance away does not miss it.
+                    self.statusText.setText(
+                        f'CAN controller {name} (TX errors {tx_err}, '
+                        f'RX errors {rx_err})' +
+                        (' - not transmitting or receiving'
+                         if name == 'BUS-OFF' else ''))
+                self._can_state = name
+                color = CAN_STATE_COLORS.get(name, '')
+                counters = (f' (TEC {tx_err} REC {rx_err})'
+                            if name != 'ACTIVE' else '')
+                if color:
+                    text = (html.escape(text) +
+                            f'  |  <b><span style="color:{color}">'
+                            f'{name}</span></b>{counters}')
+                else:
+                    text += f'  |  {name}'
+            self.statsLabel.setText(text)
         elif self.port.isOpen():
             baud = self.toolBar.baudRate()
             self.statsLabel.setText(
@@ -1780,12 +2407,14 @@ class SerialMonitor(QtWidgets.QMainWindow):
             .replace('%COMBO_ARROW%', arrow_icon_url('#b8bfc6', 'down'))
             .replace('%ARROW_UP%', arrow_icon_url('#b8bfc6', 'up'))
             .replace('%ARROW_DOWN%', arrow_icon_url('#b8bfc6', 'down')))
+        self.canView.model.set_dark_mode(True)
 
     def _apply_light_palette(self):
         QtWidgets.QApplication.instance().setPalette(
             QtWidgets.QApplication.style().standardPalette())
         QtWidgets.QApplication.instance().setStyleSheet(
             LIGHT_QSS.replace('%COMBO_ARROW%', arrow_icon_url('#5a6570', 'down')))
+        self.canView.model.set_dark_mode(False)
 
     def _toggle_dark_mode(self):
         self._dark_mode = self._dark_mode_action.isChecked()
@@ -2063,6 +2692,8 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 'channel': self.toolBar.canChannels.currentIndex(),
                 'bitrate': self.toolBar.canBitrates.currentText(),
                 'view_mode': self.canView.view_mode_combo.currentText(),
+                'flash': self.canView.flash_check.isChecked(),
+                'decode': self.canView.decode_combo.currentText(),
             },
             'window': {
                 'geometry': bytes(self.saveGeometry().toHex()).decode('ascii'),
@@ -2076,7 +2707,8 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 'stop_bits': self.toolBar.stopBits.currentIndex(),
                 'flow_control': self.toolBar._flowControl.currentIndex(),
             },
-            'macros': self.serialSendView._get_macros_list(),
+            'macros': self.serialSendView._get_macros_list('serial'),
+            'macros_can': self.serialSendView._get_macros_list('can'),
         }
         target = path or SETTINGS_FILE
         # Write to a temp file in the same directory, then atomically replace the
@@ -2209,6 +2841,10 @@ class SerialMonitor(QtWidgets.QMainWindow):
             view_mode = can_cfg.get('view_mode', 'Scrolling')
             if view_mode in ('Scrolling', 'Fixed'):
                 self.canView.view_mode_combo.setCurrentText(view_mode)
+            self.canView.flash_check.setChecked(bool(can_cfg.get('flash', True)))
+            decode = can_cfg.get('decode', 'Auto')
+            if decode in CAN_DECODE_MODES:
+                self.canView.decode_combo.setCurrentText(decode)
 
         # UI mode last, so switching applies over the loaded CAN settings
         # (never while connected: the switch would close the live connection)
@@ -2219,10 +2855,14 @@ class SerialMonitor(QtWidgets.QMainWindow):
             # which is fine since 'Serial' is the initial state.
             self.toolBar.modeCombo.setCurrentText(ui_mode)
 
-        # Macros
+        # Macros (one set per mode; loaded after the UI mode switch above so
+        # whichever set is on screen is the one that gets refreshed)
         macros = s.get('macros', None)
         if macros:
-            self.serialSendView._load_macros_from_list(macros)
+            self.serialSendView._load_macros_from_list(macros, 'serial')
+        macros_can = s.get('macros_can', None)
+        if macros_can:
+            self.serialSendView._load_macros_from_list(macros_can, 'can')
 
         # Apply splitter sizes after the plot widget (if any) has been created
         if self._splitter_sizes_to_restore:
@@ -4584,15 +5224,35 @@ class MathChannelDialog(QtWidgets.QDialog):
 
 
 class MacroEditDialog(QtWidgets.QDialog):
-    """Dialog for editing a macro button's label and hex payload."""
+    """Dialog for editing a macro button's label and payload.
 
-    def __init__(self, label, hex_data, parent=None, can_id='', can_ext=False):
+    In CAN mode the dialog also shows the complete frame the button will put
+    on the wire -- ID, type, DLC and all eight data byte cells -- and every
+    part of it is editable. The payload is the single source of truth: the
+    byte cells, the DLC spinner and the hex/ASCII/dec/bin fields are four
+    views of the same bytes. Nothing is padded behind the user's back, which
+    the explanation under the frame says in so many words.
+    """
+
+    CAN_HELP = (
+        "Sent exactly as entered \u2014 AxxTerm never pads. "
+        "<b>FF</b> goes out as a <b>1-byte</b> frame (DLC 1), "
+        "<i>not</i> as FF 00 00 00 00 00 00 00.<br>"
+        "Set DLC (or press Pad 00 / Pad FF) for a full 8-byte frame. "
+        "J1939 expects 8 bytes with unused ones set to FF."
+    )
+
+    def __init__(self, label, hex_data, parent=None, can_id='', can_ext=False,
+                 can_mode=False):
         super().__init__(parent)
-        self.setWindowTitle("Edit Macro Button")
-        self.setMinimumWidth(450)
+        self.setWindowTitle('Edit CAN Macro' if can_mode else 'Edit Macro Button')
+        self.setMinimumWidth(500)
         self._updating = False
+        self._can_mode = bool(can_mode)
 
-        layout = QtWidgets.QFormLayout(self)
+        root = QtWidgets.QVBoxLayout(self)
+        layout = QtWidgets.QFormLayout()
+        root.addLayout(layout)
 
         self.label_edit = QtWidgets.QLineEdit(label)
         self.label_edit.setFont(QtGui.QFont('Segoe UI', 11))
@@ -4633,16 +5293,17 @@ class MacroEditDialog(QtWidgets.QDialog):
         self.ascii_edit.textChanged.connect(lambda: self._sync_from('ascii'))
         self.dec_edit.textChanged.connect(lambda: self._sync_from('dec'))
         self.bin_edit.textChanged.connect(lambda: self._sync_from('bin'))
-        self._update_preview()
 
         # CAN mode fields: the same payload is sent as a CAN frame with this ID
         self.can_id_edit = QtWidgets.QLineEdit(can_id)
-        self.can_id_edit.setFont(QtGui.QFont('Segoe UI', 11))
-        self.can_id_edit.setPlaceholderText("e.g. 123 or 18FEF100 (used in CAN mode)")
+        self.can_id_edit.setFont(QtGui.QFont('Consolas', 11))
+        self.can_id_edit.setPlaceholderText("123 (standard) or 18FEF100 (extended)")
+        self.can_id_edit.textChanged.connect(self._update_frame_preview)
 
         self.can_ext_check = QtWidgets.QCheckBox("Extended (29-bit) ID")
         self.can_ext_check.setFont(QtGui.QFont('Segoe UI', 10))
         self.can_ext_check.setChecked(bool(can_ext))
+        self.can_ext_check.toggled.connect(self._update_frame_preview)
 
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
@@ -4654,17 +5315,184 @@ class MacroEditDialog(QtWidgets.QDialog):
         layout.addRow("Input Mode:", self.input_mode)
         layout.addRow("Data:", self.input_stack)
         layout.addRow("Preview:", self.preview_label)
-        layout.addRow("CAN ID (hex):", self.can_id_edit)
-        layout.addRow("", self.can_ext_check)
-        layout.addRow(buttons)
 
-        # Initialize ASCII and Decimal fields from the hex data
+        self.can_group = self._build_can_group()
+        root.addWidget(self.can_group)
+        self.can_group.setVisible(self._can_mode)
+
+        root.addWidget(buttons)
+
+        # Initialize ASCII/Decimal/Binary fields and the frame view from hex
         self._sync_from('hex')
+
+    # --- CAN frame editor ---------------------------------------------------
+
+    def _build_can_group(self):
+        """The 'what actually goes on the wire' panel: ID, DLC, D0..D7."""
+        group = QtWidgets.QGroupBox('CAN frame')
+        grid = QtWidgets.QGridLayout(group)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+
+        small = QtGui.QFont('Segoe UI', 9)
+
+        id_label = QtWidgets.QLabel('ID (hex):')
+        id_label.setFont(QtGui.QFont('Segoe UI', 10))
+        grid.addWidget(id_label, 0, 0)
+        grid.addWidget(self.can_id_edit, 0, 1, 1, 5)
+        grid.addWidget(self.can_ext_check, 0, 6, 1, 3)
+
+        dlc_label = QtWidgets.QLabel('DLC:')
+        dlc_label.setFont(QtGui.QFont('Segoe UI', 10))
+        self.dlc_spin = QtWidgets.QSpinBox()
+        self.dlc_spin.setRange(0, 8)
+        self.dlc_spin.setFont(QtGui.QFont('Segoe UI', 10))
+        self.dlc_spin.setToolTip(
+            'Number of data bytes in the frame.\n'
+            'Raising it appends 00 bytes, lowering it drops the tail.')
+        self.dlc_spin.valueChanged.connect(self._dlc_changed)
+        grid.addWidget(dlc_label, 1, 0)
+        grid.addWidget(self.dlc_spin, 1, 1)
+
+        self.pad00_btn = QtWidgets.QPushButton('Pad 00')
+        self.pad00_btn.setFont(small)
+        self.pad00_btn.setToolTip('Fill up to 8 data bytes with 00')
+        self.pad00_btn.clicked.connect(lambda: self._pad_to_eight(0x00))
+        self.padff_btn = QtWidgets.QPushButton('Pad FF')
+        self.padff_btn.setFont(small)
+        self.padff_btn.setToolTip('Fill up to 8 data bytes with FF (J1939 style)')
+        self.padff_btn.clicked.connect(lambda: self._pad_to_eight(0xFF))
+        grid.addWidget(self.pad00_btn, 1, 2)
+        grid.addWidget(self.padff_btn, 1, 3)
+
+        # D0..D7 byte cells: the literal frame, editable byte by byte
+        byte_font = QtGui.QFont('Consolas', 11)
+        hex_validator = QtGui.QRegExpValidator(QtCore.QRegExp('[0-9A-Fa-f]{0,2}'))
+        self.byte_edits = []
+        for i in range(8):
+            cap = QtWidgets.QLabel('D%d' % i)
+            cap.setFont(small)
+            cap.setAlignment(QtCore.Qt.AlignHCenter)
+            grid.addWidget(cap, 2, i + 1)
+
+            cell = QtWidgets.QLineEdit()
+            cell.setFont(byte_font)
+            cell.setMaxLength(2)
+            cell.setFixedWidth(40)
+            cell.setAlignment(QtCore.Qt.AlignHCenter)
+            cell.setValidator(hex_validator)
+            cell.textEdited.connect(self._bytes_edited)
+            grid.addWidget(cell, 3, i + 1)
+            self.byte_edits.append(cell)
+
+        wire_caption = QtWidgets.QLabel('On the wire:')
+        wire_caption.setFont(small)
+        grid.addWidget(wire_caption, 4, 0, 1, 2)
+
+        self.frame_preview = QtWidgets.QLabel()
+        self.frame_preview.setFont(QtGui.QFont('Consolas', 10))
+        self.frame_preview.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        grid.addWidget(self.frame_preview, 5, 0, 1, 9)
+
+        help_label = QtWidgets.QLabel(self.CAN_HELP)
+        help_label.setFont(small)
+        help_label.setWordWrap(True)
+        help_label.setObjectName('sectionLabel')
+        grid.addWidget(help_label, 6, 0, 1, 9)
+
+        return group
+
+    def _current_bytes(self):
+        """The payload as bytes, or None when the hex field is not valid."""
+        try:
+            return bytes.fromhex(self.hex_edit.text().replace(' ', ''))
+        except ValueError:
+            return None
+
+    def _set_bytes(self, raw):
+        """Write raw back into the hex field (which re-syncs everything else)."""
+        self.hex_edit.setText(' '.join('%02X' % b for b in raw))
+
+    def _bytes_edited(self):
+        """A D0..D7 cell was typed into: rebuild the payload from the cells."""
+        if self._updating:
+            return
+        count = self.dlc_spin.value()
+        raw = bytes(int(self.byte_edits[i].text() or '0', 16) for i in range(count))
+        self._set_bytes(raw)
+
+    def _dlc_changed(self, value):
+        """DLC drives the payload length: grow with 00, shrink from the tail."""
+        if self._updating:
+            return
+        raw = self._current_bytes()
+        if raw is None:
+            return
+        if len(raw) == value:
+            return
+        raw = raw[:value] if len(raw) > value else raw + bytes(value - len(raw))
+        self._set_bytes(raw)
+
+    def _pad_to_eight(self, fill):
+        raw = self._current_bytes()
+        if raw is None:
+            return
+        self._set_bytes(raw[:8] + bytes([fill]) * max(0, 8 - len(raw)))
+
+    def _update_frame_preview(self):
+        """Refresh the byte cells, the DLC spinner and the wire-format line."""
+        if not self._can_mode:
+            return
+        raw = self._current_bytes()
+        outer = self._updating
+        self._updating = True
+        try:
+            if raw is not None:
+                n = min(len(raw), 8)
+                if self.dlc_spin.value() != len(raw) and len(raw) <= 8:
+                    self.dlc_spin.setValue(len(raw))
+                for i, cell in enumerate(self.byte_edits):
+                    # Never rewrite the cell being typed into: normalising
+                    # 'F' to '0F' mid-keystroke would eat the second digit.
+                    if not cell.hasFocus():
+                        cell.setText('%02X' % raw[i] if i < n else '')
+                    # Cells past the DLC are not part of the frame; greying
+                    # them out is what makes "FF is one byte" visible.
+                    cell.setEnabled(i < self.dlc_spin.value())
+        finally:
+            self._updating = outer
+
+        id_text = self.can_id_edit.text().strip()
+        ext = self.can_ext_check.isChecked()
+        if raw is None:
+            self.frame_preview.setText('(data is not valid hex)')
+            return
+        if len(raw) > 8:
+            self.frame_preview.setText(
+                '%d data bytes - a classic CAN frame carries at most 8' % len(raw))
+            return
+        try:
+            can_id = int(id_text, 16) if id_text else None
+        except ValueError:
+            can_id = None
+        if can_id is None:
+            id_part = '(no valid ID)'
+        else:
+            id_part = format_can_id(can_id, ext)
+        data_part = ' '.join('%02X' % b for b in raw) if raw else '-'
+        line = 'ID %s   %s   DLC %d   Data %s' % (
+            id_part, 'EXT (29-bit)' if ext else 'STD (11-bit)',
+            len(raw), data_part)
+        if ext and can_id is not None:
+            line += '   PGN %05X' % j1939_pgn(can_id)
+        self.frame_preview.setText(line)
+
+    # --- validation / conversion -------------------------------------------
 
     def accept(self):
         """Refuse to save an invalid hex payload (it would fail silently on send)."""
         try:
-            bytes.fromhex(self.hex_edit.text())
+            raw = bytes.fromhex(self.hex_edit.text().replace(' ', ''))
         except ValueError:
             QtWidgets.QMessageBox.warning(
                 self, 'Invalid Macro',
@@ -4685,6 +5513,26 @@ class MacroEditDialog(QtWidgets.QDialog):
                     f'CAN ID {can_id:X} is out of range (max {max_id:X} for '
                     f'{"an extended" if self.can_ext_check.isChecked() else "a standard"} ID).')
                 return
+        if self._can_mode:
+            # A CAN macro that cannot be sent is worth catching here rather
+            # than as a status-bar line on the first click.
+            if len(raw) > 8:
+                QtWidgets.QMessageBox.warning(
+                    self, 'Invalid Macro',
+                    f'A CAN frame carries at most 8 data bytes (this one has {len(raw)}).')
+                return
+            if not can_id_text:
+                # Not fatal - an empty slot is a legitimate thing to save -
+                # but worth one confirmation, since the button would do
+                # nothing but print a status line when clicked.
+                answer = QtWidgets.QMessageBox.question(
+                    self, 'No CAN ID',
+                    'This macro has no CAN ID, so clicking it in CAN mode '
+                    'will not send anything.\n\nSave it anyway?',
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No)
+                if answer != QtWidgets.QMessageBox.Yes:
+                    return
         super().accept()
 
     def _mode_changed(self, index):
@@ -4721,6 +5569,7 @@ class MacroEditDialog(QtWidgets.QDialog):
             pass
         self._update_preview()
         self._updating = False
+        self._update_frame_preview()
 
     def _update_preview(self):
         try:
@@ -4764,13 +5613,24 @@ class MacroButton(QtWidgets.QPushButton):
         self.refresh_tooltip()
 
     def refresh_tooltip(self):
-        """Show the payload and hint that the button is editable."""
+        """Show the exact frame/bytes this button sends, and that it's editable."""
         payload = self.hex_data.strip() or '(empty)'
         if self._can_mode:
             if self.can_id.strip():
-                ext = ' EXT' if self.can_ext else ''
-                self.setToolTip(f'Send CAN frame: ID {self.can_id}{ext}, '
-                                f'data {payload}\nRight-click to edit')
+                try:
+                    raw = bytes.fromhex(self.hex_data.replace(' ', ''))
+                    data = ' '.join(f'{b:02X}' for b in raw) if raw else '-'
+                    dlc = len(raw)
+                except ValueError:
+                    data, dlc = payload, '?'
+                # Spelling out the DLC is the point: a one-byte macro is a
+                # one-byte frame, and the tooltip should not let that surprise.
+                self.setToolTip(
+                    f'Send CAN frame\n'
+                    f'ID {self.can_id.upper()}  '
+                    f'{"EXT (29-bit)" if self.can_ext else "STD (11-bit)"}\n'
+                    f'DLC {dlc}  Data {data}\n'
+                    f'Right-click to edit')
             else:
                 self.setToolTip('No CAN ID set for this macro\nRight-click to edit')
         else:
@@ -4795,7 +5655,8 @@ class MacroButton(QtWidgets.QPushButton):
 
     def _edit_macro(self):
         dialog = MacroEditDialog(self.text(), self.hex_data, self,
-                                 can_id=self.can_id, can_ext=self.can_ext)
+                                 can_id=self.can_id, can_ext=self.can_ext,
+                                 can_mode=self._can_mode)
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             self.setText(dialog.label_edit.text())
             self.hex_data = dialog.hex_edit.text()
@@ -4891,15 +5752,18 @@ class SerialSendView(QtWidgets.QWidget):
         self.repeatCheck.toggled.connect(self._on_repeat_toggled)
         self.repeatSpin.valueChanged.connect(self._repeat_timer.setInterval)
 
-        # Macro buttons (right-click to edit)
-        macros = self._load_macros()
+        # Macro buttons (right-click to edit). Serial and CAN each have their
+        # own set of eight; the buttons are reused and their contents swapped
+        # on mode change, so a CAN frame macro never sits in the serial row.
+        self._macro_sets = self._load_macro_sets()
+        self._active_set = 'serial'
         self.macro_buttons = []
-        for macro in macros:
+        for macro in self._macro_sets['serial']:
             btn = MacroButton(macro.get("label", ""), macro.get("hex", ""),
                               self._macro_clicked, self,
                               can_id=macro.get("can_id", ""),
                               can_ext=bool(macro.get("can_ext", False)))
-            btn.macroChanged.connect(self._save_macros)
+            btn.macroChanged.connect(self._on_macro_changed)
             self.macro_buttons.append(btn)
 
         self.setLayout(QtWidgets.QGridLayout())
@@ -4963,14 +5827,21 @@ class SerialSendView(QtWidgets.QWidget):
 
     def set_can_mode(self, is_can):
         """Swap the send row between serial (mode + line ending) and CAN
-        (ID + extended flag) layouts. The data field and macros are shared."""
+        (ID + extended flag) layouts, and swap in that mode's macro set."""
         self._can_mode = is_can
         self.charMode.setVisible(not is_can)
         self.lineEnding.setVisible(not is_can)
         self.canIdEdit.setVisible(is_can)
         self.canExtCheck.setVisible(is_can)
         self.sendData.setPlaceholderText(
-            'Data bytes as hex, e.g. 01 A2 FF (max 8)' if is_can else '')
+            'Data bytes as hex, e.g. 01 A2 FF - sent as-is, no padding (max 8)'
+            if is_can else '')
+        self.sendData.setToolTip(
+            'CAN data bytes as hex (max 8).\n'
+            'The DLC is however many bytes you type - nothing is padded:\n'
+            'FF is a 1-byte frame, FF 00 00 00 00 00 00 00 is an 8-byte one.'
+            if is_can else '')
+        self._activate_macro_set('can' if is_can else 'serial')
         for btn in self.macro_buttons:
             btn.set_can_mode(is_can)
 
@@ -5076,29 +5947,67 @@ class SerialSendView(QtWidgets.QWidget):
     def sendButtonClicked(self):
         self._emit_send()
 
-    def _get_macros_list(self):
-        """Return current macro definitions as a list of dicts."""
-        return [{"label": btn.text(), "hex": btn.hex_data,
-                 "can_id": btn.can_id, "can_ext": btn.can_ext}
-                for btn in self.macro_buttons]
+    # --- macro sets (one per mode) ------------------------------------------
 
-    def _load_macros_from_list(self, macros):
-        """Restore macro buttons from a list of dicts. A list from a build
-        with a different button count restores what it can (zip truncates)
-        instead of silently discarding the user's macros."""
-        if not isinstance(macros, list):
+    @staticmethod
+    def _normalize_macro_list(macros, defaults):
+        """Pad/truncate a stored list to the button count, dropping junk.
+
+        A list saved by a build with a different button count still restores
+        what it can instead of being thrown away wholesale.
+        """
+        if not isinstance(macros, list) or not macros:
+            return [dict(m) for m in defaults]
+        out = [m if isinstance(m, dict) else {}
+               for m in macros[:NUM_MACRO_BUTTONS]]
+        while len(out) < NUM_MACRO_BUTTONS:
+            out.append(dict(defaults[len(out)]))
+        return out
+
+    def _capture_macro_set(self):
+        """Copy what the buttons currently hold into the active set."""
+        self._macro_sets[self._active_set] = [
+            {"label": btn.text(), "hex": btn.hex_data,
+             "can_id": btn.can_id, "can_ext": btn.can_ext}
+            for btn in self.macro_buttons]
+
+    def _activate_macro_set(self, name):
+        """Store the visible macros, then load the other set onto the buttons."""
+        if name == self._active_set:
             return
-        for btn, macro in zip(self.macro_buttons, macros):
-            if not isinstance(macro, dict):
-                continue
+        self._capture_macro_set()
+        self._active_set = name
+        for btn, macro in zip(self.macro_buttons, self._macro_sets[name]):
             btn.setText(macro.get("label", ""))
             btn.hex_data = macro.get("hex", "")
             btn.can_id = macro.get("can_id", "")
             btn.can_ext = bool(macro.get("can_ext", False))
             btn.refresh_tooltip()
 
-    def _load_macros(self):
-        """Load macro definitions from settings file, or use defaults."""
+    def _get_macros_list(self, which=None):
+        """Macro definitions for one mode ('serial'/'can'); default: active."""
+        self._capture_macro_set()
+        return [dict(m) for m in self._macro_sets[which or self._active_set]]
+
+    def _load_macros_from_list(self, macros, which='serial'):
+        """Restore one mode's macro set; refresh the buttons if it is active."""
+        if not isinstance(macros, list):
+            return
+        self._macro_sets[which] = self._normalize_macro_list(
+            macros, DEFAULT_CAN_MACROS if which == 'can' else DEFAULT_MACROS)
+        if which == self._active_set:
+            # _activate_macro_set is a no-op for the current set, so push the
+            # freshly loaded definitions onto the buttons directly.
+            for btn, macro in zip(self.macro_buttons, self._macro_sets[which]):
+                btn.setText(macro.get("label", ""))
+                btn.hex_data = macro.get("hex", "")
+                btn.can_id = macro.get("can_id", "")
+                btn.can_ext = bool(macro.get("can_ext", False))
+                btn.refresh_tooltip()
+
+    def _load_macro_sets(self):
+        """Load both macro sets from the settings file, or use defaults."""
+        serial, can = None, None
         try:
             # OSError (not just FileNotFoundError): a PermissionError here
             # used to crash the whole app during __init__. isinstance guards
@@ -5106,18 +6015,22 @@ class SerialSendView(QtWidgets.QWidget):
             with open(SETTINGS_FILE, 'r') as f:
                 s = json.load(f)
             if isinstance(s, dict):
-                macros = s.get('macros', None)
-                if isinstance(macros, list) and macros:
-                    # Pad/truncate to the button count so a list saved by a
-                    # build with a different count still restores
-                    macros = [m if isinstance(m, dict) else {}
-                              for m in macros[:NUM_MACRO_BUTTONS]]
-                    while len(macros) < NUM_MACRO_BUTTONS:
-                        macros.append(dict(DEFAULT_MACROS[len(macros)]))
-                    return macros
+                serial = s.get('macros', None)
+                can = s.get('macros_can', None)
         except (OSError, json.JSONDecodeError, ValueError, UnicodeDecodeError):
             pass
-        return [dict(m) for m in DEFAULT_MACROS]
+        return {
+            'serial': self._normalize_macro_list(serial, DEFAULT_MACROS),
+            # Settings written before macro sets existed have no CAN set; the
+            # defaults seed it rather than cloning the serial byte strings,
+            # which would be meaningless frames with no ID.
+            'can': self._normalize_macro_list(can, DEFAULT_CAN_MACROS),
+        }
+
+    def _on_macro_changed(self):
+        """A button was edited: keep the active set in step, then persist."""
+        self._capture_macro_set()
+        self._save_macros()
 
     def _save_macros(self):
         """Persist macros via parent SerialMonitor (debounced)."""

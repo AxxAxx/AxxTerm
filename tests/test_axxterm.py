@@ -334,8 +334,8 @@ def test_can_model_scrolling_rows_and_dt():
                   ('RX', _can_msg(0x200, b'\x02', ts=10.5)),
                   ('RX', _can_msg(0x100, b'\x03', ts=11.25))])
     assert m.rowCount() == 3
-    # Row: Time, dt, Count, Dir, Type, ID, PGN, DLC, Data
-    assert m.rows[0] == ('0.0000', '', '1', 'RX', 'STD', '100', '', '1', '01')
+    # Row: Time, dt, Count, Dir, Type, ID, PGN, DLC, Data, Decode
+    assert m.rows[0] == ('0.0000', '', '1', 'RX', 'STD', '100', '', '1', '01', '')
     assert m.rows[1][0] == '0.5000' and m.rows[1][5] == '200'
     # dt is time since the previous frame with the SAME ID (11.25 - 10.0)
     assert m.rows[2][1] == '1.2500' and m.rows[2][2] == '2'
@@ -355,6 +355,308 @@ def test_can_model_fixed_overwrites_in_place():
     # TX and RX with the same ID stay on separate rows
     m.add_frames([('TX', _can_msg(0x100, b'\x00', ts=13.0))])
     assert m.rowCount() == 3
+
+
+def test_decode_canopen():
+    d = axx.decode_canopen
+    # The one genuinely standardised CAN heartbeat: COB-ID 0x700 + node,
+    # one byte of NMT state (CiA 301)
+    assert d(0x701, False, b'\x05') == 'Heartbeat node 1: Operational'
+    assert d(0x702, False, b'\x7f') == 'Heartbeat node 2: Pre-operational'
+    assert d(0x70A, False, b'\x00') == 'Heartbeat node 10: Boot-up'
+    assert d(0x704, False, b'\x04') == 'Heartbeat node 4: Stopped'
+    # Node guarding reuses the heartbeat IDs as a remote frame
+    assert d(0x705, False, b'', rtr=True) == 'Node guard request node 5'
+    assert d(0x000, False, b'\x01\x00') == 'NMT: Start all nodes'
+    assert d(0x000, False, b'\x81\x03') == 'NMT: Reset node 3'
+    assert d(0x080, False, b'') == 'SYNC'
+    assert d(0x100, False, b'') == 'TIME'
+    assert d(0x081, False, b'\x30\x81' + bytes(6)) == 'EMCY node 1  code 8130'
+    assert d(0x181, False, b'\x01\x02') == 'TPDO1 node 1'
+    assert d(0x201, False, b'\x01') == 'RPDO1 node 1'
+    # SDO carries the object index (LSB first) and sub-index
+    assert d(0x581, False, b'\x43\x18\x10\x01' + bytes(4)) == 'SDO tx node 1  1018:01'
+    assert d(0x601, False, b'\x40\x00\x20\x00' + bytes(4)) == 'SDO rx node 1  2000:00'
+    assert d(0x7E4, False, b'\x04') == 'LSS slave'
+    # CANopen is an 11-bit protocol and must stay silent on 29-bit IDs
+    assert d(0x18FEF100, True, b'\x01') == ''
+    assert d(0x123, False, b'\x01') == ''  # no predefined function code
+
+
+def test_decode_j1939():
+    d = axx.decode_j1939
+    assert d(0x18FEF100, True, bytes(8)) == 'CCVS Speed/Cruise  SA 00  p6'
+    assert d(0x0CF00400, True, bytes(8)) == 'EEC1 Engine  SA 00  p3'
+    # A request names the PGN it asks for (3 data bytes, LSB first)
+    assert d(0x18EAFFFE, True, b'\x04\xf0\x00') == 'Request  0F004 EEC1  SA FE -> FF  p6'
+    # PDU1 is addressed: the PS byte is a destination, not part of the PGN
+    assert d(0x18EEFF00, True, bytes(8)) == 'Address Claim  SA 00 -> FF  p6'
+    assert d(0x1CECFF00, True, b'\x20' + bytes(7)) == 'TP.CM  BAM  SA 00 -> FF  p7'
+    assert d(0x1CEBFF00, True, b'\x01' + bytes(7)) == 'TP.DT  seq 1  SA 00 -> FF  p7'
+    assert d(0x18FECA00, True, bytes(8)) == 'DM1 Active DTCs  SA 00  p6'
+    assert d(0x18FF2A17, True, bytes(8)) == 'Proprietary B  SA 17  p6'
+    assert d(0x18FD0400, True, bytes(8)).startswith('PGN 0FD04')  # unknown PGN
+    assert d(0x701, False, b'\x05') == ''  # J1939 is 29-bit only
+
+
+def test_decode_obd2():
+    d = axx.decode_obd2
+    assert d(0x7DF, False, b'\x02\x01\x0c' + bytes(5)) == \
+        'Functional req (all ECUs)  SF(2)  OBD current data  PID 0C'
+    assert d(0x7E8, False, b'\x04\x41\x0c\x1a\xf8' + bytes(3)) == \
+        'Resp ECU1  SF(4)  OBD current data +  PID 0C'
+    assert d(0x7E0, False, b'\x03\x22\xf1\x90' + bytes(4)) == \
+        'Req ECU1  SF(3)  ReadDataByIdentifier  DID F190'
+    # ISO-TP multi-frame: first frame, flow control, consecutive frame
+    assert d(0x7E8, False, b'\x10\x14\x62\xf1\x90\x57\x30\x4c').startswith(
+        'Resp ECU1  FF(len 20)  ReadDataByIdentifier +')
+    assert d(0x7E0, False, b'\x30' + bytes(7)) == 'Req ECU1  FC CTS'
+    assert d(0x7E8, False, b'\x21' + bytes(7)) == 'Resp ECU1  CF seq 1'
+    assert d(0x7E8, False, b'\x03\x7f\x22\x31' + bytes(4)) == \
+        'Resp ECU1  SF(3)  NegResp ReadDataByIdentifier: request out of range'
+    # 29-bit ISO 15765-4 addressing
+    assert d(0x18DB33F1, True, b'\x02\x10\x03' + bytes(5)).startswith('Functional req  SF(2)')
+    assert d(0x18DAF110, True, b'\x02\x50\x03' + bytes(5)).startswith('Resp ECU 10')
+    assert d(0x123, False, b'\x01') == ''  # outside the OBD ID ranges
+
+
+def test_decode_auto_and_truncated_frames():
+    # Auto applies the non-colliding rules: OBD ranges, then J1939 for 29-bit
+    # and CANopen for 11-bit
+    assert axx.decode_auto(0x701, False, b'\x05') == 'Heartbeat node 1: Operational'
+    assert axx.decode_auto(0x18FEF100, True, bytes(8)).startswith('CCVS')
+    assert axx.decode_auto(0x7DF, False, b'\x02\x01\x0c' + bytes(5)).startswith(
+        'Functional req (all ECUs)')
+    assert axx.decode_auto(0x123, False, b'\x01') == ''
+    # A real bus truncates frames in every way; no decoder may raise
+    for cid, ext, data in [(0x701, False, b''), (0x7E8, False, b'\x10'),
+                           (0x7E8, False, b'\x02'), (0x7E8, False, b'\x03\x7f'),
+                           (0x18EAFFFE, True, b'\x04'), (0x581, False, b'\x43'),
+                           (0x000, False, b''), (0x081, False, b'\x30')]:
+        for fn in (axx.decode_auto, axx.decode_j1939, axx.decode_canopen,
+                   axx.decode_obd2):
+            fn(cid, ext, data, False)
+
+
+def test_can_model_decode_column_and_reswitch():
+    """Switching protocol re-labels the rows already captured, in place."""
+    m = axx.CanFrameModel()
+    m.set_decode_mode('CANopen')
+    m.add_frames([('RX', _can_msg(0x701, b'\x05', ts=1.0)),
+                  ('RX', _can_msg(0x18FEF100, bytes(8), ext=True, ts=1.1))])
+    col = axx.CanFrameModel._DECODE_COLUMN
+    assert m.rows[0][col] == 'Heartbeat node 1: Operational'
+    assert m.rows[1][col] == ''        # 29-bit: not CANopen
+    m.set_decode_mode('J1939')
+    assert m.rows[0][col] == ''        # same rows, relabelled
+    assert m.rows[1][col].startswith('CCVS')
+    m.set_decode_mode('Off')
+    assert m.rows[0][col] == '' and m.rows[1][col] == ''
+    # Fixed mode keeps the decode in step when a row is overwritten
+    m.set_decode_mode('CANopen')
+    m.set_fixed_mode(True)
+    m.add_frames([('RX', _can_msg(0x701, b'\x05', ts=2.0))])
+    m.add_frames([('RX', _can_msg(0x701, b'\x04', ts=2.1))])
+    assert m.rowCount() == 1
+    assert m.rows[0][col] == 'Heartbeat node 1: Stopped'
+
+
+def test_can_decode_setting_round_trip():
+    win = _fresh_monitor()
+    assert win.canView.decode_combo.currentText() == 'Auto'
+    win.canView.decode_combo.setCurrentText('CANopen')
+    assert win.canView.model.decode_mode == 'CANopen'
+    win.save_all_settings()
+    win.close()
+    win2 = axx.SerialMonitor()
+    assert win2.canView.decode_combo.currentText() == 'CANopen'
+    assert win2.canView.model.decode_mode == 'CANopen'
+    _isolate_settings()
+    win2.close()
+
+
+def test_can_state_name_and_unavailable_backend():
+    # canstat flags -> state, worst first
+    assert axx.can_state_name(0) == 'ACTIVE'
+    assert axx.can_state_name(axx.canSTAT_ERROR_ACTIVE) == 'ACTIVE'
+    assert axx.can_state_name(axx.canSTAT_ERROR_WARNING) == 'WARNING'
+    assert axx.can_state_name(axx.canSTAT_ERROR_PASSIVE) == 'PASSIVE'
+    assert axx.can_state_name(axx.canSTAT_BUS_OFF) == 'BUS-OFF'
+    # Bus-off wins over the lesser flags the driver sets alongside it
+    assert axx.can_state_name(
+        axx.canSTAT_BUS_OFF | axx.canSTAT_ERROR_PASSIVE
+        | axx.canSTAT_ERROR_WARNING) == 'BUS-OFF'
+    # A non-Kvaser bus has no canlib handle: report nothing, never a guess
+    class _VirtualBus:
+        pass
+    assert axx.kvaser_bus_state(_VirtualBus()) is None
+
+
+def test_can_fixed_flash_lights_and_fades():
+    """Fixed mode tints a row when its ID is refreshed, then fades it out."""
+    import time as _time
+    m = axx.CanFrameModel()
+    m.set_fixed_mode(True)
+    m.add_frames([('RX', _can_msg(0x100, b'\x01', ts=10.0))])
+    assert m.flash_active
+    bg = m.data(m.index(0, 0), QtCore.Qt.BackgroundRole)
+    assert bg is not None and bg.alpha() > 0
+    # Only the Time cell lights up - a whole row blinking is hard to read
+    for col in range(1, m.columnCount()):
+        assert m.data(m.index(0, col), QtCore.Qt.BackgroundRole) is None
+
+    # Scrolling mode never flashes: every row there is new anyway
+    m2 = axx.CanFrameModel()
+    m2.add_frames([('RX', _can_msg(0x100, b'\x01', ts=10.0))])
+    assert not m2.flash_active
+    assert m2.data(m2.index(0, 0), QtCore.Qt.BackgroundRole) is None
+
+    # The tint dims as it ages and the model reports itself idle at the end
+    old_ms = axx.CanFrameModel.FLASH_MS
+    axx.CanFrameModel.FLASH_MS = 60.0
+    try:
+        m.add_frames([('RX', _can_msg(0x100, b'\x02', ts=11.0))])
+        first = m.data(m.index(0, 0), QtCore.Qt.BackgroundRole).alpha()
+        _time.sleep(0.03)
+        assert m.refresh_flash() is True
+        mid = m.data(m.index(0, 0), QtCore.Qt.BackgroundRole)
+        assert mid is None or mid.alpha() < first
+        _time.sleep(0.05)
+        assert m.refresh_flash() is False
+        assert m.data(m.index(0, 0), QtCore.Qt.BackgroundRole) is None
+    finally:
+        axx.CanFrameModel.FLASH_MS = old_ms
+
+
+def test_can_flash_disabled_leaves_rows_untinted():
+    m = axx.CanFrameModel()
+    m.set_fixed_mode(True)
+    m.set_flash_enabled(False)
+    m.add_frames([('RX', _can_msg(0x100, b'\x01', ts=10.0))])
+    assert not m.flash_active
+    assert m.data(m.index(0, 0), QtCore.Qt.BackgroundRole) is None
+
+
+def test_can_flash_row_lists_stay_parallel():
+    """A scroll-mode trim and a mode switch must not desync _row_flash."""
+    m = axx.CanFrameModel()
+    old_cap = axx.CAN_MAX_SCROLL_ROWS
+    axx.CAN_MAX_SCROLL_ROWS = 4
+    try:
+        m.add_frames([('RX', _can_msg(i, b'', ts=float(i))) for i in range(10)])
+        assert len(m._row_flash) == len(m.rows) == 4
+        m.set_fixed_mode(True)
+        m.add_frames([('RX', _can_msg(0x10, b'\x01', ts=20.0))])
+        assert len(m._row_flash) == len(m.rows) == 1
+    finally:
+        axx.CAN_MAX_SCROLL_ROWS = old_cap
+
+
+def test_can_view_fade_timer_stops_when_idle():
+    import time as _time
+    win = _fresh_monitor()
+    view = win.canView
+    view.view_mode_combo.setCurrentText('Fixed')
+    assert view.flash_check.isEnabled()
+    old_ms = axx.CanFrameModel.FLASH_MS
+    axx.CanFrameModel.FLASH_MS = 1.0
+    try:
+        view.ingest([('RX', _can_msg(0x100, b'\x01', ts=10.0))])
+        assert view._fade_timer.isActive()
+        _time.sleep(0.01)
+        view._fade_tick()           # one tick past a 1 ms fade
+        assert not view._fade_timer.isActive()
+    finally:
+        axx.CanFrameModel.FLASH_MS = old_ms
+    # Switching back to scrolling disables the toggle and stops the ticker
+    view.view_mode_combo.setCurrentText('Scrolling')
+    assert not view.flash_check.isEnabled()
+    assert not view._fade_timer.isActive()
+    win.close()
+
+
+def test_macro_dialog_can_frame_editor():
+    """The CAN frame panel is a second view of the same payload bytes."""
+    dlg = axx.MacroEditDialog('m', 'FF', can_id='100', can_ext=False,
+                              can_mode=True)
+    # 'FF' is one byte: DLC 1, one live cell, seven disabled ones
+    assert dlg.dlc_spin.value() == 1
+    assert dlg.byte_edits[0].text() == 'FF'
+    assert dlg.byte_edits[1].text() == '' and not dlg.byte_edits[1].isEnabled()
+    assert dlg.frame_preview.text() == 'ID 100   STD (11-bit)   DLC 1   Data FF'
+
+    # Padding is explicit: DLC 8 appends zero bytes to the payload itself
+    dlg.dlc_spin.setValue(8)
+    assert bytes.fromhex(dlg.hex_edit.text().replace(' ', '')) == b'\xff' + bytes(7)
+    assert 'DLC 8' in dlg.frame_preview.text()
+
+    # ...and 'Pad FF' fills the tail instead
+    dlg.hex_edit.setText('04 F0 00')
+    dlg._pad_to_eight(0xFF)
+    assert bytes.fromhex(dlg.hex_edit.text().replace(' ', '')) == b'\x04\xf0\x00' + b'\xff' * 5
+
+    # Editing a byte cell writes back into the payload
+    dlg.byte_edits[1].setText('AB')
+    dlg._bytes_edited()
+    assert bytes.fromhex(dlg.hex_edit.text().replace(' ', ''))[1] == 0xAB
+    dlg.deleteLater()
+
+
+def test_macro_dialog_serial_hides_can_frame():
+    dlg = axx.MacroEditDialog('m', '7F')
+    assert not dlg.can_group.isVisible()
+    assert 'ASCII:' in dlg.preview_label.text()
+    dlg.deleteLater()
+
+
+def test_macro_sets_are_separate_per_mode():
+    win = _fresh_monitor()
+    sv = win.serialSendView
+    sv.macro_buttons[0].setText('serial-one')
+    sv.macro_buttons[0].hex_data = '7F'
+
+    win.toolBar.modeCombo.setCurrentText('CAN')
+    # CAN mode shows its own set, seeded from the CAN defaults
+    assert sv.macro_buttons[0].text() != 'serial-one'
+    assert sv.macro_buttons[0].can_id == axx.DEFAULT_CAN_MACROS[0]['can_id']
+    sv.macro_buttons[0].setText('can-one')
+    sv.macro_buttons[0].hex_data = '0102'
+    sv.macro_buttons[0].can_id = '7FF'
+
+    win.toolBar.modeCombo.setCurrentText('Serial')
+    assert sv.macro_buttons[0].text() == 'serial-one'
+    assert sv.macro_buttons[0].hex_data == '7F'
+
+    # Both sets survive a save/load round trip
+    win.save_all_settings()
+    saved = json.load(open(axx.SETTINGS_FILE))
+    assert saved['macros'][0]['label'] == 'serial-one'
+    assert saved['macros_can'][0]['label'] == 'can-one'
+    win.close()
+
+    win2 = axx.SerialMonitor()
+    sv2 = win2.serialSendView
+    assert sv2.macro_buttons[0].text() == 'serial-one'
+    win2.toolBar.modeCombo.setCurrentText('CAN')
+    assert sv2.macro_buttons[0].text() == 'can-one'
+    assert sv2.macro_buttons[0].can_id == '7FF'
+    _isolate_settings()
+    win2.close()
+
+
+def test_can_macro_set_seeded_from_defaults_for_old_settings():
+    """Settings written before per-mode macros get the CAN defaults, not a
+    copy of the serial byte strings (which have no CAN ID and cannot send)."""
+    _isolate_settings()
+    with open(axx.SETTINGS_FILE, 'w') as f:
+        json.dump({'macros': [{'label': 'old', 'hex': '7F'}]}, f)
+    win = axx.SerialMonitor()
+    sv = win.serialSendView
+    assert sv.macro_buttons[0].text() == 'old'
+    win.toolBar.modeCombo.setCurrentText('CAN')
+    assert sv.macro_buttons[0].can_id == axx.DEFAULT_CAN_MACROS[0]['can_id']
+    _isolate_settings()
+    win.close()
 
 
 def test_can_model_mode_switch_keeps_timing_state():

@@ -1,6 +1,6 @@
 # AxxTerm
 
-A professional serial terminal with dual ASCII/HEX view, real-time plotting, binary/frame decoding, data converter, configurable macro buttons, and a CAN bus monitor mode (Kvaser/Ixxat). Built with Python and PyQt5.
+A professional serial terminal with dual ASCII/HEX view, real-time plotting, binary/frame decoding, data converter, configurable macro buttons, and a CAN bus monitor mode (Kvaser/Ixxat) with J1939 / CANopen / OBD-II frame decoding. Built with Python and PyQt5.
 
 ![AxxTerm GUI](AxxTerm_GUI.PNG)
 
@@ -40,7 +40,9 @@ A professional serial terminal with dual ASCII/HEX view, real-time plotting, bin
   macro) to re-send periodically - polling commands, keep-alives, CAN cyclic
   TX. Stops on disconnect, mode switch, or repeated send failures
 - Command history with Up/Down arrow keys
-- 8 macro buttons for quick-send (right-click to edit label and payload)
+- 8 macro buttons for quick-send (right-click to edit label and payload).
+  **Serial and CAN each have their own set of eight** - switching mode swaps
+  the whole row, so CAN frame macros never sit among the serial byte strings
 
 ### Real-Time Plotting
 - 1 to 12 channels with auto-scaling Y-axis
@@ -127,10 +129,20 @@ with both installed.
 | Scrolling | Every frame appends a line (ring-buffered at 10,000 rows) |
 | Fixed | One line per CAN ID, overwritten in place (like CANKing fixed positions) |
 
+- **Activity flash in fixed mode** (the `Flash` checkbox above the table):
+  when a frame arrives, the **Time cell** of its row lights up - blue for RX,
+  amber for TX - and fades out over ~0.7 s. Only that one column blips, so
+  the Time axis reads as an activity strip without the rest of the row
+  flickering under the data you are trying to read. In fixed mode the only
+  other sign that a frame arrived is text changing in place, so this is what
+  makes live IDs (and silent ones) obvious at a glance. The fade repaints at
+  ~25 fps only while something is lit, and the toggle is greyed out in
+  scrolling mode where every row is new anyway
+
 - Columns, everything in hex: relative time, **Δt since the previous frame
   with the same ID**, per-ID frame count, direction (TX rows in blue),
   STD/EXT (plus RTR/ERR flags), ID, **J1939 PGN** (derived from 29-bit IDs,
-  PDU1 destination byte cleared), DLC, and data bytes
+  PDU1 destination byte cleared), DLC, data bytes, and the **Decode** label
 - RX runs on a background thread and the table is a batched
   `QAbstractTableModel` updated at ~30 fps, so a saturated bus stays smooth
 - Bus open and close also run on worker threads: driver init (Kvaser/Ixxat
@@ -138,17 +150,55 @@ with both installed.
   responsive instead of freezing while it happens
 - **ID filter** above the table: show only listed IDs (`123, 18FEF100`) or
   hide noisy ones (`!0CF00400`) - view only, recording captures everything
+- **Protocol decoding** (the combo next to the view mode) names well-known
+  frames in the Decode column. Raw CAN carries no meaning - an ID is just 11
+  or 29 bits - so the protocol is **chosen, not sniffed**: `0x7E8` is "OBD-II
+  response from ECU 1" under one protocol and "CANopen heartbeat, node 104"
+  under another, and a confidently wrong label is worse than none. Switching
+  protocol re-labels the rows already captured in place, so you can re-read a
+  trace under a different reading without losing it.
+
+| Mode | What it labels |
+|------|----------------|
+| `Off` | Nothing (also the cheapest on a saturated bus) |
+| `J1939` | 29-bit only: PGN name, source address, destination (PDU1), priority. Requests name the PGN they ask for; TP.CM/TP.DT show the control byte and sequence number. NMEA 2000 shares the framing and falls through to the numeric PGN |
+| `CANopen` | 11-bit only: **Heartbeat** (`0x700`+node, with the NMT state decoded), node guarding, NMT, SYNC, TIME, EMCY with error code, TPDO/RPDO 1-4, SDO with object index:sub-index, LSS |
+| `OBD-II` | ISO-TP addressing (`7DF`, `7E0-7EF`, and 29-bit `18DA`/`18DB`), the PCI nibble (SF/FF/CF/FC), and the OBD mode or UDS service, including negative-response codes |
+| `Auto` | Only the rules that cannot collide: OBD-II ID ranges first, then J1939 for 29-bit and CANopen for 11-bit. The default |
+
+  **On heartbeats**: there is no heartbeat in raw CAN - the concept comes
+  from the higher-layer protocol. CANopen (CiA 301) standardises one and
+  AxxTerm decodes it fully (`701 / DLC 1 / 05` → `Heartbeat node 1:
+  Operational`). J1939 has no heartbeat; it uses cyclic PGNs and Address
+  Claim instead.
 - **Bus load % and error-frame count** in the status bar (estimated from
-  frame sizes vs. bitrate, the same approach PCAN-View uses)
+  frame sizes vs. bitrate, the same approach PCAN-View uses). Error frames
+  also show up in the table with `ERR` in the Type column and are written to
+  both logs
+- **Controller state** in the status bar: `ACTIVE` / `WARNING` / `PASSIVE` /
+  `BUS-OFF` with the TX and RX error counters, read straight from Kvaser's
+  `canReadStatus` once a second (python-can does not implement `bus.state`
+  for Kvaser). Anything worse than ACTIVE is coloured and also announced
+  once in the status line - bus-off means the controller has stopped taking
+  part in traffic entirely, which counting error frames alone would not tell
+  you. **Kvaser only**; Ixxat and Virtual show nothing. AxxTerm reports the
+  state, it does not attempt bus-off recovery
 - Send frames from the send row: ID (hex) + data bytes (hex, max 8) +
   extended-ID checkbox; Enter or Send transmits. Sends wait for transmit
   confirmation (300 ms timeout), so a frame shown as TX actually left the
   controller - wrong bitrate / missing ACK shows an error instead
 - **Cyclic transmit**: the Repeat checkbox works in CAN mode for keep-alive
   frames (per-frame or per-macro)
-- **Macro buttons send CAN frames in CAN mode**: right-click a macro to give
-  it a CAN ID and standard/extended flag; its hex payload becomes the frame
-  data. In serial mode the same macro still sends its raw bytes.
+- **No padding, ever**: the DLC is however many data bytes you type. `FF` is
+  a 1-byte frame (DLC 1), *not* `FF 00 00 00 00 00 00 00`. For a full 8-byte
+  frame, type all eight bytes, set DLC to 8, or press Pad 00 / Pad FF in the
+  macro editor (J1939 expects 8 bytes with unused ones set to FF)
+- **Macro buttons send CAN frames in CAN mode**: right-click a macro to open
+  the frame editor. It shows the complete frame the button will put on the
+  wire - ID, STD/EXT, DLC, the eight D0..D7 byte cells (greyed past the DLC)
+  and a PGN readout - and every part of it is editable. The byte cells, the
+  DLC spinner and the hex/ASCII/decimal/binary fields are all views of the
+  same payload bytes. The CAN macro set is separate from the serial one.
 - The Record button (Ctrl+R) logs CAN traffic to the same timestamped log
   file format as serial data (stamped with the frame's hardware timestamp), e.g.
   `[2026-07-17 14:03:12.481] RX: CAN 18FEF100 EXT PGN 0FEF1 DLC 8 DATA 01 02 03 04 05 06 07 08`
@@ -247,7 +297,9 @@ They cover the binary/frame/ASCII decoders (including chunk boundaries and
 resync), the hex formatter, the math-expression sandbox, per-channel
 scale/offset, the time-axis sample-rate measurement, a settings round-trip,
 and the CAN mode (J1939 PGN extraction, frame/log formatting, both table view
-modes, macro round-trip, and an end-to-end send/receive over a virtual bus).
+modes, the fixed-mode row flash and its fade, the per-mode macro sets, the
+CAN frame editor, the J1939/CANopen/OBD-II decoders including truncated
+frames, and an end-to-end send/receive over a virtual bus).
 They also pin the responsiveness behavior: heavy modules must import lazily,
 and CAN bus open/close must not block the GUI thread (including the
 cancel-while-opening and reopen-while-cancelling races). Newer tests cover
@@ -265,7 +317,7 @@ baud, display timestamps, freeze, repeat send, CAN ID filter, .asc logging).
   "auto_reconnect": true,
   "show_timestamps": false,
   "ui_mode": "Serial",
-  "can": { "interface": "Kvaser", "channel": 0, "bitrate": "500 kbit/s", "view_mode": "Scrolling" },
+  "can": { "interface": "Kvaser", "channel": 0, "bitrate": "500 kbit/s", "view_mode": "Scrolling", "flash": true, "decode": "Auto" },
   "window": { "geometry": "<hex>", "splitter": [300, 400] },
   "plot": {
     "mode": "ASCII",
@@ -295,7 +347,10 @@ baud, display timestamps, freeze, repeat send, CAN ID filter, .asc logging).
     "flow_control": 0
   },
   "macros": [
-    { "label": "0x7F", "hex": "7F", "can_id": "18FEF100", "can_ext": true }
+    { "label": "0x7F", "hex": "7F", "can_id": "", "can_ext": false }
+  ],
+  "macros_can": [
+    { "label": "Req EEC1", "hex": "04F000", "can_id": "18EAFFFE", "can_ext": true }
   ]
 }
 ```
