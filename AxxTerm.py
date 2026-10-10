@@ -3,6 +3,7 @@ import sys
 import ast
 import html
 import math
+import re
 import struct
 import os
 import json
@@ -44,6 +45,28 @@ def _ensure_pg():
     return pg
 
 
+def _ensure_cantools():
+    """Import cantools on first use (DBC load). Raises ImportError if it is
+    not installed - DBC decoding is an optional feature, not a dependency."""
+    import cantools
+    return cantools
+
+
+def load_dbc_index(path):
+    """Load a DBC file into {(frame_id, extended): cantools message}.
+
+    The dict makes the per-frame lookup on the display path O(1) and silent
+    for unknown IDs - cantools' own get_message_by_frame_id raises instead,
+    and on a live bus "not in the database" is most frames.
+    """
+    cantools = _ensure_cantools()
+    db = cantools.database.load_file(path, database_format='dbc')
+    index = {}
+    for m in db.messages:
+        index[(m.frame_id, bool(m.is_extended_frame))] = m
+    return index
+
+
 def _create_can_bus(interface, channel, bitrate):
     """Open a python-can bus. Runs on a worker thread: bus creation loads
     driver DLLs and talks to hardware, which can block for seconds."""
@@ -54,6 +77,14 @@ def _create_can_bus(interface, channel, bitrate):
         # would "succeed" on a virtual channel and silently monitor nothing.
         # The app has its own explicit Virtual interface for that use case.
         kwargs['accept_virtual'] = False
+    elif interface == 'pcan':
+        # PCANBasic names USB channels 1-based; the toolbar combo is 0-based
+        # like every other backend here.
+        channel = f'PCAN_USBBUS{channel + 1}'
+    elif interface == 'vector':
+        # app_name=None selects by global channel index, so the device works
+        # without an application entry in Vector Hardware Config.
+        kwargs['app_name'] = None
     return _ensure_pycan().Bus(interface=interface, channel=channel,
                                bitrate=bitrate, **kwargs)
 
@@ -104,10 +135,14 @@ NUMPY_DTYPES = {
 
 # --- CAN mode constants ---
 
-# Display name -> python-can interface (backend) name
+# Display name -> python-can interface (backend) name. Only vendor driver
+# stacks that keep up with a loaded bus belong here (plus Virtual for
+# testing) - a backend that drops frames would poison every capture.
 CAN_INTERFACES = {
     'Kvaser': 'kvaser',
     'Ixxat': 'ixxat',
+    'PCAN': 'pcan',
+    'Vector': 'vector',
     'Virtual': 'virtual',
 }
 CAN_BITRATES = ['10', '20', '50', '100', '125', '250', '500', '800', '1000']  # kbit/s
@@ -168,6 +203,12 @@ canSTAT_ERROR_PASSIVE = 0x00000001
 canSTAT_BUS_OFF = 0x00000002
 canSTAT_ERROR_WARNING = 0x00000004
 canSTAT_ERROR_ACTIVE = 0x00000008
+# Receive-buffer overruns: HW = the controller itself lost frames, SW = the
+# driver queue overflowed because the application read too slowly. Either way
+# frames are gone - the one failure this app promises to never leave silent.
+canSTAT_HW_OVERRUN = 0x00000200
+canSTAT_SW_OVERRUN = 0x00000400
+canSTAT_OVERRUN = canSTAT_HW_OVERRUN | canSTAT_SW_OVERRUN
 
 _canlib_dll = None  # ctypes handle, or False once a load attempt has failed
 
@@ -198,7 +239,7 @@ def _get_canlib():
 
 
 def kvaser_bus_state(bus):
-    """Controller state of an open Kvaser bus as (state, tx_err, rx_err).
+    """Controller state of an open Kvaser bus as (state, tx_err, rx_err, overrun).
 
     Returns None for any other backend (python-can's virtual/Ixxat buses have
     no canlib handle), when canlib cannot be loaded, or when the driver call
@@ -224,7 +265,28 @@ def kvaser_bus_state(bus):
                                  ctypes.byref(ov))
     except Exception:
         return None
-    return can_state_name(flags.value), tx.value, rx.value
+    return (can_state_name(flags.value), tx.value, rx.value,
+            bool(flags.value & canSTAT_OVERRUN))
+
+
+def generic_bus_state(bus):
+    """Controller state via python-can's BusABC.state for backends that
+    implement it (PCAN, Vector). Same shape as kvaser_bus_state but without
+    error counters or overrun flags, which the generic API does not expose.
+    Returns None when the backend raises or reports nothing."""
+    if pycan is None:
+        return None
+    try:
+        state = bus.state
+    except Exception:
+        return None
+    names = {pycan.BusState.ACTIVE: 'ACTIVE',
+             pycan.BusState.PASSIVE: 'PASSIVE',
+             pycan.BusState.ERROR: 'ERROR'}
+    name = names.get(state)
+    if name is None:
+        return None
+    return name, None, None, False
 
 
 def can_state_name(flags):
@@ -243,6 +305,7 @@ def can_state_name(flags):
 CAN_STATE_COLORS = {
     'BUS-OFF': '#c0453d',
     'PASSIVE': '#c0453d',
+    'ERROR': '#c0453d',     # generic BusState.ERROR (PCAN/Vector backends)
     'WARNING': '#d08b1e',
     'ACTIVE': '',
 }
@@ -1194,6 +1257,12 @@ class CanFrameModel(QtCore.QAbstractTableModel):
     TX_COLOR = QtGui.QColor('#2a82da')  # readable on light and dark themes
 
     FLASH_MS = 700.0        # fade-out duration of the "row just updated" tint
+    # Per-byte change tint in the Data column (fixed mode): which bytes of a
+    # refreshed frame actually changed, and in which direction. Fades slower
+    # than the activity blip - it answers "what moved in the last couple of
+    # seconds", the question that matters when reverse-engineering a bus.
+    BYTE_FLASH_MS = 2000.0
+    _DATA_COLUMN = 8        # Data [hex]: painted per-byte by CanByteDelegate
     _FLASH_COLUMN = 0       # Time [s]: the only cell that lights up
     _FLASH_STEPS = 12       # alpha is quantised to this many levels and cached
     # Base tints (alpha is applied per step). RX reads as the accent blue, TX
@@ -1221,12 +1290,18 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         self._flash_active = False
         self._dark_mode = False
         self._flash_cache = {}   # {(is_tx, step): QColor} -- no QColor per cell
+        # Per-byte change marks (fixed mode): parallel list, each entry None
+        # (byte never changed) or a list of 8 slots of None | (stamp, sign)
+        # with sign +1 increment / -1 decrement / 0 appeared or disappeared.
+        self._byte_marks = []
+        self._byte_live_until = 0.0  # monotonic ms when the last byte mark expires
         # Higher-layer decode. _row_src keeps the few numbers each decoder
         # needs, so switching protocol re-labels the existing trace in place
         # instead of throwing the capture away.
         self.decode_mode = 'Off'
         self._decoder = None
         self._row_src = []       # parallel: (can_id, ext, data, rtr)
+        self._dbc_index = None   # {(frame_id, ext): cantools message} or None
 
     # --- Qt model interface ---
 
@@ -1291,6 +1366,31 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         """True while at least one row is still lit (drives the fade timer)."""
         return self._flash_active
 
+    @property
+    def flash_clock(self):
+        """The repaint pass's cached monotonic clock (ms), for the delegate."""
+        return self._flash_now
+
+    def byte_marks(self, row):
+        """Per-byte change marks for one row, or None (for CanByteDelegate)."""
+        return self._byte_marks[row]
+
+    @staticmethod
+    def _mark_bytes(old, new, now, marks):
+        """Stamp the bytes that differ between two payloads of the same ID.
+        Sign: +1 the byte's value grew, -1 it shrank, 0 it appeared or
+        disappeared (DLC change)."""
+        n = min(8, max(len(old), len(new)))
+        for i in range(n):
+            ob = old[i] if i < len(old) else None
+            nb = new[i] if i < len(new) else None
+            if ob != nb:
+                if ob is None or nb is None:
+                    sign = 0
+                else:
+                    sign = 1 if nb > ob else -1
+                marks[i] = (now, sign)
+
     def set_dark_mode(self, dark):
         """Theme switch: the tint needs more lift on a dark base."""
         dark = bool(dark)
@@ -1299,11 +1399,13 @@ class CanFrameModel(QtCore.QAbstractTableModel):
             self._flash_cache.clear()
 
     def set_flash_enabled(self, enabled):
-        """Turn the row-update tint on/off (view preference)."""
+        """Turn the row-update and byte-change tints on/off (view preference)."""
         self.flash_enabled = bool(enabled)
         if not self.flash_enabled and self._flash_active:
             self._flash_active = False
             self._row_flash = [0.0] * len(self.rows)
+            self._byte_marks = [None] * len(self.rows)
+            self._byte_live_until = 0.0
             self._repaint_all()
 
     def refresh_flash(self):
@@ -1316,7 +1418,8 @@ class CanFrameModel(QtCore.QAbstractTableModel):
             return False
         self._flash_now = time.monotonic() * 1000.0
         cutoff = self._flash_now - self.FLASH_MS
-        still_lit = any(st > cutoff for st in self._row_flash)
+        still_lit = (any(st > cutoff for st in self._row_flash)
+                     or self._flash_now < self._byte_live_until)
         if not still_lit:
             self._flash_active = False
             self._repaint_all()  # final repaint clears the last faint tint
@@ -1341,12 +1444,39 @@ class CanFrameModel(QtCore.QAbstractTableModel):
             # index into data that a real bus can truncate in any way.
             return ''
 
+    def set_dbc_index(self, index):
+        """Attach a loaded DBC index; re-label the trace if DBC mode is active."""
+        self._dbc_index = index
+        if self.decode_mode == 'DBC':
+            self.decode_mode = None  # force the relabel pass below
+            self.set_decode_mode('DBC')
+
+    def _decode_dbc(self, can_id, ext, data, rtr):
+        """Signal values from the loaded DBC, or '' for IDs it doesn't know."""
+        index = self._dbc_index
+        if not index:
+            return ''
+        msg = index.get((can_id, ext))
+        if msg is None:
+            return ''
+        try:
+            sigs = msg.decode(data, decode_choices=True, allow_truncated=True)
+        except Exception:
+            return msg.name  # unpackable payload: the name still helps
+        parts = []
+        for k, v in sigs.items():
+            if isinstance(v, float):
+                v = f'{v:.6g}'
+            parts.append(f'{k}={v}')
+        return f'{msg.name}: ' + ' '.join(parts)
+
     def set_decode_mode(self, mode):
         """Switch protocol and re-label every row already in the table."""
         if mode == self.decode_mode:
             return
         self.decode_mode = mode
-        self._decoder = CAN_DECODERS.get(mode)
+        self._decoder = (self._decode_dbc if mode == 'DBC'
+                         else CAN_DECODERS.get(mode))
         col = self._DECODE_COLUMN
         for i, src in enumerate(self._row_src):
             row = self.rows[i]
@@ -1421,6 +1551,7 @@ class CanFrameModel(QtCore.QAbstractTableModel):
             # of them says nothing. The stamp is still kept parallel so a
             # mid-session mode switch finds consistent lists.
             self._row_flash.append(0.0)
+            self._byte_marks.append(None)
         self.endInsertRows()
         excess = len(self.rows) - CAN_MAX_SCROLL_ROWS
         if excess > 0:
@@ -1428,6 +1559,7 @@ class CanFrameModel(QtCore.QAbstractTableModel):
             del self.rows[:excess]
             del self._row_is_tx[:excess]
             del self._row_flash[:excess]
+            del self._byte_marks[:excess]
             del self._row_src[:excess]
             self.endRemoveRows()
 
@@ -1438,11 +1570,21 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         # One clock read per batch: every frame in it arrived within the same
         # flush tick, so they are lit (and fade) together.
         now = time.monotonic() * 1000.0 if self.flash_enabled else 0.0
+        marked = False
         for direction, msg in batch:
             key, row, is_tx, src = self._make_row(direction, msg)
             r = self._fixed_index.get(key)
             if r is not None:
                 if r < len(self.rows):
+                    if now:
+                        old_data = self._row_src[r][2]
+                        if old_data != src[2]:
+                            marks = self._byte_marks[r]
+                            if marks is None:
+                                marks = [None] * 8
+                                self._byte_marks[r] = marks
+                            self._mark_bytes(old_data, src[2], now, marks)
+                            marked = True
                     self.rows[r] = row
                     self._row_src[r] = src
                     self._row_flash[r] = now
@@ -1450,20 +1592,28 @@ class CanFrameModel(QtCore.QAbstractTableModel):
                     changed_max = r if changed_max is None else max(changed_max, r)
                 else:
                     # Row is still in this batch's pending block
-                    pending[r - len(self.rows)] = (row, is_tx, src)
+                    p = r - len(self.rows)
+                    prev_row, prev_tx, prev_src, marks = pending[p]
+                    if now and prev_src[2] != src[2]:
+                        if marks is None:
+                            marks = [None] * 8
+                        self._mark_bytes(prev_src[2], src[2], now, marks)
+                        marked = True
+                    pending[p] = (row, is_tx, src, marks)
             else:
                 if len(self.rows) + len(pending) >= CAN_MAX_SCROLL_ROWS:
                     continue  # fixed view full (ID churn/fuzz): drop new IDs
                 self._fixed_index[key] = len(self.rows) + len(pending)
-                pending.append((row, is_tx, src))
+                pending.append((row, is_tx, src, None))
         if pending:
             start = len(self.rows)
             self.beginInsertRows(QtCore.QModelIndex(), start, start + len(pending) - 1)
-            for row, is_tx, src in pending:
+            for row, is_tx, src, marks in pending:
                 self.rows.append(row)
                 self._row_is_tx.append(is_tx)
                 self._row_src.append(src)
                 self._row_flash.append(now)
+                self._byte_marks.append(marks)
             self.endInsertRows()
         if changed_min is not None:
             self.dataChanged.emit(
@@ -1472,6 +1622,8 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         if now and (pending or changed_min is not None):
             self._flash_now = now
             self._flash_active = True
+            if marked:
+                self._byte_live_until = now + self.BYTE_FLASH_MS
 
     # --- control ---
 
@@ -1492,6 +1644,8 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         self.rows = []
         self._row_is_tx = []
         self._row_flash = []
+        self._byte_marks = []
+        self._byte_live_until = 0.0
         self._row_src = []
         self._flash_active = False
         self._fixed_index = {}
@@ -1502,6 +1656,8 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         self.rows = []
         self._row_is_tx = []
         self._row_flash = []
+        self._byte_marks = []
+        self._byte_live_until = 0.0
         self._row_src = []
         self._flash_active = False
         self._fixed_index = {}
@@ -1509,6 +1665,89 @@ class CanFrameModel(QtCore.QAbstractTableModel):
         self._counts = {}
         self._t0 = None
         self.endResetModel()
+
+
+class CanByteDelegate(QtWidgets.QStyledItemDelegate):
+    """Paints the Data [hex] column with per-byte change tints (the view
+    SavvyCAN's sniffer made standard for bus reverse-engineering): green
+    behind a byte whose value just increased, red behind a decrease, the
+    accent blue behind one that appeared/disappeared with a DLC change.
+
+    The tint fades over CanFrameModel.BYTE_FLASH_MS and uses the same
+    quantised, cached QColors as the Time-cell flash, so a saturated bus
+    repaints without allocating. When nothing is lit (or the row is selected,
+    or the view is scrolling), painting falls through to the default path.
+    """
+
+    _SIGN_RGB = {1: (58, 150, 72), -1: (192, 69, 61), 0: (53, 116, 179)}
+    _PEAK_ALPHA = 150
+    _STEPS = 12
+
+    def __init__(self, model, parent=None):
+        super().__init__(parent)
+        self._model = model
+        self._tint_cache = {}  # {(sign, step): QColor}
+
+    def _tint(self, sign, step):
+        key = (sign, step)
+        color = self._tint_cache.get(key)
+        if color is None:
+            color = QtGui.QColor(*self._SIGN_RGB[sign])
+            color.setAlpha(int(self._PEAK_ALPHA * step / self._STEPS))
+            self._tint_cache[key] = color
+        return color
+
+    def paint(self, painter, option, index):
+        model = self._model
+        marks = None
+        if (model.fixed_mode and model.flash_active
+                and not (option.state & QtWidgets.QStyle.State_Selected)):
+            marks = model.byte_marks(index.row())
+        if not marks:
+            super().paint(painter, option, index)
+            return
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = opt.widget
+        style = widget.style() if widget else QtWidgets.QApplication.style()
+        text = opt.text
+        opt.text = ''
+        # Standard background first (alternating rows), then the byte tints,
+        # then the text - drawn with the same margin the default path uses so
+        # the column does not shift when the fade ends.
+        style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, opt, painter, widget)
+        fm = opt.fontMetrics
+        byte_w = fm.horizontalAdvance('XX')
+        sp_w = fm.horizontalAdvance(' ')
+        margin = style.pixelMetric(
+            QtWidgets.QStyle.PM_FocusFrameHMargin, opt, widget) + 1
+        rect = opt.rect
+        now = model.flash_clock
+        span = model.BYTE_FLASH_MS
+        x = rect.x() + margin
+        for mark in marks:
+            if mark is not None:
+                stamp, sign = mark
+                age = now - stamp
+                if 0 <= age < span:
+                    step = int((1.0 - age / span) * self._STEPS)
+                    if step > 0:
+                        painter.fillRect(x - 1, rect.y() + 1, byte_w + 2,
+                                         rect.height() - 2,
+                                         self._tint(sign, step))
+            x += byte_w + sp_w
+        fg = index.data(QtCore.Qt.ForegroundRole)
+        painter.save()
+        painter.setFont(opt.font)
+        if isinstance(fg, QtGui.QBrush):
+            painter.setPen(QtGui.QPen(fg.color()))
+        elif isinstance(fg, QtGui.QColor):
+            painter.setPen(QtGui.QPen(fg))
+        else:
+            painter.setPen(QtGui.QPen(opt.palette.color(QtGui.QPalette.Text)))
+        painter.drawText(rect.adjusted(margin, 0, -margin, 0),
+                         QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, text)
+        painter.restore()
 
 
 class CanView(QtWidgets.QWidget):
@@ -1543,8 +1782,22 @@ class CanView(QtWidgets.QWidget):
             'CANopen: heartbeat/NMT/SYNC/EMCY/PDO/SDO (11-bit)\n'
             'OBD-II: ISO-TP addressing, PCI and UDS service\n'
             'Auto: OBD-II ID ranges first, then J1939 for 29-bit and\n'
-            'CANopen for 11-bit. Pick a protocol if Auto mislabels your bus.')
+            'CANopen for 11-bit. Pick a protocol if Auto mislabels your bus.\n'
+            'DBC: signal names and values from a loaded DBC file.')
         self.decode_combo.currentTextChanged.connect(self._on_decode_changed)
+
+        # DBC file: the decode that matters most in practice - names and
+        # scaled signal values for your own bus instead of generic protocol
+        # labels. cantools is imported on first load, not at startup.
+        self.dbc_button = QtWidgets.QPushButton('DBC...')
+        self.dbc_button.setFont(view_font)
+        self.dbc_button.setFixedHeight(30)
+        self.dbc_button.setToolTip(
+            'Load a DBC file: the Decode column then shows message names\n'
+            'and decoded signal values (requires the cantools package).')
+        self.dbc_button.clicked.connect(self._on_dbc_clicked)
+        self.dbc_path = ''       # loaded DBC file (persisted in settings)
+        self.pending_dbc = None  # (path, activate) deferred until CAN mode
 
         # Highlight rows as they refresh. In fixed mode the only visible sign
         # that a frame arrived is text changing in place, which is easy to
@@ -1555,7 +1808,9 @@ class CanView(QtWidgets.QWidget):
         self.flash_check.setFixedHeight(30)
         self.flash_check.setToolTip(
             'Fixed mode: light up the Time cell when a frame with that ID\n'
-            'arrives, then fade it out. Shows at a glance which IDs are live.')
+            'arrives, then fade it out - shows at a glance which IDs are live.\n'
+            'Data bytes that changed are tinted individually:\n'
+            'green = value increased, red = decreased, blue = DLC changed.')
         self.flash_check.toggled.connect(self._on_flash_toggled)
         # Only meaningful in fixed mode; the view starts in scrolling mode.
         self.flash_check.setEnabled(False)
@@ -1596,6 +1851,7 @@ class CanView(QtWidgets.QWidget):
         controls.addWidget(label)
         controls.addWidget(self.view_mode_combo)
         controls.addWidget(self.decode_combo)
+        controls.addWidget(self.dbc_button)
         controls.addWidget(self.flash_check)
         controls.addWidget(self.filter_edit, stretch=1)
         controls.addWidget(self.clear_button)
@@ -1616,6 +1872,9 @@ class CanView(QtWidgets.QWidget):
         hh.setHighlightSections(False)
         for col, width in enumerate([90, 90, 60, 44, 70, 90, 60, 52, 240, 260]):
             self.table.setColumnWidth(col, width)
+        self._byte_delegate = CanByteDelegate(self.model, self.table)
+        self.table.setItemDelegateForColumn(
+            CanFrameModel._DATA_COLUMN, self._byte_delegate)
 
         # Connection indicator, same DB-9 icon as the serial view
         self.indicator = QtWidgets.QLabel(self)
@@ -1653,6 +1912,53 @@ class CanView(QtWidgets.QWidget):
         monitor = self.window()
         if hasattr(monitor, 'schedule_save'):
             monitor.schedule_save()
+
+    def _status(self, text):
+        monitor = self.window()
+        if hasattr(monitor, 'statusText'):
+            monitor.statusText.setText(text)
+
+    def _on_dbc_clicked(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, 'Load DBC', '', 'DBC Files (*.dbc);;All Files (*)')
+        if path:
+            self.load_dbc(path)
+
+    def load_dbc(self, path, activate=True):
+        """Load a DBC into the model; optionally switch Decode to it.
+        Returns True on success (failures land in the status bar)."""
+        try:
+            index = load_dbc_index(path)
+        except ImportError:
+            self._status('cantools is not installed - run: pip install cantools')
+            return False
+        except Exception as e:
+            self._status(f'DBC load failed: {e}')
+            return False
+        self.dbc_path = path
+        self.model.set_dbc_index(index)
+        if self.decode_combo.findText('DBC') < 0:
+            self.decode_combo.addItem('DBC')
+        if activate:
+            self.decode_combo.setCurrentText('DBC')
+        self.dbc_button.setToolTip(
+            f'{os.path.basename(path)}: {len(index)} messages loaded.\n'
+            'Click to load a different DBC file.')
+        self._status(f'DBC loaded: {os.path.basename(path)} '
+                     f'({len(index)} messages)')
+        monitor = self.window()
+        if hasattr(monitor, 'schedule_save'):
+            monitor.schedule_save()
+        return True
+
+    def apply_pending_dbc(self):
+        """Load the DBC remembered from settings, deferred until CAN mode is
+        actually used so startup never pays the cantools import."""
+        if not self.pending_dbc:
+            return
+        path, activate = self.pending_dbc
+        self.pending_dbc = None
+        self.load_dbc(path, activate=activate)
 
     def _on_flash_toggled(self, checked):
         self.model.set_flash_enabled(checked)
@@ -1744,6 +2050,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._can_bits = 0            # wire bits this second (bus-load estimate)
         self._can_err_total = 0       # error frames seen this session
         self._can_state = ''          # last controller state (Kvaser only)
+        self._can_overrun = False     # latched: driver RX buffer overflowed
 
         self.setWindowTitle('AxxTerm')
         self.setWindowIcon(QIcon(create_connector_pixmap(CONNECTED_COLOR)))
@@ -1835,6 +2142,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._recording = False
         self._rx_log_pending = ''  # partial RX line awaiting its newline
         self._asc_writer = None    # Vector .asc CAN log (interoperable format)
+        self._canlog_writer = None  # candump .log CAN log (can-utils format)
 
         ### Window state restore ###
         self._geometry_restored = False
@@ -1977,6 +2285,8 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self.serialDataView.setVisible(not is_can)
         self.canView.setVisible(is_can)
         self.serialSendView.set_can_mode(is_can)
+        if is_can:
+            self.canView.apply_pending_dbc()
         self.schedule_save()
 
     def _open_can_bus(self):
@@ -2043,6 +2353,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
         self._can_bits = 0
         self._can_err_total = 0
         self._can_state = ''  # controller state is per session, like the counters
+        self._can_overrun = False  # latched RX-overrun indicator, per session
         self.canView.model.reset_timing()  # Δt/Count restart per session
         self._can_reader = CanReaderThread(bus, self._can_rx_queue, self)
         self._can_reader.errorOccurred.connect(self._on_can_error)
@@ -2170,7 +2481,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
             if self._recording and self._log_file is not None:
                 self._log_data(direction, format_can_log_line(msg),
                                when=getattr(msg, 'timestamp', None))
-            if self._asc_writer is not None:
+            if self._asc_writer is not None or self._canlog_writer is not None:
                 self._write_asc(direction, msg)
         self.canView.ingest(batch)
 
@@ -2351,31 +2662,49 @@ class SerialMonitor(QtWidgets.QMainWindow):
                     f'RX: {can_rx} msg/s  TX: {can_tx} msg/s  |  '
                     f'RX total: {self._can_rx_total}  TX total: {self._can_tx_total}  |  '
                     f'{bitrate // 1000} kbit/s')
-            # Controller state (Kvaser only; None on other backends). BUS-OFF
-            # means the controller has dropped off the bus entirely - it has
-            # to be impossible to miss, so it is coloured and carries the
-            # error counters that explain it.
-            state = kvaser_bus_state(self._can_bus)
+            # Controller state: Kvaser via direct canlib (full detail incl.
+            # error counters and overrun flags), PCAN/Vector via python-can's
+            # generic BusABC.state. BUS-OFF means the controller has dropped
+            # off the bus entirely - it has to be impossible to miss, so it is
+            # coloured and carries the error counters that explain it.
+            state = kvaser_bus_state(self._can_bus) \
+                or generic_bus_state(self._can_bus)
+            overrun = False
             if state is not None:
-                name, tx_err, rx_err = state
+                name, tx_err, rx_err, overrun = state
                 if name != self._can_state and name != 'ACTIVE':
                     # Degrading is an event, not just a readout: say it once
                     # in the status line so a glance away does not miss it.
+                    counters_msg = (f' (TX errors {tx_err}, RX errors {rx_err})'
+                                    if tx_err is not None else '')
                     self.statusText.setText(
-                        f'CAN controller {name} (TX errors {tx_err}, '
-                        f'RX errors {rx_err})' +
+                        f'CAN controller {name}{counters_msg}' +
                         (' - not transmitting or receiving'
                          if name == 'BUS-OFF' else ''))
                 self._can_state = name
                 color = CAN_STATE_COLORS.get(name, '')
                 counters = (f' (TEC {tx_err} REC {rx_err})'
-                            if name != 'ACTIVE' else '')
+                            if name != 'ACTIVE' and tx_err is not None else '')
                 if color:
                     text = (html.escape(text) +
                             f'  |  <b><span style="color:{color}">'
                             f'{name}</span></b>{counters}')
                 else:
                     text += f'  |  {name}'
+            # Receive overrun = frames were lost before this app ever saw
+            # them. Latched for the session: a loss that scrolled past three
+            # minutes ago still invalidates the capture, so the flag must not
+            # quietly disappear when the flood pauses.
+            if overrun and not self._can_overrun:
+                self._can_overrun = True
+                self.statusText.setText(
+                    'CAN RX OVERRUN - the driver receive buffer overflowed, '
+                    'frames were LOST')
+            if self._can_overrun:
+                if '<span' not in text:
+                    text = html.escape(text)
+                text += ('  |  <b><span style="color:#c0453d">OVERRUN - '
+                         'frames lost</span></b>')
             self.statsLabel.setText(text)
         elif self.port.isOpen():
             baud = self.toolBar.baudRate()
@@ -2561,17 +2890,25 @@ class SerialMonitor(QtWidgets.QMainWindow):
             self.statusText.setText('Recording stopped: log file write failed')
 
     def _write_asc(self, direction, msg):
-        """Mirror one CAN frame into the .asc log (standard Vector format
-        readable by CANalyzer/SavvyCAN/asammdf, unlike the .txt log)."""
+        """Mirror one CAN frame into the machine-readable logs: .asc (Vector
+        format, for CANalyzer/SavvyCAN/asammdf) and .log (candump format, for
+        can-utils/SavvyCAN/python-can replay)."""
         try:
+            msg.is_rx = (direction != 'TX')  # .asc direction column
+        except AttributeError:
+            pass  # python-can < 4.0 Message has no is_rx; log without it
+        if self._asc_writer is not None:
             try:
-                msg.is_rx = (direction != 'TX')  # .asc direction column
-            except AttributeError:
-                pass  # python-can < 4.0 Message has no is_rx; log without it
-            self._asc_writer(msg)
-        except Exception:
-            self._stop_asc_writer()
-            self.statusText.setText('.asc log write failed - .asc recording stopped')
+                self._asc_writer(msg)
+            except Exception:
+                self._stop_asc_writer()
+                self.statusText.setText('.asc log write failed - .asc recording stopped')
+        if self._canlog_writer is not None:
+            try:
+                self._canlog_writer(msg)
+            except Exception:
+                self._stop_canlog_writer()
+                self.statusText.setText('.log write failed - candump recording stopped')
 
     def _stop_asc_writer(self):
         if self._asc_writer is not None:
@@ -2581,6 +2918,14 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 pass
             self._asc_writer = None
 
+    def _stop_canlog_writer(self):
+        if self._canlog_writer is not None:
+            try:
+                self._canlog_writer.stop()
+            except Exception:
+                pass
+            self._canlog_writer = None
+
     def _toggle_recording(self):
         """Start or stop recording serial data to a log file."""
         if self._recording:
@@ -2588,6 +2933,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
             # first so nothing buffered in the last display tick is lost
             self._flush_can_queue()
             self._stop_asc_writer()
+            self._stop_canlog_writer()
             if self._rx_log_pending:
                 pending, self._rx_log_pending = self._rx_log_pending, ''
                 self._log_data('RX', pending)
@@ -2614,16 +2960,26 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 self.statusText.setText(f'Cannot create log file: {e}')
                 self._record_btn.setChecked(False)
                 return
-            # In CAN mode, additionally record a Vector .asc file: the .txt
-            # log is human-readable but a dead end for tooling, while .asc
-            # loads into CANalyzer/SavvyCAN/asammdf for real analysis.
+            # In CAN mode, additionally record machine-readable formats: the
+            # .txt log is human-readable but a dead end for tooling, while
+            # .asc loads into CANalyzer/SavvyCAN/asammdf and candump .log into
+            # can-utils/SavvyCAN/python-can for replay and real analysis.
             extra = ''
             if self._ui_mode == 'CAN' and pycan is not None:
+                formats = []
                 try:
                     self._asc_writer = pycan.ASCWriter(filepath[:-4] + '.asc')
-                    extra = ' (+.asc)'
+                    formats.append('.asc')
                 except Exception:
                     self._asc_writer = None
+                try:
+                    self._canlog_writer = pycan.CanutilsLogWriter(
+                        filepath[:-4] + '.log', channel='can0')
+                    formats.append('.log')
+                except Exception:
+                    self._canlog_writer = None
+                if formats:
+                    extra = f' (+{", ".join(formats)})'
             self._recording = True
             self._record_btn.setChecked(True)
             self._record_btn.setText('Recording...')
@@ -2663,6 +3019,7 @@ class SerialMonitor(QtWidgets.QMainWindow):
         # Readers are stopped now; log whatever they queued during the last tick
         self._flush_can_queue()
         self._stop_asc_writer()
+        self._stop_canlog_writer()
         self.save_all_settings()  # also captures final window/splitter geometry
         if self._log_file is not None:
             try:
@@ -2694,6 +3051,11 @@ class SerialMonitor(QtWidgets.QMainWindow):
                 'view_mode': self.canView.view_mode_combo.currentText(),
                 'flash': self.canView.flash_check.isChecked(),
                 'decode': self.canView.decode_combo.currentText(),
+                # A DBC that was restored from settings but not loaded yet
+                # (Serial mode all session) must survive the next save too.
+                'dbc_path': self.canView.dbc_path or (
+                    self.canView.pending_dbc[0]
+                    if self.canView.pending_dbc else ''),
             },
             'window': {
                 'geometry': bytes(self.saveGeometry().toHex()).decode('ascii'),
@@ -2845,6 +3207,11 @@ class SerialMonitor(QtWidgets.QMainWindow):
             decode = can_cfg.get('decode', 'Auto')
             if decode in CAN_DECODE_MODES:
                 self.canView.decode_combo.setCurrentText(decode)
+            # DBC load is deferred until CAN mode is active (below, or on a
+            # later mode switch): startup must not pay the cantools import.
+            dbc_path = str(can_cfg.get('dbc_path', '') or '')
+            if dbc_path and os.path.isfile(dbc_path):
+                self.canView.pending_dbc = (dbc_path, decode == 'DBC')
 
         # UI mode last, so switching applies over the loaded CAN settings
         # (never while connected: the switch would close the live connection)
@@ -2989,6 +3356,16 @@ class SerialDataView(QtWidgets.QWidget):
         # line boundaries across arbitrarily-chunked reads.
         self.show_timestamps = False
         self._ts_at_line_start = True
+
+        # Highlight rules (pattern -> color per received line) and the live
+        # line filter. Both work at line granularity, so while either is
+        # active RX display runs through _append_filtered_rx, which holds the
+        # trailing partial line until its newline arrives. View-only: the log,
+        # hex view, stats and plot all see every byte regardless.
+        self.highlight_rules = []    # [{'pattern','color','regex','enabled'}]
+        self._compiled_rules = []    # [(match_fn, QColor)] for enabled rules
+        self._line_filter = None     # match_fn while the filter box has text
+        self._filter_line_buffer = ''  # partial RX line awaiting its newline
 
         # FFT view state
         self._fft_widget = None
@@ -3269,6 +3646,30 @@ class SerialDataView(QtWidgets.QWidget):
         self._math_btn.setToolTip("Configure math/computed channels")
         self._math_btn.clicked.connect(self._open_math_dialog)
         cl.addWidget(self._math_btn)
+
+        # Highlight rules + live line filter for the ASCII view
+        self.highlight_btn = QtWidgets.QPushButton('Colors')
+        self.highlight_btn.setFont(row_font)
+        self.highlight_btn.setFixedHeight(30)
+        self.highlight_btn.setToolTip(
+            'Color received lines that match patterns\n'
+            '(e.g. lines containing "error" in red).')
+        self.highlight_btn.clicked.connect(self._open_highlight_dialog)
+        cl.addWidget(self.highlight_btn)
+
+        self.line_filter_edit = QtWidgets.QLineEdit()
+        self.line_filter_edit.setFont(row_font)
+        self.line_filter_edit.setFixedHeight(30)
+        self.line_filter_edit.setFixedWidth(150)
+        self.line_filter_edit.setClearButtonEnabled(True)
+        self.line_filter_edit.setPlaceholderText('Filter lines...')
+        self.line_filter_edit.setToolTip(
+            'Show only received lines containing this text\n'
+            '(a valid regex is used as one, case-insensitive).\n'
+            'View only: logging, plotting and the hex view\n'
+            'still see everything. Lines appear when complete.')
+        self.line_filter_edit.textChanged.connect(self._on_line_filter_changed)
+        cl.addWidget(self.line_filter_edit)
 
         # Freeze display: scroll back / read / search while RX capture,
         # logging and stats keep running (buffered data renders on resume)
@@ -4706,6 +5107,7 @@ class SerialDataView(QtWidgets.QWidget):
                 'checksum': self.checksum_check.isChecked(),
             },
             'math_channels': self._math_channels,
+            'highlight_rules': self.highlight_rules,
         }
 
     def _save_settings(self, path=None):
@@ -4802,6 +5204,12 @@ class SerialDataView(QtWidgets.QWidget):
                 ]
         _try('math_channels', _restore_math)
 
+        def _restore_highlight():
+            rules = s.get('highlight_rules', [])
+            if isinstance(rules, list):
+                self.set_highlight_rules(rules)
+        _try('highlight_rules', _restore_highlight)
+
         _try('show_fft', lambda: self._fft_check.setChecked(bool(s.get('show_fft', False))))
         _try('show_plot', lambda: self.graph_mode.setChecked(bool(s.get('show_plot', False))))
 
@@ -4842,6 +5250,7 @@ class SerialDataView(QtWidgets.QWidget):
         self._frame_reader.reset()
         self._pending_cr = False
         self._ascii_line_buffer = ''
+        self._filter_line_buffer = ''
         self._pending_rows = []
         self._pending_blocks = []
         # New session: don't glue its first bytes onto the old partial hex row
@@ -5049,6 +5458,94 @@ class SerialDataView(QtWidgets.QWidget):
             out.append(seg)
         return ''.join(out)
 
+    # --- highlight rules & line filter ---
+
+    @staticmethod
+    def _make_matcher(pattern, is_regex=True):
+        """Case-insensitive line matcher. A pattern that does not compile as
+        a regex (or was saved as plain text) falls back to substring search,
+        so a half-typed '[' in the filter box never breaks the view."""
+        if is_regex:
+            try:
+                return re.compile(pattern, re.IGNORECASE).search
+            except re.error:
+                pass
+        low = pattern.lower()
+        return lambda line, _low=low: _low in line.lower()
+
+    def _on_line_filter_changed(self, text):
+        self._line_filter = self._make_matcher(text) if text else None
+        self._maybe_flush_line_buffer()
+
+    def set_highlight_rules(self, rules):
+        self.highlight_rules = [r for r in rules if isinstance(r, dict)]
+        self._rebuild_highlight_rules()
+
+    def _rebuild_highlight_rules(self):
+        compiled = []
+        for r in self.highlight_rules:
+            pattern = str(r.get('pattern', ''))
+            if not pattern or not r.get('enabled', True):
+                continue
+            matcher = self._make_matcher(pattern, bool(r.get('regex', False)))
+            compiled.append((matcher, QtGui.QColor(str(r.get('color', '#c0453d')))))
+        self._compiled_rules = compiled
+        self._maybe_flush_line_buffer()
+
+    def _maybe_flush_line_buffer(self):
+        """When the last rule/filter turns off, render the held partial line
+        immediately - otherwise the stream would look stalled mid-line."""
+        if (not self._compiled_rules and self._line_filter is None
+                and self._filter_line_buffer):
+            pending, self._filter_line_buffer = self._filter_line_buffer, ''
+            if self.show_timestamps:
+                pending = self._stamp_lines(pending)
+            self._insert_colored_text(self.serialData, pending,
+                                      QtGui.QColor(255, 0, 0))
+
+    def _append_filtered_rx(self, text):
+        """Line-granular RX rendering used while highlight rules or the line
+        filter are active. Complete lines are classified once and rendered in
+        runs of equal color (one insert per run, not per line); the trailing
+        partial line is held until its newline arrives so a rule always sees
+        - and colors - whole lines. Only the matchers the user actually
+        enabled run, so an empty rule list costs nothing on the hot path."""
+        combined = self._filter_line_buffer + text
+        lines = combined.split('\n')
+        # Cap the carry so a newline-free stream can't grow it forever
+        self._filter_line_buffer = lines[-1][-4096:]
+        complete = lines[:-1]
+        if not complete:
+            return
+        flt = self._line_filter
+        prefix = ('[' + datetime.now().strftime('%H:%M:%S.%f')[:-3] + '] '
+                  if self.show_timestamps else '')
+        default = QtGui.QColor(255, 0, 0)
+        runs = []  # (QColor, [lines]) - consecutive same-color lines batch up
+        for line in complete:
+            if flt is not None and not flt(line):
+                continue
+            color = default
+            for matcher, rule_color in self._compiled_rules:
+                if matcher(line):
+                    color = rule_color
+                    break
+            if runs and runs[-1][0] is color:
+                runs[-1][1].append(line)
+            else:
+                runs.append((color, [line]))
+        for color, batch in runs:
+            block = ''.join(f'{prefix}{l}\n' if l else '\n' for l in batch)
+            self._insert_colored_text(self.serialData, block, color)
+        self._ts_at_line_start = True
+
+    def _open_highlight_dialog(self):
+        dlg = HighlightRulesDialog(self.highlight_rules, self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self.highlight_rules = dlg.get_rules()
+            self._rebuild_highlight_rules()
+            self._save_settings()
+
     def appendSerialText(self, appendText, direction, mode="ASCII"):
         is_send = direction == "send"
         color = QtGui.QColor(0, 0, 255) if is_send else QtGui.QColor(255, 0, 0)
@@ -5086,12 +5583,17 @@ class SerialDataView(QtWidgets.QWidget):
         else:
             raw = appendText.encode('ISO-8859-1', 'replace')
 
-        if not is_send and self.show_timestamps and ascii_text:
-            ascii_text = self._stamp_lines(ascii_text)
-        elif is_send and ascii_text:
-            # A send breaks/continues the current line like received text does
-            self._ts_at_line_start = ascii_text.endswith('\n')
-        self._insert_colored_text(self.serialData, ascii_text, color)
+        if not is_send and (self._compiled_rules
+                            or self._line_filter is not None):
+            # Highlight/filter path renders at line granularity instead
+            self._append_filtered_rx(displayText)
+        else:
+            if not is_send and self.show_timestamps and ascii_text:
+                ascii_text = self._stamp_lines(ascii_text)
+            elif is_send and ascii_text:
+                # A send breaks/continues the current line like received text
+                self._ts_at_line_start = ascii_text.endswith('\n')
+            self._insert_colored_text(self.serialData, ascii_text, color)
         if raw:
             # One shared formatter for RX and TX keeps hex column tracking consistent
             self._insert_colored_text(self.serialDataHex, self._format_hex(raw), color)
@@ -5120,6 +5622,106 @@ class HLine(QFrame):
         super().__init__()
         self.setFrameShape(QFrame.HLine)
         self.setFrameShadow(QFrame.Sunken)
+
+
+class HighlightRulesDialog(QtWidgets.QDialog):
+    """Edit the highlight rules for the ASCII view: each rule is a pattern,
+    a color, and whether the pattern is a regex. First matching rule wins."""
+
+    DEFAULT_COLOR = '#c0453d'
+
+    def __init__(self, rules, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Highlight Rules')
+        self.setMinimumWidth(500)
+        layout = QtWidgets.QVBoxLayout(self)
+
+        info = QtWidgets.QLabel(
+            'Received lines matching a pattern are shown in its color '
+            '(case-insensitive). The first matching rule wins.')
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self._rows_layout = QtWidgets.QVBoxLayout()
+        layout.addLayout(self._rows_layout)
+        self._rows = []  # live row dicts; removed rows are dropped from here
+
+        for rule in rules:
+            self._add_row(str(rule.get('pattern', '')),
+                          str(rule.get('color', self.DEFAULT_COLOR)),
+                          bool(rule.get('regex', False)),
+                          bool(rule.get('enabled', True)))
+        if not rules:
+            self._add_row('error', self.DEFAULT_COLOR, False, True)
+
+        add_btn = QtWidgets.QPushButton('Add Rule')
+        add_btn.clicked.connect(lambda: self._add_row())
+        layout.addWidget(add_btn, alignment=QtCore.Qt.AlignLeft)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _add_row(self, pattern='', color=None, regex=False, enabled=True):
+        color = color or self.DEFAULT_COLOR
+        row = {'color': color}
+        h = QtWidgets.QHBoxLayout()
+
+        row['enabled'] = QtWidgets.QCheckBox()
+        row['enabled'].setChecked(enabled)
+        row['enabled'].setToolTip('Rule active')
+        h.addWidget(row['enabled'])
+
+        row['pattern'] = QtWidgets.QLineEdit(pattern)
+        row['pattern'].setPlaceholderText('Pattern (e.g. error)')
+        h.addWidget(row['pattern'], stretch=1)
+
+        row['color_btn'] = QtWidgets.QPushButton()
+        row['color_btn'].setFixedSize(44, 24)
+        row['color_btn'].setToolTip('Line color')
+        row['color_btn'].setStyleSheet(
+            f'background-color: {color}; border: 1px solid #888;')
+        row['color_btn'].clicked.connect(lambda _, r=row: self._pick_color(r))
+        h.addWidget(row['color_btn'])
+
+        row['regex'] = QtWidgets.QCheckBox('Regex')
+        row['regex'].setChecked(regex)
+        row['regex'].setToolTip('Treat the pattern as a regular expression\n'
+                                '(otherwise plain substring match)')
+        h.addWidget(row['regex'])
+
+        remove_btn = QtWidgets.QPushButton('✕')
+        remove_btn.setFixedWidth(28)
+        remove_btn.clicked.connect(lambda _, r=row: self._remove_row(r))
+        h.addWidget(remove_btn)
+
+        container = QtWidgets.QWidget()
+        container.setLayout(h)
+        h.setContentsMargins(0, 0, 0, 0)
+        row['widget'] = container
+        self._rows_layout.addWidget(container)
+        self._rows.append(row)
+
+    def _pick_color(self, row):
+        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(row['color']), self)
+        if c.isValid():
+            row['color'] = c.name()
+            row['color_btn'].setStyleSheet(
+                f'background-color: {c.name()}; border: 1px solid #888;')
+
+    def _remove_row(self, row):
+        self._rows.remove(row)
+        row['widget'].setParent(None)
+        row['widget'].deleteLater()
+
+    def get_rules(self):
+        return [{'pattern': r['pattern'].text(),
+                 'color': r['color'],
+                 'regex': r['regex'].isChecked(),
+                 'enabled': r['enabled'].isChecked()}
+                for r in self._rows if r['pattern'].text().strip()]
 
 
 class MathChannelDialog(QtWidgets.QDialog):
@@ -6142,7 +6744,12 @@ class ToolBar(QtWidgets.QToolBar):
         self.canInterfaces.setMinimumHeight(30)
         self.canInterfaces.setFont(toolbar_font)
         self.canInterfaces.setToolTip(
-            'CAN hardware backend (Kvaser CANlib / Ixxat VCI drivers must be installed)')
+            'CAN hardware backend. The vendor driver must be installed:\n'
+            'Kvaser: CANlib drivers\n'
+            'Ixxat: VCI drivers\n'
+            'PCAN: PEAK PCANBasic (channel N = PCAN_USBBUS N+1)\n'
+            'Vector: XL Driver Library (channel = global channel index)\n'
+            'Virtual: loopback for testing, no hardware needed')
 
         self.canChannels = QtWidgets.QComboBox(self)
         self.canChannels.addItems([f'Channel {i}' for i in range(8)])

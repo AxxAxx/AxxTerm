@@ -512,8 +512,12 @@ def test_can_fixed_flash_lights_and_fades():
     assert m2.data(m2.index(0, 0), QtCore.Qt.BackgroundRole) is None
 
     # The tint dims as it ages and the model reports itself idle at the end
+    # (byte-change marks hold the ticker alive on their own, longer clock,
+    # so both fade windows are shortened here)
     old_ms = axx.CanFrameModel.FLASH_MS
+    old_byte_ms = axx.CanFrameModel.BYTE_FLASH_MS
     axx.CanFrameModel.FLASH_MS = 60.0
+    axx.CanFrameModel.BYTE_FLASH_MS = 60.0
     try:
         m.add_frames([('RX', _can_msg(0x100, b'\x02', ts=11.0))])
         first = m.data(m.index(0, 0), QtCore.Qt.BackgroundRole).alpha()
@@ -526,6 +530,7 @@ def test_can_fixed_flash_lights_and_fades():
         assert m.data(m.index(0, 0), QtCore.Qt.BackgroundRole) is None
     finally:
         axx.CanFrameModel.FLASH_MS = old_ms
+        axx.CanFrameModel.BYTE_FLASH_MS = old_byte_ms
 
 
 def test_can_flash_disabled_leaves_rows_untinted():
@@ -1068,6 +1073,213 @@ def test_kvaser_open_rejects_virtual_channels():
         axx.pycan = orig
 
 
+def test_pcan_and_vector_channel_mapping():
+    """PCAN channels are 1-based device names; Vector uses the global channel
+    index (app_name=None, so no Vector Hardware Config entry is needed)."""
+    captured = {}
+
+    class _DummyPycan:
+        @staticmethod
+        def Bus(**kwargs):
+            captured.update(kwargs)
+            raise RuntimeError('capture only')
+
+    orig, axx.pycan = axx.pycan, _DummyPycan()
+    try:
+        try:
+            axx._create_can_bus('pcan', 1, 500000)
+        except RuntimeError:
+            pass
+        assert captured['channel'] == 'PCAN_USBBUS2'
+        captured.clear()
+        try:
+            axx._create_can_bus('vector', 3, 250000)
+        except RuntimeError:
+            pass
+        assert captured['channel'] == 3
+        assert 'app_name' in captured and captured['app_name'] is None
+    finally:
+        axx.pycan = orig
+    # The toolbar offers them (pros only: no random hobby dongles)
+    assert axx.CAN_INTERFACES['PCAN'] == 'pcan'
+    assert axx.CAN_INTERFACES['Vector'] == 'vector'
+
+
+def test_generic_bus_state():
+    if not _pycan_available():
+        return
+    axx._ensure_pycan()
+
+    class _Passive:
+        state = axx.pycan.BusState.PASSIVE
+
+    class _Unimplemented:
+        @property
+        def state(self):
+            raise NotImplementedError
+
+    assert axx.generic_bus_state(_Passive()) == ('PASSIVE', None, None, False)
+    assert axx.generic_bus_state(_Unimplemented()) is None
+
+
+def test_can_byte_change_marks():
+    """Fixed mode stamps each changed data byte: +1 grew, -1 shrank, 0 for a
+    DLC change; untouched bytes stay unmarked and first sightings mark nothing."""
+    m = axx.CanFrameModel()
+    m.set_fixed_mode(True)
+    m.add_frames([('RX', _can_msg(0x100, b'\x01\x02\x03', ts=1.0))])
+    assert m.byte_marks(0) is None  # first sighting: nothing changed yet
+    m.add_frames([('RX', _can_msg(0x100, b'\x02\x01\x03', ts=1.1))])
+    marks = m.byte_marks(0)
+    assert marks is not None
+    assert marks[0][1] == 1       # 01 -> 02
+    assert marks[1][1] == -1      # 02 -> 01
+    assert marks[2] is None       # 03 unchanged
+    m.add_frames([('RX', _can_msg(0x100, b'\x02\x01', ts=1.2))])
+    assert m.byte_marks(0)[2][1] == 0  # byte disappeared (DLC change)
+
+    # Two frames of the same new ID within one batch still compare payloads
+    m2 = axx.CanFrameModel()
+    m2.set_fixed_mode(True)
+    m2.add_frames([('RX', _can_msg(0x200, b'\x05', ts=2.0)),
+                   ('RX', _can_msg(0x200, b'\x06', ts=2.1))])
+    assert m2.rowCount() == 1
+    assert m2.byte_marks(0)[0][1] == 1
+
+    # Scrolling mode never marks, and the parallel list stays in step
+    m3 = axx.CanFrameModel()
+    m3.add_frames([('RX', _can_msg(0x100, b'\x01', ts=1.0)),
+                   ('RX', _can_msg(0x100, b'\x02', ts=1.1))])
+    assert m3.byte_marks(0) is None and m3.byte_marks(1) is None
+    assert len(m3._byte_marks) == len(m3.rows)
+
+    # Flash toggle off disables (and clears) the marks
+    m4 = axx.CanFrameModel()
+    m4.set_fixed_mode(True)
+    m4.set_flash_enabled(False)
+    m4.add_frames([('RX', _can_msg(0x100, b'\x01', ts=1.0))])
+    m4.add_frames([('RX', _can_msg(0x100, b'\x02', ts=1.1))])
+    assert m4.byte_marks(0) is None
+
+
+def test_dbc_decode_column():
+    try:
+        import cantools  # noqa: F401  (optional dependency)
+    except ImportError:
+        return
+    import tempfile
+    content = (
+        'VERSION ""\n\nNS_ :\n\nBS_:\n\nBU_: ECU\n\n'
+        'BO_ 291 Status: 2 ECU\n'
+        ' SG_ Speed : 0|16@1+ (0.1,0) [0|6553.5] "km/h" Vector__XXX\n'
+    )
+    fd, path = tempfile.mkstemp(suffix='.dbc')
+    os.close(fd)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    try:
+        index = axx.load_dbc_index(path)
+        assert (291, False) in index
+        m = axx.CanFrameModel()
+        m.set_dbc_index(index)
+        m.set_decode_mode('DBC')
+        m.add_frames([('RX', _can_msg(291, b'\x64\x00', ts=1.0))])
+        col = axx.CanFrameModel._DECODE_COLUMN
+        assert m.rows[0][col] == 'Status: Speed=10'  # 0x64 * 0.1 km/h
+        # IDs the database does not know stay blank
+        m.add_frames([('RX', _can_msg(0x7F, b'\x00', ts=1.1))])
+        assert m.rows[1][col] == ''
+        # Switching away re-labels the capture in place, like the protocols
+        m.set_decode_mode('Off')
+        assert m.rows[0][col] == ''
+        m.set_decode_mode('DBC')
+        assert m.rows[0][col] == 'Status: Speed=10'
+        # Attaching a DBC while DBC mode is active re-labels immediately
+        m.set_dbc_index({})
+        assert m.rows[0][col] == ''
+    finally:
+        os.remove(path)
+
+
+def test_dbc_view_load_and_persistence():
+    try:
+        import cantools  # noqa: F401
+    except ImportError:
+        return
+    import tempfile
+    content = (
+        'VERSION ""\n\nNS_ :\n\nBS_:\n\nBU_: ECU\n\n'
+        'BO_ 291 Status: 2 ECU\n'
+        ' SG_ Speed : 0|16@1+ (0.1,0) [0|6553.5] "km/h" Vector__XXX\n'
+    )
+    fd, path = tempfile.mkstemp(suffix='.dbc')
+    os.close(fd)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    try:
+        win = _fresh_monitor()
+        assert win.canView.load_dbc(path)
+        assert win.canView.decode_combo.currentText() == 'DBC'
+        assert win.canView.model.decode_mode == 'DBC'
+        win.save_all_settings()
+        win.close()
+        # A fresh session defers the load until CAN mode is actually used
+        win2 = axx.SerialMonitor()
+        assert win2.canView.pending_dbc == (path, True)
+        assert win2.canView.model._dbc_index is None
+        win2.toolBar.modeCombo.setCurrentText('CAN')
+        assert win2.canView.model.decode_mode == 'DBC'
+        assert win2.canView.model._dbc_index
+        _isolate_settings()
+        win2.close()
+    finally:
+        os.remove(path)
+
+
+def test_serial_highlight_rules_and_line_filter():
+    win = _fresh_monitor()
+    dv = win.serialDataView
+    dv.set_highlight_rules([{'pattern': 'error', 'color': '#ff0000',
+                             'regex': False, 'enabled': True}])
+    # Complete lines render; the trailing partial line is held for its newline
+    dv.appendSerialText('ok line\nERROR: bang\npart', 'read')
+    text = dv.serialData.toPlainText()
+    assert 'ok line' in text and 'ERROR: bang' in text
+    assert 'part' not in text
+    dv.appendSerialText('ial\n', 'read')
+    assert 'partial' in dv.serialData.toPlainText()
+    # The live filter shows only matching lines (view-only)
+    dv.line_filter_edit.setText('keep')
+    dv.appendSerialText('keep me\ndrop me\n', 'read')
+    text = dv.serialData.toPlainText()
+    assert 'keep me' in text and 'drop me' not in text
+    # Disabling both flushes the held partial line so the stream looks live
+    dv.appendSerialText('tail', 'read')
+    dv.line_filter_edit.setText('')
+    dv.set_highlight_rules([])
+    assert 'tail' in dv.serialData.toPlainText()
+    # Rules survive a settings round-trip
+    dv.set_highlight_rules([{'pattern': 'warn', 'color': '#d08b1e',
+                             'regex': False, 'enabled': True}])
+    win.save_all_settings()
+    win.close()
+    win2 = axx.SerialMonitor()
+    assert win2.serialDataView.highlight_rules == [
+        {'pattern': 'warn', 'color': '#d08b1e', 'regex': False, 'enabled': True}]
+    assert len(win2.serialDataView._compiled_rules) == 1
+    _isolate_settings()
+    win2.close()
+
+
+def test_highlight_matcher_fallback():
+    """An unparseable regex must fall back to substring, never break the view."""
+    mk = axx.SerialDataView._make_matcher
+    assert mk('err', True)('ERRor here') is not None     # regex path
+    assert mk('[', True)('open [ bracket')               # bad regex -> substring
+    assert not mk('[', True)('no bracket')
+    assert mk('abc', False)('xxABCxx')                   # substring path
+
+
 def test_can_send_and_receive_virtual_bus():
     if not _pycan_available():
         return
@@ -1120,8 +1332,10 @@ def test_can_recording_logs_frames(tmp_path=None):
     win._toggle_recording()
     assert win._recording
     assert win._asc_writer is not None  # CAN recording mirrors to Vector .asc
+    assert win._canlog_writer is not None  # ...and to candump .log
     log_path = win._log_file.name
     asc_path = log_path[:-4] + '.asc'
+    canlog_path = log_path[:-4] + '.log'
     try:
         win.sendCanFrame('7F', False, 'AA')
         win._flush_display()
@@ -1129,6 +1343,7 @@ def test_can_recording_logs_frames(tmp_path=None):
         win._toggle_recording()
         win.portOpen(False)
     assert win._asc_writer is None  # stopped with recording
+    assert win._canlog_writer is None
     with open(log_path, encoding='utf-8') as f:
         content = f.read()
     os.remove(log_path)
@@ -1137,6 +1352,11 @@ def test_can_recording_logs_frames(tmp_path=None):
         asc = f.read()
     os.remove(asc_path)
     assert '7f' in asc.lower() and 'aa' in asc.lower()
+    with open(canlog_path, encoding='utf-8') as f:
+        cand = f.read()
+    os.remove(canlog_path)
+    # candump format: "(timestamp) channel ID#DATA"
+    assert '#' in cand and '7f#aa' in cand.lower().replace('07f', '7f')
     win.close()
 
 
