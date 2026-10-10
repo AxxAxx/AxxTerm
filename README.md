@@ -1,6 +1,6 @@
 # AxxTerm
 
-A professional serial terminal with dual ASCII/HEX view, real-time plotting, binary/frame decoding, data converter, configurable macro buttons, and a CAN bus monitor mode (Kvaser/Ixxat) with J1939 / CANopen / OBD-II frame decoding. Built with Python and PyQt5.
+A serial terminal and CAN bus monitor in one window. Dual ASCII/HEX view, real-time plotting, binary/frame decoding, line highlighting and filtering, data converter, macro buttons, and a CAN mode (Kvaser / Ixxat / PCAN / Vector) with DBC signal decoding and J1939 / CANopen / OBD-II frame labels. Built with Python and PyQt5, and written to stay fast: data is never dropped and the UI never lags behind the bus.
 
 ![AxxTerm GUI](AxxTerm_GUI.PNG)
 
@@ -31,6 +31,15 @@ A professional serial terminal with dual ASCII/HEX view, real-time plotting, bin
 - Scroll position and text selection are preserved while data streams in;
   the view only auto-scrolls when already at the bottom
 - Search/highlight in scrollback (Ctrl+F)
+- **Highlight rules** (the `Colors` button): color received lines that match
+  a pattern - lines with `error` in red, `warn` in orange, whatever you set
+  up. Plain substring or regex, case-insensitive, first matching rule wins.
+  Rules are saved with the settings
+- **Live line filter** (the `Filter lines...` box): show only received lines
+  containing the text (a valid regex works too). View only - logging,
+  plotting and the hex view still see everything. While a filter or
+  highlight rule is active, lines appear when their newline arrives, so a
+  rule always colors whole lines
 - Resizable splitter between the plot and data views
 
 ### Sending Data
@@ -116,8 +125,11 @@ driver for your hardware. `python-can` (and `pyqtgraph`) are imported on
 first use rather than at startup, so the app window appears quickly even
 with both installed.
 
-- Supported hardware: **Kvaser** (CANlib drivers) and **Ixxat** (VCI drivers),
-  plus a **Virtual** bus for testing without hardware
+- Supported hardware: **Kvaser** (CANlib drivers), **Ixxat** (VCI drivers),
+  **PCAN** (PEAK PCANBasic) and **Vector** (XL Driver Library), plus a
+  **Virtual** bus for testing without hardware. PCAN channel N in the toolbar
+  maps to `PCAN_USBBUS(N+1)`; Vector uses the global channel index, so no
+  application entry in Vector Hardware Config is needed
 - Kvaser opens require real hardware (`accept_virtual=False`): without this,
   the Kvaser driver's built-in virtual channels would let Open "succeed" with
   no device attached. Use the Virtual interface for hardware-free testing
@@ -138,6 +150,13 @@ with both installed.
   makes live IDs (and silent ones) obvious at a glance. The fade repaints at
   ~25 fps only while something is lit, and the toggle is greyed out in
   scrolling mode where every row is new anyway
+
+- **Byte change highlighting in fixed mode** (same `Flash` toggle): each data
+  byte that changed gets its own tint - **green when the value went up, red
+  when it went down, blue when the byte appeared or disappeared** (DLC
+  change) - fading out over ~2 s. This is the fastest way to find the byte
+  that follows the thing you are poking at on a bus full of counters: the
+  moving bytes glow, the constant ones stay quiet
 
 - Columns, everything in hex: relative time, **Δt since the previous frame
   with the same ID**, per-ID frame count, direction (TX rows in blue),
@@ -165,6 +184,15 @@ with both installed.
 | `CANopen` | 11-bit only: **Heartbeat** (`0x700`+node, with the NMT state decoded), node guarding, NMT, SYNC, TIME, EMCY with error code, TPDO/RPDO 1-4, SDO with object index:sub-index, LSS |
 | `OBD-II` | ISO-TP addressing (`7DF`, `7E0-7EF`, and 29-bit `18DA`/`18DB`), the PCI nibble (SF/FF/CF/FC), and the OBD mode or UDS service, including negative-response codes |
 | `Auto` | Only the rules that cannot collide: OBD-II ID ranges first, then J1939 for 29-bit and CANopen for 11-bit. The default |
+| `DBC` | Message names and decoded signal values from a loaded DBC file (appears after loading one) |
+
+- **DBC decoding** (the `DBC...` button): load a `.dbc` file and the Decode
+  column shows the message name and every signal with its scaled value -
+  `EEC1: EngineSpeed=1823.5 ...` instead of a wall of hex. This is usually
+  the whole reason to open a CAN tool. Needs the `cantools` package
+  (`pip install cantools`), which is imported when you load a file, not at
+  startup. The loaded path is remembered in the settings and restored the
+  next time you enter CAN mode
 
   **On heartbeats**: there is no heartbeat in raw CAN - the concept comes
   from the higher-layer protocol. CANopen (CiA 301) standardises one and
@@ -178,11 +206,17 @@ with both installed.
 - **Controller state** in the status bar: `ACTIVE` / `WARNING` / `PASSIVE` /
   `BUS-OFF` with the TX and RX error counters, read straight from Kvaser's
   `canReadStatus` once a second (python-can does not implement `bus.state`
-  for Kvaser). Anything worse than ACTIVE is coloured and also announced
-  once in the status line - bus-off means the controller has stopped taking
-  part in traffic entirely, which counting error frames alone would not tell
-  you. **Kvaser only**; Ixxat and Virtual show nothing. AxxTerm reports the
-  state, it does not attempt bus-off recovery
+  for Kvaser). PCAN and Vector report their state through python-can's
+  generic `bus.state` (no error counters there). Anything worse than ACTIVE
+  is coloured and also announced once in the status line - bus-off means the
+  controller has stopped taking part in traffic entirely, which counting
+  error frames alone would not tell you. Ixxat and Virtual show nothing.
+  AxxTerm reports the state, it does not attempt bus-off recovery
+- **RX overrun detection (Kvaser)**: if the driver's receive buffer
+  overflows - frames lost before the app ever saw them - a red `OVERRUN -
+  frames lost` indicator latches in the status bar for the rest of the
+  session. Lost data should never be silent: a capture with a hole in it and
+  no warning is worse than no capture
 - Send frames from the send row: ID (hex) + data bytes (hex, max 8) +
   extended-ID checkbox; Enter or Send transmits. Sends wait for transmit
   confirmation (300 ms timeout), so a frame shown as TX actually left the
@@ -202,8 +236,9 @@ with both installed.
 - The Record button (Ctrl+R) logs CAN traffic to the same timestamped log
   file format as serial data (stamped with the frame's hardware timestamp), e.g.
   `[2026-07-17 14:03:12.481] RX: CAN 18FEF100 EXT PGN 0FEF1 DLC 8 DATA 01 02 03 04 05 06 07 08`
-- **Recording in CAN mode also writes a Vector `.asc` file** alongside the
-  `.txt`, so captures load directly into CANalyzer / SavvyCAN / asammdf
+- **Recording in CAN mode also writes a Vector `.asc` and a candump `.log`
+  file** alongside the `.txt`, so captures load directly into CANalyzer /
+  SavvyCAN / asammdf / can-utils, and can be replayed with standard tools
 
 Classic CAN only (max 8 data bytes); CAN FD is not supported yet.
 
@@ -216,7 +251,8 @@ Classic CAN only (max 8 data bytes); CAN FD is not supported yet.
 - All settings saved automatically to `AxxTerm_settings.json` (writes are
   debounced so rapid changes coalesce into one disk write)
 - Includes: serial port config, decode mode, plot settings, channel
-  names/colors/axes/visibility, math channels, macros, dark mode, and
+  names/colors/axes/visibility, math channels, highlight rules, macros,
+  dark mode, CAN config (interface, bitrate, view mode, DBC path), and
   window/splitter geometry
 - File > Save Settings / Load Settings for explicit save/load to custom files
 
@@ -241,6 +277,7 @@ Classic CAN only (max 8 data bytes); CAN FD is not supported yet.
 - pyqtgraph >= 0.13
 - NumPy >= 1.24
 - python-can >= 4.0 (for CAN mode; the serial side works without it)
+- cantools (optional, only for DBC decoding)
 
 ## Installation
 
@@ -305,7 +342,10 @@ and CAN bus open/close must not block the GUI thread (including the
 cancel-while-opening and reopen-while-cancelling races). Newer tests cover
 the robustness fixes (per-key settings restore, invalid sync word warning,
 trigger in scaled units, fixed-view row cap) and the feature set (custom
-baud, display timestamps, freeze, repeat send, CAN ID filter, .asc logging).
+baud, display timestamps, freeze, repeat send, CAN ID filter, .asc and
+candump .log logging, per-byte change marks, DBC decoding and its settings
+round-trip, the PCAN/Vector channel mapping, and the serial highlight rules
+and line filter).
 
 ## Settings File Format
 
@@ -317,7 +357,7 @@ baud, display timestamps, freeze, repeat send, CAN ID filter, .asc logging).
   "auto_reconnect": true,
   "show_timestamps": false,
   "ui_mode": "Serial",
-  "can": { "interface": "Kvaser", "channel": 0, "bitrate": "500 kbit/s", "view_mode": "Scrolling", "flash": true, "decode": "Auto" },
+  "can": { "interface": "Kvaser", "channel": 0, "bitrate": "500 kbit/s", "view_mode": "Scrolling", "flash": true, "decode": "Auto", "dbc_path": "" },
   "window": { "geometry": "<hex>", "splitter": [300, 400] },
   "plot": {
     "mode": "ASCII",
@@ -336,6 +376,9 @@ baud, display timestamps, freeze, repeat send, CAN ID filter, .asc logging).
     "x_time_mode": false,
     "y_auto_scale": true,
     "math_channels": [],
+    "highlight_rules": [
+      { "pattern": "error", "color": "#c0453d", "regex": false, "enabled": true }
+    ],
     "binary": { "data_type": "float32", "endianness": "little" },
     "frame": { "sync_word": "AA", "size_field": "fixed", "frame_size": 12, "checksum": false }
   },
